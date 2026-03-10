@@ -89,6 +89,8 @@ pub struct RecordingRow {
     pub id: String,
     pub title: String,
     pub duration_ms: Option<i64>,
+    pub primary_artist_id: Option<String>,
+    pub release_group_id: Option<String>,
     pub artist_credit_name: Option<String>,
     pub release_group_title: Option<String>,
     pub genre: Option<String>,
@@ -109,6 +111,17 @@ pub struct ArtistRow {
     pub sort_name: String,
     pub release_group_count: i64,
     pub recording_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReleaseGroupRow {
+    pub id: String,
+    pub title: String,
+    pub artist_credit_name: Option<String>,
+    pub primary_artist_id: Option<String>,
+    pub release_count: i64,
+    pub recording_count: i64,
+    pub release_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

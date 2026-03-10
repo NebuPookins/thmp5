@@ -79,6 +79,7 @@ pub fn run() {
             commands::get_library_summary,
             commands::list_recordings,
             commands::list_artists,
+            commands::list_release_groups,
             commands::record_play_history,
             commands::get_player_state,
             commands::get_log_file_path,

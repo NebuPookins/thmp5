@@ -248,6 +248,87 @@ button {
   border: 1px solid rgba(124, 148, 177, 0.14);
 }
 
+.browser-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(240px, 1fr) minmax(0, 2.2fr);
+  gap: 14px;
+}
+
+.browser-column,
+.track-column {
+  min-width: 0;
+}
+
+.browser-column-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.browser-list {
+  display: grid;
+  gap: 10px;
+  max-height: calc(100vh - 330px);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.browser-item,
+.filter-chip {
+  border: 1px solid rgba(140, 164, 190, 0.16);
+  background: rgba(16, 25, 38, 0.84);
+  color: #eef4fb;
+}
+
+.browser-item {
+  width: 100%;
+  text-align: left;
+  border-radius: 18px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    transform 150ms ease;
+}
+
+.browser-item span,
+.empty-browser-state,
+.empty-table-state {
+  color: #95aac4;
+}
+
+.browser-item:hover,
+.filter-chip:hover {
+  border-color: rgba(94, 166, 255, 0.38);
+  transform: translateY(-1px);
+}
+
+.browser-item-active {
+  border-color: rgba(239, 177, 90, 0.72);
+  background: linear-gradient(180deg, rgba(41, 54, 76, 0.94), rgba(18, 28, 42, 0.94));
+}
+
+.filter-chip {
+  border-radius: 999px;
+  padding: 8px 12px;
+}
+
+.filter-chip-active {
+  color: #0b1018;
+  border-color: transparent;
+  background: linear-gradient(135deg, #f8d367 0%, #ef9f4f 100%);
+  font-weight: 700;
+}
+
+.track-table-wrap {
+  max-height: calc(100vh - 330px);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -353,6 +434,18 @@ thead th {
   background: rgba(105, 24, 28, 0.62);
 }
 
+.empty-browser-state {
+  margin: 0;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(22, 32, 47, 0.64);
+}
+
+.empty-table-state {
+  text-align: center;
+  padding: 28px 16px;
+ }
+
 @media (max-width: 1100px) {
   .layout-grid {
     grid-template-columns: 1fr;
@@ -360,6 +453,15 @@ thead th {
 
   .queue-panel {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .browser-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .browser-list,
+  .track-table-wrap {
+    max-height: 360px;
   }
 }
 

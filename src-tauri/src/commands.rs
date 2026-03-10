@@ -3,7 +3,7 @@ use crate::library::import::import_paths as do_import;
 use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, ImportProgress, ImportStats, InitialSetupRequest,
     LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, QueueSettingsUpdate, RecordingRow,
-    SeekRequest, VolumeRequest,
+    ReleaseGroupRow, SeekRequest, VolumeRequest,
 };
 use crate::AppState;
 use sqlx::Row;
@@ -260,6 +260,8 @@ pub async fn list_recordings(
             r.id,
             r.title,
             r.duration_ms,
+            a.id                  AS primary_artist_id,
+            rg.id                 AS release_group_id,
             COALESCE(ra.credited_as, a.name) AS artist_credit_name,
             rg.title             AS release_group_title,
             r.genre,
@@ -312,6 +314,8 @@ pub async fn list_recordings(
             id: row.get("id"),
             title: row.get("title"),
             duration_ms: row.get("duration_ms"),
+            primary_artist_id: row.get("primary_artist_id"),
+            release_group_id: row.get("release_group_id"),
             artist_credit_name: row.get("artist_credit_name"),
             release_group_title: row.get("release_group_title"),
             genre: row.get("genre"),
@@ -364,6 +368,73 @@ pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<Artis
         .collect();
 
     Ok(artists)
+}
+
+#[tauri::command]
+pub async fn list_release_groups(
+    state: tauri::State<'_, AppState>,
+    artist_id: Option<String>,
+    search: Option<String>,
+) -> Result<Vec<ReleaseGroupRow>, String> {
+    let db = &state.db;
+    let artist_filter = artist_id.as_deref();
+    let search_filter = search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let rows = sqlx::query(
+        "SELECT
+            rg.id,
+            rg.title,
+            COALESCE(rg.artist_credit_text, rga.credited_as, a.name) AS artist_credit_name,
+            a.id                                                     AS primary_artist_id,
+            COUNT(DISTINCT rel.id)                                   AS release_count,
+            COUNT(DISTINCT t.recording_id)                           AS recording_count,
+            MIN(rel.release_date)                                    AS release_date
+         FROM release_group rg
+         LEFT JOIN release_group_artist rga
+             ON rga.release_group_id = rg.id AND rga.position = 0
+         LEFT JOIN artist a
+             ON a.id = rga.artist_id
+         LEFT JOIN release rel
+             ON rel.release_group_id = rg.id
+         LEFT JOIN medium m
+             ON m.release_id = rel.id
+         LEFT JOIN track t
+             ON t.medium_id = m.id
+         WHERE (? IS NULL OR a.id = ?)
+           AND (
+               ? IS NULL
+               OR lower(rg.title) LIKE '%' || lower(?) || '%'
+               OR lower(COALESCE(rg.artist_credit_text, rga.credited_as, a.name, '')) LIKE '%' || lower(?) || '%'
+           )
+         GROUP BY rg.id
+         ORDER BY lower(COALESCE(a.sort_name, a.name, '')), lower(rg.title)",
+    )
+    .bind(artist_filter)
+    .bind(artist_filter)
+    .bind(search_filter)
+    .bind(search_filter)
+    .bind(search_filter)
+    .fetch_all(db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let release_groups = rows
+        .into_iter()
+        .map(|row| ReleaseGroupRow {
+            id: row.get("id"),
+            title: row.get("title"),
+            artist_credit_name: row.get("artist_credit_name"),
+            primary_artist_id: row.get("primary_artist_id"),
+            release_count: row.get::<Option<i64>, _>("release_count").unwrap_or(0),
+            recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
+            release_date: row.get("release_date"),
+        })
+        .collect();
+
+    Ok(release_groups)
 }
 
 pub async fn load_music_root(db: &sqlx::SqlitePool) -> anyhow::Result<Option<String>> {

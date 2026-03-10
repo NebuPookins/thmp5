@@ -39,6 +39,8 @@ type RecordingRow = {
   id: string;
   title: string;
   duration_ms: number | null;
+  primary_artist_id: string | null;
+  release_group_id: string | null;
   artist_credit_name: string | null;
   release_group_title: string | null;
   genre: string | null;
@@ -50,6 +52,24 @@ type RecordingRow = {
   last_played: string | null;
   primary_source_id: string | null;
   primary_source_path: string | null;
+};
+
+type ArtistRow = {
+  id: string;
+  name: string;
+  sort_name: string;
+  release_group_count: number;
+  recording_count: number;
+};
+
+type ReleaseGroupRow = {
+  id: string;
+  title: string;
+  artist_credit_name: string | null;
+  primary_artist_id: string | null;
+  release_count: number;
+  recording_count: number;
+  release_date: string | null;
 };
 
 type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
@@ -105,19 +125,42 @@ function formatLastPlayed(value: string | null): string {
   return value ?? "Never";
 }
 
+function formatYear(value: string | null): string {
+  return value?.slice(0, 4) ?? "Unknown year";
+}
+
+function trackSort(a: RecordingRow, b: RecordingRow): number {
+  const discDelta = (a.disc_position ?? Number.MAX_SAFE_INTEGER) - (b.disc_position ?? Number.MAX_SAFE_INTEGER);
+  if (discDelta !== 0) {
+    return discDelta;
+  }
+
+  const trackDelta =
+    (a.track_position ?? Number.MAX_SAFE_INTEGER) - (b.track_position ?? Number.MAX_SAFE_INTEGER);
+  if (trackDelta !== 0) {
+    return trackDelta;
+  }
+
+  return a.title.localeCompare(b.title);
+}
+
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
+  const [artists, setArtists] = useState<ArtistRow[]>([]);
+  const [releaseGroups, setReleaseGroups] = useState<ReleaseGroupRow[]>([]);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<QueueItem[]>([]);
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
   const [search, setSearch] = useState("");
+  const [selectedArtistId, setSelectedArtistId] = useState<string | null>(null);
+  const [selectedReleaseGroupId, setSelectedReleaseGroupId] = useState<string | null>(null);
   const [wizardPath, setWizardPath] = useState("");
   const [queueHistoryLimitInput, setQueueHistoryLimitInput] = useState("5");
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [isSubmittingWizard, setIsSubmittingWizard] = useState(false);
-  const [isRefreshingTable, setIsRefreshingTable] = useState(false);
+  const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false);
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -125,18 +168,86 @@ function App() {
   const isPlaying = playerState.status === "playing";
   const activeDurationMs = playerState.duration_ms ?? currentTrack?.duration_ms ?? 0;
 
+  const selectedArtist = useMemo(
+    () => artists.find((artist) => artist.id === selectedArtistId) ?? null,
+    [artists, selectedArtistId],
+  );
+
+  const selectedReleaseGroup = useMemo(
+    () => releaseGroups.find((releaseGroup) => releaseGroup.id === selectedReleaseGroupId) ?? null,
+    [releaseGroups, selectedReleaseGroupId],
+  );
+
+  const visibleArtists = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    if (!needle) {
+      return artists;
+    }
+
+    return artists.filter((artist) => artist.name.toLowerCase().includes(needle));
+  }, [artists, search]);
+
+  const filteredRecordings = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+
+    return recordings
+      .filter((recording) => {
+        if (selectedArtist) {
+          if (recording.primary_artist_id !== selectedArtist.id) {
+            return false;
+          }
+        }
+
+        if (selectedReleaseGroup) {
+          if (recording.release_group_id !== selectedReleaseGroup.id) {
+            return false;
+          }
+        }
+
+        if (!needle) {
+          return true;
+        }
+
+        return [recording.artist_credit_name, recording.title, recording.release_group_title, recording.genre]
+          .filter(Boolean)
+          .some((value) => value!.toLowerCase().includes(needle));
+      })
+      .sort(trackSort);
+  }, [recordings, search, selectedArtist, selectedReleaseGroup]);
+
   async function loadRecordings() {
-    setIsRefreshingTable(true);
+    const rows = await invoke<RecordingRow[]>("list_recordings", {
+      limit: 10000,
+      offset: 0,
+    });
+    setRecordings(rows);
+  }
+
+  async function loadArtists() {
+    const rows = await invoke<ArtistRow[]>("list_artists");
+    setArtists(rows);
+  }
+
+  async function loadReleaseGroups(nextArtistId: string | null, nextSearch: string) {
+    const rows = await invoke<ReleaseGroupRow[]>("list_release_groups", {
+      artistId: nextArtistId,
+      search: nextSearch.trim() || null,
+    });
+    setReleaseGroups(rows);
+  }
+
+  async function loadLibraryData(nextArtistId = selectedArtistId, nextSearch = search) {
+    setIsRefreshingLibrary(true);
     try {
-      const rows = await invoke<RecordingRow[]>("list_recordings", {
-        limit: 10000,
-        offset: 0,
-      });
-      setRecordings(rows);
+      await Promise.all([
+        loadRecordings(),
+        loadArtists(),
+        loadReleaseGroups(nextArtistId, nextSearch),
+      ]);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
-      setIsRefreshingTable(false);
+      setIsRefreshingLibrary(false);
     }
   }
 
@@ -165,8 +276,33 @@ function App() {
       return;
     }
 
-    void loadRecordings();
+    void loadLibraryData();
   }, [bootstrap?.needs_setup]);
+
+  useEffect(() => {
+    if (!bootstrap || bootstrap.needs_setup) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void loadReleaseGroups(selectedArtistId, search).catch((loadError) => {
+        setError(loadError instanceof Error ? loadError.message : String(loadError));
+      });
+    }, 120);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [bootstrap?.needs_setup, search, selectedArtistId]);
+
+  useEffect(() => {
+    if (!selectedReleaseGroupId) {
+      return;
+    }
+
+    const stillExists = releaseGroups.some((releaseGroup) => releaseGroup.id === selectedReleaseGroupId);
+    if (!stillExists) {
+      setSelectedReleaseGroupId(null);
+    }
+  }, [releaseGroups, selectedReleaseGroupId]);
 
   useEffect(() => {
     if (!bootstrap || bootstrap.needs_setup) {
@@ -188,11 +324,7 @@ function App() {
         );
 
         if (progress.is_running) {
-          const rows = await invoke<RecordingRow[]>("list_recordings", {
-            limit: 10000,
-            offset: 0,
-          });
-          setRecordings(rows);
+          await loadLibraryData(selectedArtistId, search);
         }
       } catch (pollError) {
         setError(pollError instanceof Error ? pollError.message : String(pollError));
@@ -200,7 +332,7 @@ function App() {
     }, 2000);
 
     return () => window.clearInterval(interval);
-  }, [bootstrap?.needs_setup]);
+  }, [bootstrap?.needs_setup, search, selectedArtistId]);
 
   useEffect(() => {
     let isMounted = true;
@@ -270,11 +402,10 @@ function App() {
     setError(null);
     void invoke<PlayerState>("play", {
       request: { source_id: currentTrack.primary_source_id },
-    })
-      .catch((playError) => {
-        setError(playError instanceof Error ? playError.message : String(playError));
-        setCurrentTrack(null);
-      });
+    }).catch((playError) => {
+      setError(playError instanceof Error ? playError.message : String(playError));
+      setCurrentTrack(null);
+    });
   }, [currentTrack?.id, currentTrack?.primary_source_id]);
 
   async function completeCurrentTrack(positionMs?: number) {
@@ -324,7 +455,7 @@ function App() {
         library_summary: summary,
       });
       setQueueHistoryLimitInput(String(config.queue_history_limit));
-      await loadRecordings();
+      await loadLibraryData();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : String(submitError));
     } finally {
@@ -454,24 +585,6 @@ function App() {
     }
   }
 
-  const filteredRecordings = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    if (!needle) {
-      return recordings;
-    }
-
-    return recordings.filter((recording) =>
-      [
-        recording.artist_credit_name,
-        recording.title,
-        recording.release_group_title,
-        recording.genre,
-      ]
-        .filter(Boolean)
-        .some((value) => value!.toLowerCase().includes(needle)),
-    );
-  }, [recordings, search]);
-
   if (isBootstrapping) {
     return <main className="loading-screen">Loading thmp5…</main>;
   }
@@ -521,13 +634,13 @@ function App() {
         <div className="topbar-actions">
           <button
             className="secondary-button"
-            disabled={isRefreshingTable}
+            disabled={isRefreshingLibrary}
             onClick={() => {
-              void loadRecordings();
+              void loadLibraryData();
             }}
             type="button"
           >
-            {isRefreshingTable ? "Refreshing..." : "Refresh table"}
+            {isRefreshingLibrary ? "Refreshing..." : "Refresh library"}
           </button>
           <button className="secondary-button" onClick={handleRescan} type="button">
             Rescan library
@@ -581,54 +694,159 @@ function App() {
 
       <section className="layout-grid">
         <section className="table-panel">
-          <div className="table-toolbar">
+          <div className="table-toolbar browser-toolbar">
             <input
               className="search-input"
               onChange={(event) => setSearch(event.currentTarget.value)}
-              placeholder="Filter by artist, title, album, genre"
+              placeholder="Filter artists, albums, tracks, genre"
               value={search}
             />
-            <span className="panel-meta">{filteredRecordings.length} rows</span>
+            <span className="panel-meta">
+              {filteredRecordings.length} tracks · {releaseGroups.length} albums
+            </span>
           </div>
 
-          <div className="table-wrap">
-            <table className="recordings-table">
-              <thead>
-                <tr>
-                  <th>Artist</th>
-                  <th>Title</th>
-                  <th>Album</th>
-                  <th>Genre</th>
-                  <th>Rating</th>
-                  <th>Duration</th>
-                  <th>Plays</th>
-                  <th>Last played</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredRecordings.map((recording) => (
-                  <tr
-                    className={recording.primary_source_id ? "playable-row" : "muted-row"}
-                    key={recording.id}
-                    onDoubleClick={() => enqueueRecording(recording)}
-                    title={
-                      recording.primary_source_id
-                        ? "Double click to play or queue"
-                        : "No playable local file"
-                    }
-                  >
-                    <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
-                    <td>{recording.title}</td>
-                    <td>{recording.release_group_title ?? "Unknown Album"}</td>
-                    <td>{recording.genre ?? "—"}</td>
-                    <td>{recording.rating ?? "—"}</td>
-                    <td>{formatDuration(recording.duration_ms)}</td>
-                    <td>{recording.play_count}</td>
-                    <td>{formatLastPlayed(recording.last_played)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div className="browser-grid">
+            <section className="browser-column">
+              <div className="browser-column-header">
+                <div>
+                  <p className="panel-label">Artists</p>
+                  <strong>{visibleArtists.length}</strong>
+                </div>
+                <button
+                  className={`filter-chip ${selectedArtistId ? "" : "filter-chip-active"}`}
+                  onClick={() => setSelectedArtistId(null)}
+                  type="button"
+                >
+                  All
+                </button>
+              </div>
+              <div className="browser-list">
+                {visibleArtists.length === 0 ? (
+                  <p className="empty-browser-state">No artists match this filter.</p>
+                ) : (
+                  visibleArtists.map((artist) => (
+                    <button
+                      className={`browser-item ${artist.id === selectedArtistId ? "browser-item-active" : ""}`}
+                      key={artist.id}
+                      onClick={() =>
+                        setSelectedArtistId((current) => (current === artist.id ? null : artist.id))
+                      }
+                      type="button"
+                    >
+                      <strong>{artist.name}</strong>
+                      <span>
+                        {artist.release_group_count} albums · {artist.recording_count} tracks
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </section>
+
+            <section className="browser-column">
+              <div className="browser-column-header">
+                <div>
+                  <p className="panel-label">Albums</p>
+                  <strong>{selectedArtist?.name ?? "All artists"}</strong>
+                </div>
+                <button
+                  className={`filter-chip ${selectedReleaseGroupId ? "" : "filter-chip-active"}`}
+                  onClick={() => setSelectedReleaseGroupId(null)}
+                  type="button"
+                >
+                  All
+                </button>
+              </div>
+              <div className="browser-list">
+                {releaseGroups.length === 0 ? (
+                  <p className="empty-browser-state">No albums available for this view.</p>
+                ) : (
+                  releaseGroups.map((releaseGroup) => (
+                    <button
+                      className={`browser-item ${releaseGroup.id === selectedReleaseGroupId ? "browser-item-active" : ""}`}
+                      key={releaseGroup.id}
+                      onClick={() =>
+                        setSelectedReleaseGroupId((current) =>
+                          current === releaseGroup.id ? null : releaseGroup.id,
+                        )
+                      }
+                      type="button"
+                    >
+                      <strong>{releaseGroup.title}</strong>
+                      <span>
+                        {releaseGroup.artist_credit_name ?? "Unknown Artist"} ·{" "}
+                        {formatYear(releaseGroup.release_date)}
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </section>
+
+            <section className="track-column">
+              <div className="browser-column-header">
+                <div>
+                  <p className="panel-label">Tracks</p>
+                  <strong>{selectedReleaseGroup?.title ?? "Library view"}</strong>
+                </div>
+                <span className="panel-meta">
+                  {selectedArtist?.name ?? "All artists"}
+                </span>
+              </div>
+              <div className="table-wrap track-table-wrap">
+                <table className="recordings-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Title</th>
+                      <th>Artist</th>
+                      <th>Album</th>
+                      <th>Genre</th>
+                      <th>Rating</th>
+                      <th>Duration</th>
+                      <th>Plays</th>
+                      <th>Last played</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredRecordings.map((recording) => (
+                      <tr
+                        className={recording.primary_source_id ? "playable-row" : "muted-row"}
+                        key={recording.id}
+                        onDoubleClick={() => enqueueRecording(recording)}
+                        title={
+                          recording.primary_source_id
+                            ? "Double click to play or queue"
+                            : "No playable local file"
+                        }
+                      >
+                        <td>
+                          {recording.disc_position && recording.disc_position > 1
+                            ? `${recording.disc_position}.${recording.track_position ?? "—"}`
+                            : recording.track_position ?? "—"}
+                        </td>
+                        <td>{recording.title}</td>
+                        <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
+                        <td>{recording.release_group_title ?? "Unknown Album"}</td>
+                        <td>{recording.genre ?? "—"}</td>
+                        <td>{recording.rating ?? "—"}</td>
+                        <td>{formatDuration(recording.duration_ms)}</td>
+                        <td>{recording.play_count}</td>
+                        <td>{formatLastPlayed(recording.last_played)}</td>
+                      </tr>
+                    ))}
+                    {filteredRecordings.length === 0 ? (
+                      <tr>
+                        <td className="empty-table-state" colSpan={9}>
+                          No tracks match the current artist, album, and search filters.
+                        </td>
+                      </tr>
+                    ) : null}
+                  </tbody>
+                </table>
+              </div>
+            </section>
           </div>
         </section>
 
