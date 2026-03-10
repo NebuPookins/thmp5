@@ -1,0 +1,35 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Generated Tauri icon assets
+src-tauri/icons/*.png
+src-tauri/icons/*.ico
+src-tauri/icons/*.icns
+src-tauri/icons/Square*Logo.png
+src-tauri/icons/StoreLogo.png
+src-tauri/icons/android/mipmap-*/ic_launcher*.png
+src-tauri/icons/android/mipmap-anydpi-v26/ic_launcher.xml
+src-tauri/icons/android/values/ic_launcher_background.xml
+src-tauri/icons/ios/*.png
