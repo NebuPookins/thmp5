@@ -2,8 +2,8 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, ImportProgress, ImportStats, InitialSetupRequest,
-    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, QueueSettingsUpdate, RecordingRow,
-    ReleaseGroupRow, SeekRequest, VolumeRequest,
+    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, QueueSettingsUpdate,
+    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SeekRequest, VolumeRequest,
 };
 use crate::AppState;
 use sqlx::Row;
@@ -119,6 +119,37 @@ pub async fn record_play_history(
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_recording_rating(
+    state: tauri::State<'_, AppState>,
+    request: RatingUpdateRequest,
+) -> Result<(), String> {
+    validate_rating(request.stars)?;
+
+    if let Some(stars) = request.stars {
+        sqlx::query(
+            "INSERT INTO user_rating (recording_id, stars, updated_at)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(recording_id) DO UPDATE SET
+                stars = excluded.stars,
+                updated_at = datetime('now')",
+        )
+        .bind(&request.id)
+        .bind(stars)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    } else {
+        sqlx::query("DELETE FROM user_rating WHERE recording_id = ?")
+            .bind(&request.id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
@@ -391,7 +422,21 @@ pub async fn list_release_groups(
             a.id                                                     AS primary_artist_id,
             COUNT(DISTINCT rel.id)                                   AS release_count,
             COUNT(DISTINCT t.recording_id)                           AS recording_count,
-            MIN(rel.release_date)                                    AS release_date
+            MIN(rel.release_date)                                    AS release_date,
+            (
+                SELECT AVG(track_ratings.stars)
+                FROM (
+                    SELECT DISTINCT t2.recording_id, ur2.stars
+                    FROM release rel2
+                    JOIN medium m2
+                        ON m2.release_id = rel2.id
+                    JOIN track t2
+                        ON t2.medium_id = m2.id
+                    JOIN user_rating ur2
+                        ON ur2.recording_id = t2.recording_id
+                    WHERE rel2.release_group_id = rg.id
+                ) AS track_ratings
+            )                                                        AS rating
          FROM release_group rg
          LEFT JOIN release_group_artist rga
              ON rga.release_group_id = rg.id AND rga.position = 0
@@ -431,10 +476,21 @@ pub async fn list_release_groups(
             release_count: row.get::<Option<i64>, _>("release_count").unwrap_or(0),
             recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
             release_date: row.get("release_date"),
+            rating: row.get("rating"),
         })
         .collect();
 
     Ok(release_groups)
+}
+
+fn validate_rating(stars: Option<i64>) -> Result<(), String> {
+    if let Some(stars) = stars {
+        if !(1..=5).contains(&stars) {
+            return Err("Rating must be between 1 and 5.".to_string());
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn load_music_root(db: &sqlx::SqlitePool) -> anyhow::Result<Option<String>> {

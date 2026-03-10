@@ -122,6 +122,7 @@ pub struct ReleaseGroupRow {
     pub release_count: i64,
     pub recording_count: i64,
     pub release_date: Option<String>,
+    pub rating: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +140,12 @@ pub struct PlayHistoryInput {
     pub recording_id: String,
     pub source_id: Option<String>,
     pub duration_played_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RatingUpdateRequest {
+    pub id: String,
+    pub stars: Option<i64>,
 }
 
 // ── Internal scanner metadata ─────────────────────────────────────────────────

@@ -70,6 +70,7 @@ type ReleaseGroupRow = {
   release_count: number;
   recording_count: number;
   release_date: string | null;
+  rating: number | null;
 };
 
 type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
@@ -129,6 +130,14 @@ function formatYear(value: string | null): string {
   return value?.slice(0, 4) ?? "Unknown year";
 }
 
+function formatAlbumRating(value: number | null): string {
+  if (value === null) {
+    return "Unrated album";
+  }
+
+  return `Avg ${value.toFixed(1)}`;
+}
+
 function trackSort(a: RecordingRow, b: RecordingRow): number {
   const discDelta = (a.disc_position ?? Number.MAX_SAFE_INTEGER) - (b.disc_position ?? Number.MAX_SAFE_INTEGER);
   if (discDelta !== 0) {
@@ -142,6 +151,38 @@ function trackSort(a: RecordingRow, b: RecordingRow): number {
   }
 
   return a.title.localeCompare(b.title);
+}
+
+type RatingStarsProps = {
+  value: number | null;
+  onChange: (value: number | null) => void;
+  disabled?: boolean;
+};
+
+function RatingStars({ value, onChange, disabled = false }: RatingStarsProps) {
+  return (
+    <div className="rating-stars" role="group">
+      {[1, 2, 3, 4, 5].map((star) => {
+        const filled = value !== null && star <= value;
+        return (
+          <button
+            aria-label={`Set rating to ${star}`}
+            className={`rating-star ${filled ? "rating-star-filled" : ""}`}
+            disabled={disabled}
+            key={star}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onChange(value === star ? null : star);
+            }}
+            type="button"
+          >
+            ★
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 function App() {
@@ -162,6 +203,7 @@ function App() {
   const [isSubmittingWizard, setIsSubmittingWizard] = useState(false);
   const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false);
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
+  const [ratingKeyInFlight, setRatingKeyInFlight] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
@@ -585,6 +627,28 @@ function App() {
     }
   }
 
+  async function updateRecordingRating(recordingId: string, stars: number | null) {
+    const ratingKey = `recording:${recordingId}`;
+    const previousRecordings = recordings;
+    setRatingKeyInFlight(ratingKey);
+    setRecordings((current) =>
+      current.map((recording) =>
+        recording.id === recordingId ? { ...recording, rating: stars } : recording,
+      ),
+    );
+
+    try {
+      await invoke("set_recording_rating", {
+        request: { id: recordingId, stars },
+      });
+    } catch (ratingError) {
+      setRecordings(previousRecordings);
+      setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
+    } finally {
+      setRatingKeyInFlight((current) => (current === ratingKey ? null : current));
+    }
+  }
+
   if (isBootstrapping) {
     return <main className="loading-screen">Loading thmp5…</main>;
   }
@@ -763,7 +827,7 @@ function App() {
                   <p className="empty-browser-state">No albums available for this view.</p>
                 ) : (
                   releaseGroups.map((releaseGroup) => (
-                    <button
+                    <div
                       className={`browser-item ${releaseGroup.id === selectedReleaseGroupId ? "browser-item-active" : ""}`}
                       key={releaseGroup.id}
                       onClick={() =>
@@ -771,14 +835,24 @@ function App() {
                           current === releaseGroup.id ? null : releaseGroup.id,
                         )
                       }
-                      type="button"
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setSelectedReleaseGroupId((current) =>
+                            current === releaseGroup.id ? null : releaseGroup.id,
+                          );
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
                     >
                       <strong>{releaseGroup.title}</strong>
                       <span>
                         {releaseGroup.artist_credit_name ?? "Unknown Artist"} ·{" "}
                         {formatYear(releaseGroup.release_date)}
                       </span>
-                    </button>
+                      <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
+                    </div>
                   ))
                 )}
               </div>
@@ -830,7 +904,15 @@ function App() {
                         <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
                         <td>{recording.release_group_title ?? "Unknown Album"}</td>
                         <td>{recording.genre ?? "—"}</td>
-                        <td>{recording.rating ?? "—"}</td>
+                        <td>
+                          <RatingStars
+                            disabled={ratingKeyInFlight === `recording:${recording.id}`}
+                            onChange={(stars) => {
+                              void updateRecordingRating(recording.id, stars);
+                            }}
+                            value={recording.rating}
+                          />
+                        </td>
                         <td>{formatDuration(recording.duration_ms)}</td>
                         <td>{recording.play_count}</td>
                         <td>{formatLastPlayed(recording.last_played)}</td>

@@ -302,6 +302,11 @@ button {
   color: #95aac4;
 }
 
+.rating-summary {
+  color: #efb15a;
+  font-weight: 600;
+}
+
 .browser-item:hover,
 .filter-chip:hover {
   border-color: rgba(94, 166, 255, 0.38);
@@ -311,6 +316,38 @@ button {
 .browser-item-active {
   border-color: rgba(239, 177, 90, 0.72);
   background: linear-gradient(180deg, rgba(41, 54, 76, 0.94), rgba(18, 28, 42, 0.94));
+}
+
+.rating-stars {
+  display: inline-flex;
+  gap: 2px;
+  align-items: center;
+}
+
+.rating-star {
+  border: 0;
+  background: transparent;
+  color: rgba(149, 170, 196, 0.48);
+  padding: 0;
+  line-height: 1;
+  font-size: 0.95rem;
+  transition:
+    color 120ms ease,
+    transform 120ms ease;
+}
+
+.rating-star:hover:not(:disabled) {
+  color: #f8d367;
+  transform: translateY(-1px);
+}
+
+.rating-star-filled {
+  color: #efb15a;
+}
+
+.rating-star:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .filter-chip {
