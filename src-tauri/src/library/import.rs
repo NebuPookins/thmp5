@@ -1,14 +1,26 @@
 use super::scanner::{is_audio_file, read_metadata};
 use crate::fingerprint::{self, AcoustIdMatch};
-use crate::models::ImportStats;
+use crate::models::{ImportStats, TrackMetadata};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+pub(crate) struct PreparedImport {
+    path: PathBuf,
+    path_str: String,
+    existing_source_id: Option<String>,
+    hash: String,
+    meta: TrackMetadata,
+    file_size: i64,
+    file_mtime_ms: i64,
+    fp: Option<fingerprint::FingerprintResult>,
+    acoustid_match: Option<AcoustIdMatch>,
+}
 
 pub async fn import_paths(
     db: &SqlitePool,
@@ -72,6 +84,18 @@ pub(crate) async fn import_file(
     path: &Path,
     acoustid_key: Option<&str>,
 ) -> Result<bool> {
+    let Some(prepared) = prepare_import(db, path, acoustid_key).await? else {
+        return Ok(false);
+    };
+
+    store_prepared_import(db, prepared).await
+}
+
+pub(crate) async fn prepare_import(
+    db: &SqlitePool,
+    path: &Path,
+    acoustid_key: Option<&str>,
+) -> Result<Option<PreparedImport>> {
     let (file_size, file_mtime_ms) = file_identity(path).context("Failed to read file metadata")?;
     let path_str = path.to_string_lossy().to_string();
     let existing_source = sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
@@ -84,36 +108,15 @@ pub(crate) async fn import_file(
 
     if let Some((_, existing_size, existing_mtime_ms)) = &existing_source {
         if existing_size == &Some(file_size) && existing_mtime_ms == &Some(file_mtime_ms) {
-            return Ok(false);
+            return Ok(None);
         }
     }
 
     let existing_source_id = existing_source.as_ref().map(|(id, _, _)| id.as_str());
 
-    // ── 1. Hash ──────────────────────────────────────────────────────────────
     let hash = file_sha256(path).context("Failed to hash file")?;
-
-    // ── 2. Dedup by exact hash ───────────────────────────────────────────────
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM source
-         WHERE file_hash = ?
-           AND (? IS NULL OR id != ?)",
-    )
-    .bind(&hash)
-    .bind(existing_source_id)
-    .bind(existing_source_id)
-    .fetch_one(db)
-    .await
-    .context("DB error checking hash")?;
-    if count > 0 {
-        return Ok(false);
-    }
-
-    // ── 3. Read embedded tags ────────────────────────────────────────────────
     let meta = read_metadata(path).context("Failed to read metadata")?;
-    let duration = meta.duration_ms as i64;
 
-    // ── 4. Generate Chromaprint fingerprint (best-effort, off main thread) ───
     let fp = {
         let p = path.to_path_buf();
         match tokio::task::spawn_blocking(move || fingerprint::generate_fingerprint(&p)).await {
@@ -129,7 +132,6 @@ pub(crate) async fn import_file(
         }
     };
 
-    // ── 5. AcoustID lookup (best-effort) ─────────────────────────────────────
     let acoustid_match: Option<AcoustIdMatch> = match (acoustid_key, fp.as_ref()) {
         (Some(key), Some(fp_result)) => match fingerprint::lookup_acoustid(key, fp_result).await {
             Ok(m) => m,
@@ -140,6 +142,50 @@ pub(crate) async fn import_file(
         },
         _ => None,
     };
+
+    Ok(Some(PreparedImport {
+        path: path.to_path_buf(),
+        path_str,
+        existing_source_id: existing_source_id.map(ToOwned::to_owned),
+        hash,
+        meta,
+        file_size,
+        file_mtime_ms,
+        fp,
+        acoustid_match,
+    }))
+}
+
+pub(crate) async fn store_prepared_import(
+    db: &SqlitePool,
+    prepared: PreparedImport,
+) -> Result<bool> {
+    let PreparedImport {
+        path,
+        path_str,
+        existing_source_id,
+        hash,
+        meta,
+        file_size,
+        file_mtime_ms,
+        fp,
+        acoustid_match,
+    } = prepared;
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM source
+         WHERE file_hash = ?
+           AND (? IS NULL OR id != ?)",
+    )
+    .bind(&hash)
+    .bind(existing_source_id.as_deref())
+    .bind(existing_source_id.as_deref())
+    .fetch_one(db)
+    .await
+    .context("DB error checking hash")?;
+    if count > 0 {
+        return Ok(false);
+    }
 
     let mut tx = db
         .begin()
@@ -179,9 +225,8 @@ pub(crate) async fn import_file(
     let track_position = meta.track_number.unwrap_or(0) as i64;
     get_or_create_track(&mut tx, &medium_id, &recording_id, track_position).await?;
 
-    // ── 10. Source ────────────────────────────────────────────────────────────
-    let source_id = existing_source
-        .map(|(id, _, _)| id)
+    let source_id = existing_source_id
+        .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let fingerprint_str = fp.as_ref().map(|f| f.fingerprint.as_str());
     sqlx::query(
@@ -209,7 +254,7 @@ pub(crate) async fn import_file(
     .bind(&path_str)
     .bind(&hash)
     .bind(&meta.format)
-    .bind(duration)
+    .bind(meta.duration_ms as i64)
     .bind(fingerprint_str)
     .bind(file_size)
     .bind(file_mtime_ms)

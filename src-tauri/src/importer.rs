@@ -1,10 +1,11 @@
-use crate::library::import::import_file;
+use crate::library::import::{prepare_import, store_prepared_import};
 use crate::library::scanner::is_audio_file;
 use crate::models::ImportProgress;
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
 #[derive(Clone)]
@@ -64,11 +65,13 @@ async fn run_scan(
     acoustid_key: Option<&str>,
     progress: &Arc<Mutex<ImportProgress>>,
 ) -> Result<()> {
+    let concurrency = import_concurrency();
     let path = Path::new(root_path);
     if !path.exists() {
         anyhow::bail!("Import root does not exist: {}", path.display());
     }
 
+    let mut tasks = JoinSet::new();
     for entry in WalkDir::new(path).follow_links(true) {
         match entry {
             Ok(entry) if entry.file_type().is_file() && is_audio_file(entry.path()) => {
@@ -78,23 +81,19 @@ async fn run_scan(
                     state.current_path = Some(entry.path().display().to_string());
                 }
 
-                match import_file(db, entry.path(), acoustid_key).await {
-                    Ok(true) => {
-                        let mut state = progress.lock().expect("import progress mutex poisoned");
-                        state.imported += 1;
-                    }
-                    Ok(false) => {
-                        let mut state = progress.lock().expect("import progress mutex poisoned");
-                        state.skipped += 1;
-                    }
-                    Err(error) => {
-                        let mut state = progress.lock().expect("import progress mutex poisoned");
-                        state.errors += 1;
-                        state
-                            .error_messages
-                            .push(format!("{}: {}", entry.path().display(), error));
+                if tasks.len() >= concurrency {
+                    if let Some(result) = tasks.join_next().await {
+                        handle_task_result(db, progress, result).await;
                     }
                 }
+
+                let db = db.clone();
+                let path = entry.path().to_path_buf();
+                let acoustid_key = acoustid_key.map(ToOwned::to_owned);
+                tasks.spawn(async move {
+                    let prepared = prepare_import(&db, &path, acoustid_key.as_deref()).await;
+                    (path, prepared)
+                });
             }
             Ok(_) => {}
             Err(error) => {
@@ -105,9 +104,69 @@ async fn run_scan(
         }
     }
 
+    while let Some(result) = tasks.join_next().await {
+        handle_task_result(db, progress, result).await;
+    }
+
     let mut state = progress.lock().expect("import progress mutex poisoned");
     state.current_path = None;
     Ok(())
+}
+
+async fn handle_task_result(
+    db: &SqlitePool,
+    progress: &Arc<Mutex<ImportProgress>>,
+    result: std::result::Result<
+        (
+            std::path::PathBuf,
+            Result<Option<crate::library::import::PreparedImport>>,
+        ),
+        tokio::task::JoinError,
+    >,
+) {
+    match result {
+        Ok((path, Ok(Some(prepared)))) => match store_prepared_import(db, prepared).await {
+            Ok(true) => {
+                let mut state = progress.lock().expect("import progress mutex poisoned");
+                state.imported += 1;
+            }
+            Ok(false) => {
+                let mut state = progress.lock().expect("import progress mutex poisoned");
+                state.skipped += 1;
+            }
+            Err(error) => {
+                let mut state = progress.lock().expect("import progress mutex poisoned");
+                state.errors += 1;
+                state
+                    .error_messages
+                    .push(format!("{}: {}", path.display(), error));
+            }
+        },
+        Ok((_, Ok(None))) => {
+            let mut state = progress.lock().expect("import progress mutex poisoned");
+            state.skipped += 1;
+        }
+        Ok((path, Err(error))) => {
+            let mut state = progress.lock().expect("import progress mutex poisoned");
+            state.errors += 1;
+            state
+                .error_messages
+                .push(format!("{}: {}", path.display(), error));
+        }
+        Err(error) => {
+            let mut state = progress.lock().expect("import progress mutex poisoned");
+            state.errors += 1;
+            state
+                .error_messages
+                .push(format!("Importer task failed: {error}"));
+        }
+    }
+}
+
+fn import_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(6).max(2))
+        .unwrap_or(4)
 }
 
 fn now_iso() -> String {
