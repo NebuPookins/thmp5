@@ -3,9 +3,10 @@ use crate::fingerprint::{self, AcoustIdMatch};
 use crate::models::ImportStats;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::io::Read;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -71,22 +72,45 @@ pub(crate) async fn import_file(
     path: &Path,
     acoustid_key: Option<&str>,
 ) -> Result<bool> {
+    let (file_size, file_mtime_ms) = file_identity(path).context("Failed to read file metadata")?;
+    let path_str = path.to_string_lossy().to_string();
+    let existing_source = sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
+        "SELECT id, file_size, file_mtime_ms FROM source WHERE file_path = ?",
+    )
+    .bind(&path_str)
+    .fetch_optional(db)
+    .await
+    .context("DB error checking existing path")?;
+
+    if let Some((_, existing_size, existing_mtime_ms)) = &existing_source {
+        if existing_size == &Some(file_size) && existing_mtime_ms == &Some(file_mtime_ms) {
+            return Ok(false);
+        }
+    }
+
+    let existing_source_id = existing_source.as_ref().map(|(id, _, _)| id.as_str());
+
     // ── 1. Hash ──────────────────────────────────────────────────────────────
     let hash = file_sha256(path).context("Failed to hash file")?;
 
     // ── 2. Dedup by exact hash ───────────────────────────────────────────────
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source WHERE file_hash = ?")
-        .bind(&hash)
-        .fetch_one(db)
-        .await
-        .context("DB error checking hash")?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM source
+         WHERE file_hash = ?
+           AND (? IS NULL OR id != ?)",
+    )
+    .bind(&hash)
+    .bind(existing_source_id)
+    .bind(existing_source_id)
+    .fetch_one(db)
+    .await
+    .context("DB error checking hash")?;
     if count > 0 {
         return Ok(false);
     }
 
     // ── 3. Read embedded tags ────────────────────────────────────────────────
     let meta = read_metadata(path).context("Failed to read metadata")?;
-    let path_str = path.to_string_lossy().to_string();
     let duration = meta.duration_ms as i64;
 
     // ── 4. Generate Chromaprint fingerprint (best-effort, off main thread) ───
@@ -117,6 +141,11 @@ pub(crate) async fn import_file(
         _ => None,
     };
 
+    let mut tx = db
+        .begin()
+        .await
+        .context("Failed to start import transaction")?;
+
     // ── 6. Artist ─────────────────────────────────────────────────────────────
     let artist_name = meta
         .album_artist
@@ -124,37 +153,56 @@ pub(crate) async fn import_file(
         .or(meta.artist.as_deref())
         .unwrap_or("Unknown Artist")
         .to_string();
-    let artist_id = get_or_create_artist(db, &artist_name).await?;
+    let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
 
     // ── 7. Find or create Recording (3-level dedup) ───────────────────────────
     let recording_id =
-        find_or_create_recording(db, &meta, &artist_id, acoustid_match.as_ref()).await?;
+        find_or_create_recording(&mut tx, &meta, &artist_id, acoustid_match.as_ref()).await?;
 
     // ── 8. ReleaseGroup / Release / Medium ────────────────────────────────────
     let album_title = meta.album.as_deref().unwrap_or("Unknown Album").to_string();
-    let release_group_id = get_or_create_release_group(db, &album_title, &artist_id).await?;
+    let release_group_id = get_or_create_release_group(&mut tx, &album_title, &artist_id).await?;
 
     let release_date = meta.year.map(|y| y.to_string());
-    let release_id =
-        get_or_create_release(db, &release_group_id, &album_title, release_date.as_deref()).await?;
+    let release_id = get_or_create_release(
+        &mut tx,
+        &release_group_id,
+        &album_title,
+        release_date.as_deref(),
+    )
+    .await?;
 
     let disc = meta.disc_number.unwrap_or(1) as i64;
-    let medium_id = get_or_create_medium(db, &release_id, disc).await?;
+    let medium_id = get_or_create_medium(&mut tx, &release_id, disc).await?;
 
     // ── 9. Track ──────────────────────────────────────────────────────────────
     let track_position = meta.track_number.unwrap_or(0) as i64;
-    get_or_create_track(db, &medium_id, &recording_id, track_position).await?;
+    get_or_create_track(&mut tx, &medium_id, &recording_id, track_position).await?;
 
     // ── 10. Source ────────────────────────────────────────────────────────────
-    let source_id = Uuid::new_v4().to_string();
+    let source_id = existing_source
+        .map(|(id, _, _)| id)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let fingerprint_str = fp.as_ref().map(|f| f.fingerprint.as_str());
     sqlx::query(
         "INSERT INTO source (
             id, recording_id, source_type, file_path, file_hash, format, duration_ms,
-            fingerprint,
+            fingerprint, file_size, file_mtime_ms,
             replay_gain_track_db, replay_gain_track_peak,
             replay_gain_album_db, replay_gain_album_peak
-         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(file_path) DO UPDATE SET
+            recording_id = excluded.recording_id,
+            file_hash = excluded.file_hash,
+            format = excluded.format,
+            duration_ms = excluded.duration_ms,
+            fingerprint = excluded.fingerprint,
+            file_size = excluded.file_size,
+            file_mtime_ms = excluded.file_mtime_ms,
+            replay_gain_track_db = excluded.replay_gain_track_db,
+            replay_gain_track_peak = excluded.replay_gain_track_peak,
+            replay_gain_album_db = excluded.replay_gain_album_db,
+            replay_gain_album_peak = excluded.replay_gain_album_peak",
     )
     .bind(&source_id)
     .bind(&recording_id)
@@ -163,13 +211,19 @@ pub(crate) async fn import_file(
     .bind(&meta.format)
     .bind(duration)
     .bind(fingerprint_str)
+    .bind(file_size)
+    .bind(file_mtime_ms)
     .bind(meta.replay_gain_track_db)
     .bind(meta.replay_gain_track_peak)
     .bind(meta.replay_gain_album_db)
     .bind(meta.replay_gain_album_peak)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .context("Failed to insert source")?;
+
+    tx.commit()
+        .await
+        .context("Failed to commit import transaction")?;
 
     tracing::debug!(
         path = %path.display(),
@@ -191,7 +245,7 @@ pub(crate) async fn import_file(
 /// 2. Tag-based match — same title + artist + duration (±5 s).
 /// 3. Create new.
 async fn find_or_create_recording(
-    db: &SqlitePool,
+    tx: &mut Transaction<'_, Sqlite>,
     meta: &crate::models::TrackMetadata,
     artist_id: &str,
     acoustid_match: Option<&AcoustIdMatch>,
@@ -204,7 +258,7 @@ async fn find_or_create_recording(
         if let Some(id) =
             sqlx::query_scalar::<_, String>("SELECT id FROM recording WHERE acoustid = ?")
                 .bind(&aid.acoustid)
-                .fetch_optional(db)
+                .fetch_optional(&mut **tx)
                 .await?
         {
             tracing::debug!(acoustid = %aid.acoustid, recording_id = %id, "AcoustID hit");
@@ -230,7 +284,7 @@ async fn find_or_create_recording(
     .bind(artist_id)
     .bind(dur_min)
     .bind(dur_max)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await?
     {
         // Backfill acoustid/mbid if we have them and the recording doesn't yet.
@@ -242,7 +296,7 @@ async fn find_or_create_recording(
             .bind(&aid.acoustid)
             .bind(aid.recording_mbid.as_deref())
             .bind(&id)
-            .execute(db)
+            .execute(&mut **tx)
             .await?;
         }
         return Ok(id);
@@ -262,10 +316,10 @@ async fn find_or_create_recording(
     .bind(&meta.comment)
     .bind(acoustid_match.as_ref().map(|a| a.acoustid.as_str()))
     .bind(acoustid_match.and_then(|a| a.recording_mbid.as_deref()))
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
 
-    insert_recording_artist(db, &id, artist_id, 0, "main").await?;
+    insert_recording_artist(tx, &id, artist_id, 0, "main").await?;
 
     Ok(id)
 }
@@ -274,11 +328,11 @@ async fn find_or_create_recording(
 // "Get or create" helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn get_or_create_artist(db: &SqlitePool, name: &str) -> Result<String> {
+async fn get_or_create_artist(tx: &mut Transaction<'_, Sqlite>, name: &str) -> Result<String> {
     let name_lower = name.to_lowercase();
     if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM artist WHERE lower(name) = ?")
         .bind(&name_lower)
-        .fetch_optional(db)
+        .fetch_optional(&mut **tx)
         .await?
     {
         return Ok(id);
@@ -289,13 +343,13 @@ async fn get_or_create_artist(db: &SqlitePool, name: &str) -> Result<String> {
         .bind(&id)
         .bind(name)
         .bind(name)
-        .execute(db)
+        .execute(&mut **tx)
         .await?;
     Ok(id)
 }
 
 async fn get_or_create_release_group(
-    db: &SqlitePool,
+    tx: &mut Transaction<'_, Sqlite>,
     title: &str,
     artist_id: &str,
 ) -> Result<String> {
@@ -308,7 +362,7 @@ async fn get_or_create_release_group(
     )
     .bind(&title_lower)
     .bind(artist_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await?
     {
         return Ok(id);
@@ -318,7 +372,7 @@ async fn get_or_create_release_group(
     sqlx::query("INSERT INTO release_group (id, title, rg_type) VALUES (?, ?, 'album')")
         .bind(&id)
         .bind(title)
-        .execute(db)
+        .execute(&mut **tx)
         .await?;
     sqlx::query(
         "INSERT INTO release_group_artist (release_group_id, artist_id, position, role)
@@ -326,13 +380,13 @@ async fn get_or_create_release_group(
     )
     .bind(&id)
     .bind(artist_id)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
     Ok(id)
 }
 
 async fn get_or_create_release(
-    db: &SqlitePool,
+    tx: &mut Transaction<'_, Sqlite>,
     release_group_id: &str,
     title: &str,
     release_date: Option<&str>,
@@ -340,7 +394,7 @@ async fn get_or_create_release(
     if let Some(id) =
         sqlx::query_scalar::<_, String>("SELECT id FROM release WHERE release_group_id = ? LIMIT 1")
             .bind(release_group_id)
-            .fetch_optional(db)
+            .fetch_optional(&mut **tx)
             .await?
     {
         return Ok(id);
@@ -354,18 +408,22 @@ async fn get_or_create_release(
     .bind(release_group_id)
     .bind(title)
     .bind(release_date)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
     Ok(id)
 }
 
-async fn get_or_create_medium(db: &SqlitePool, release_id: &str, disc: i64) -> Result<String> {
+async fn get_or_create_medium(
+    tx: &mut Transaction<'_, Sqlite>,
+    release_id: &str,
+    disc: i64,
+) -> Result<String> {
     if let Some(id) = sqlx::query_scalar::<_, String>(
         "SELECT id FROM medium WHERE release_id = ? AND position = ?",
     )
     .bind(release_id)
     .bind(disc)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await?
     {
         return Ok(id);
@@ -378,13 +436,13 @@ async fn get_or_create_medium(db: &SqlitePool, release_id: &str, disc: i64) -> R
     .bind(&id)
     .bind(release_id)
     .bind(disc)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
     Ok(id)
 }
 
 async fn get_or_create_track(
-    db: &SqlitePool,
+    tx: &mut Transaction<'_, Sqlite>,
     medium_id: &str,
     recording_id: &str,
     position: i64,
@@ -394,7 +452,7 @@ async fn get_or_create_track(
     )
     .bind(medium_id)
     .bind(recording_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await?
     {
         return Ok(id);
@@ -406,13 +464,13 @@ async fn get_or_create_track(
         .bind(medium_id)
         .bind(recording_id)
         .bind(position)
-        .execute(db)
+        .execute(&mut **tx)
         .await?;
     Ok(id)
 }
 
 async fn insert_recording_artist(
-    db: &SqlitePool,
+    tx: &mut Transaction<'_, Sqlite>,
     recording_id: &str,
     artist_id: &str,
     position: i64,
@@ -426,7 +484,7 @@ async fn insert_recording_artist(
     .bind(artist_id)
     .bind(position)
     .bind(role)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -447,4 +505,13 @@ fn file_sha256(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn file_identity(path: &Path) -> Result<(i64, i64)> {
+    let metadata = std::fs::metadata(path)?;
+    let file_size = i64::try_from(metadata.len()).context("File too large to index")?;
+    let modified = metadata.modified()?;
+    let file_mtime_ms = i64::try_from(modified.duration_since(UNIX_EPOCH)?.as_millis())
+        .context("File modification time out of range")?;
+    Ok((file_size, file_mtime_ms))
 }

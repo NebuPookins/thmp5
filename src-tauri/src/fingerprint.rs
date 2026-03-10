@@ -4,13 +4,14 @@ use base64::Engine as _;
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::OnceLock;
 use symphonia::core::{
     audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
     formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
 };
 
-/// Decode only the first ~2 minutes of audio for fingerprinting.
-const MAX_FINGERPRINT_MS: u64 = 120_000;
+/// Decode only the first 30 seconds of audio for the initial fingerprint pass.
+const MAX_FINGERPRINT_MS: u64 = 30_000;
 
 // ── Fingerprint generation ────────────────────────────────────────────────────
 
@@ -175,9 +176,13 @@ pub async fn lookup_acoustid(
     api_key: &str,
     fp: &FingerprintResult,
 ) -> Result<Option<AcoustIdMatch>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+    static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build shared AcoustID HTTP client")
+    });
 
     let duration_s = (fp.duration_ms / 1000).to_string();
 
