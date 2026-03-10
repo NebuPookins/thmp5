@@ -271,7 +271,6 @@ function App() {
     void invoke<PlayerState>("play", {
       request: { source_id: currentTrack.primary_source_id },
     })
-      .then((nextState) => setPlayerState(nextState))
       .catch((playError) => {
         setError(playError instanceof Error ? playError.message : String(playError));
         setCurrentTrack(null);
@@ -407,11 +406,11 @@ function App() {
 
     try {
       if (playerState.status === "playing") {
-        const nextState = await invoke<PlayerState>("pause");
-        setPlayerState(nextState);
+        setPlayerState((current) => ({ ...current, status: "paused" }));
+        await invoke<PlayerState>("pause");
       } else {
-        const nextState = await invoke<PlayerState>("resume");
-        setPlayerState(nextState);
+        setPlayerState((current) => ({ ...current, status: "loading" }));
+        await invoke<PlayerState>("resume");
       }
     } catch (playbackError) {
       setError(playbackError instanceof Error ? playbackError.message : String(playbackError));
@@ -429,10 +428,13 @@ function App() {
 
   async function handleSeek(nextPositionMs: number) {
     try {
-      const nextState = await invoke<PlayerState>("seek", {
+      setPlayerState((current) => ({
+        ...current,
+        position_ms: nextPositionMs,
+      }));
+      await invoke<PlayerState>("seek", {
         request: { position_ms: nextPositionMs },
       });
-      setPlayerState(nextState);
     } catch (seekError) {
       setError(seekError instanceof Error ? seekError.message : String(seekError));
     }
@@ -440,10 +442,13 @@ function App() {
 
   async function handleVolumeChange(nextVolume: number) {
     try {
-      const nextState = await invoke<PlayerState>("set_volume", {
+      setPlayerState((current) => ({
+        ...current,
+        volume: nextVolume,
+      }));
+      await invoke<PlayerState>("set_volume", {
         request: { volume: nextVolume },
       });
-      setPlayerState(nextState);
     } catch (volumeError) {
       setError(volumeError instanceof Error ? volumeError.message : String(volumeError));
     }
