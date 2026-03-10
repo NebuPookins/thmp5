@@ -1,13 +1,16 @@
+mod audio;
 mod commands;
 mod db;
 pub mod fingerprint;
 mod importer;
 mod library;
+mod logging;
 mod models;
 
+use audio::AudioEngineHandle;
+use importer::ImportManager;
 use sqlx::SqlitePool;
 use tauri::Manager;
-use importer::ImportManager;
 
 pub struct AppState {
     pub db: SqlitePool,
@@ -15,17 +18,12 @@ pub struct AppState {
     /// AcoustID lookups are skipped when this is `None`.
     pub acoustid_api_key: Option<String>,
     pub importer: ImportManager,
+    pub player: AudioEngineHandle,
+    pub log_file_path: String,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -33,8 +31,12 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             let db_path = app_data_dir.join("library.db");
+            let log_path = app_data_dir.join("thmp5.log");
+
+            logging::init(&log_path).map_err(|e| format!("Failed to initialize logging: {e}"))?;
 
             tracing::info!("Database path: {}", db_path.display());
+            tracing::info!("Log path: {}", log_path.display());
 
             let pool = tauri::async_runtime::block_on(db::init_pool(&db_path))
                 .map_err(|e| format!("Failed to initialize database: {e}"))?;
@@ -46,10 +48,14 @@ pub fn run() {
                 tracing::info!("ACOUSTID_API_KEY not set — fingerprint lookups disabled");
             }
             let importer = ImportManager::new();
+            let player = AudioEngineHandle::new(app.handle().clone())
+                .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
             let state = AppState {
                 db: pool.clone(),
                 acoustid_api_key: acoustid_api_key.clone(),
                 importer,
+                player,
+                log_file_path: log_path.display().to_string(),
             };
 
             if let Ok(Some(root_path)) =
@@ -74,6 +80,14 @@ pub fn run() {
             commands::list_recordings,
             commands::list_artists,
             commands::record_play_history,
+            commands::get_player_state,
+            commands::get_log_file_path,
+            commands::play,
+            commands::pause,
+            commands::resume,
+            commands::seek,
+            commands::set_volume,
+            commands::stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

@@ -107,15 +107,13 @@ pub(crate) async fn import_file(
 
     // ── 5. AcoustID lookup (best-effort) ─────────────────────────────────────
     let acoustid_match: Option<AcoustIdMatch> = match (acoustid_key, fp.as_ref()) {
-        (Some(key), Some(fp_result)) => {
-            match fingerprint::lookup_acoustid(key, fp_result).await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), "AcoustID lookup failed: {e}");
-                    None
-                }
+        (Some(key), Some(fp_result)) => match fingerprint::lookup_acoustid(key, fp_result).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "AcoustID lookup failed: {e}");
+                None
             }
-        }
+        },
         _ => None,
     };
 
@@ -134,13 +132,11 @@ pub(crate) async fn import_file(
 
     // ── 8. ReleaseGroup / Release / Medium ────────────────────────────────────
     let album_title = meta.album.as_deref().unwrap_or("Unknown Album").to_string();
-    let release_group_id =
-        get_or_create_release_group(db, &album_title, &artist_id).await?;
+    let release_group_id = get_or_create_release_group(db, &album_title, &artist_id).await?;
 
     let release_date = meta.year.map(|y| y.to_string());
     let release_id =
-        get_or_create_release(db, &release_group_id, &album_title, release_date.as_deref())
-            .await?;
+        get_or_create_release(db, &release_group_id, &album_title, release_date.as_deref()).await?;
 
     let disc = meta.disc_number.unwrap_or(1) as i64;
     let medium_id = get_or_create_medium(db, &release_id, disc).await?;
@@ -205,12 +201,11 @@ async fn find_or_create_recording(
 
     // ── Level 1: AcoustID ────────────────────────────────────────────────────
     if let Some(aid) = acoustid_match {
-        if let Some(id) = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM recording WHERE acoustid = ?",
-        )
-        .bind(&aid.acoustid)
-        .fetch_optional(db)
-        .await?
+        if let Some(id) =
+            sqlx::query_scalar::<_, String>("SELECT id FROM recording WHERE acoustid = ?")
+                .bind(&aid.acoustid)
+                .fetch_optional(db)
+                .await?
         {
             tracing::debug!(acoustid = %aid.acoustid, recording_id = %id, "AcoustID hit");
             return Ok(id);
@@ -281,12 +276,10 @@ async fn find_or_create_recording(
 
 async fn get_or_create_artist(db: &SqlitePool, name: &str) -> Result<String> {
     let name_lower = name.to_lowercase();
-    if let Some(id) = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM artist WHERE lower(name) = ?",
-    )
-    .bind(&name_lower)
-    .fetch_optional(db)
-    .await?
+    if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM artist WHERE lower(name) = ?")
+        .bind(&name_lower)
+        .fetch_optional(db)
+        .await?
     {
         return Ok(id);
     }
@@ -344,12 +337,11 @@ async fn get_or_create_release(
     title: &str,
     release_date: Option<&str>,
 ) -> Result<String> {
-    if let Some(id) = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM release WHERE release_group_id = ? LIMIT 1",
-    )
-    .bind(release_group_id)
-    .fetch_optional(db)
-    .await?
+    if let Some(id) =
+        sqlx::query_scalar::<_, String>("SELECT id FROM release WHERE release_group_id = ? LIMIT 1")
+            .bind(release_group_id)
+            .fetch_optional(db)
+            .await?
     {
         return Ok(id);
     }
@@ -409,15 +401,13 @@ async fn get_or_create_track(
     }
 
     let id = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO track (id, medium_id, recording_id, position) VALUES (?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(medium_id)
-    .bind(recording_id)
-    .bind(position)
-    .execute(db)
-    .await?;
+    sqlx::query("INSERT INTO track (id, medium_id, recording_id, position) VALUES (?, ?, ?, ?)")
+        .bind(&id)
+        .bind(medium_id)
+        .bind(recording_id)
+        .bind(position)
+        .execute(db)
+        .await?;
     Ok(id)
 }
 

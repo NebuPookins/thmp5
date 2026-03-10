@@ -413,41 +413,41 @@ src/
 ## Build Order (Implementation Phases)
 
 ### Phase 1 — Foundation
-1. Initialize Tauri 2 project with React/TypeScript/Vite
-2. Set up `sqlx` with SQLite, write migrations for the full schema
-3. Implement `MetadataScanner` (lofty crate: ID3, Vorbis, FLAC tags)
-4. Implement `FingerprintService` (rusty-chromaprint + AcoustID HTTP client)
-5. Implement the import pipeline (scan → hash → fingerprint → deduplicate → store)
-6. Tauri commands: `import_paths`, `get_library_summary`
+1. [x] Initialize Tauri 2 project with React/TypeScript/Vite
+2. [x] Set up `sqlx` with SQLite, write migrations for the full schema
+3. [x] Implement `MetadataScanner` (using `lofty`)
+4. [x] Implement `FingerprintService` (`rusty-chromaprint` + AcoustID HTTP client)
+5. [x] Implement the import pipeline (scan → hash → fingerprint → deduplicate → store)
+6. [x] Tauri commands: `import_paths`, `get_library_summary`
 
 ### Phase 2 — Playback
-7. Implement `LocalFileSource` using symphonia
-8. Implement `AudioEngine` with cpal output, command/event channels
-9. Tauri commands: `play`, `pause`, `resume`, `seek`, `set_volume`
-10. Basic `PlayerBar` React component wired to Tauri events
-11. Basic `LibraryView` (list recordings, click to play)
+7. [ ] Implement `LocalFileSource` using symphonia
+8. [ ] Implement `AudioEngine` with cpal output, command/event channels
+9. [ ] Tauri commands: `play`, `pause`, `resume`, `seek`, `set_volume`
+10. [ ] Basic `PlayerBar` React component wired to Tauri events
+11. [x] Basic `LibraryView` (list recordings, queue/play from the UI)
 
 ### Phase 3 — Library UI
-12. Artist/Album/Track tree view with virtualized lists
-13. Cover art extraction and display
-14. Inline rating UI (per recording + per album)
-15. Tag management UI
+12. [ ] Artist/Album/Track tree view with virtualized lists
+13. [ ] Cover art extraction and display
+14. [ ] Inline rating UI (per recording + per album)
+15. [ ] Tag management UI
 
 ### Phase 4 — Smart Playlists
-16. Implement pest grammar + AST types
-17. Implement SQL codegen + duration-limit post-filter
-18. `SmartPlaylistEditor` with live preview (shows first N matching tracks)
-19. Save/load smart playlists; evaluate at queue time
+16. [ ] Implement pest grammar + AST types
+17. [ ] Implement SQL codegen + duration-limit post-filter
+18. [ ] `SmartPlaylistEditor` with live preview (shows first N matching tracks)
+19. [ ] Save/load smart playlists; evaluate at queue time
 
 ### Phase 5 — Additional Sources
-20. `YouTubeSource` via yt-dlp subprocess
-21. `HttpStreamSource` via reqwest streaming
-22. UI for adding YouTube URLs / streams to a Recording
-23. Source health checking (re-verify URLs periodically)
+20. [ ] `YouTubeSource` via yt-dlp subprocess
+21. [ ] `HttpStreamSource` via reqwest streaming
+22. [ ] UI for adding YouTube URLs / streams to a Recording
+23. [ ] Source health checking (re-verify URLs periodically)
 
 ### Phase 6 — Polish
-24. Full MusicBrainz metadata import (for well-known recordings)
-25. Duplicate detection UI (show recordings with multiple sources)
-26. Cross-fade, gapless playback
-27. ReplayGain / volume normalization
-28. Export playlist to M3U / JSON
+24. [ ] Full MusicBrainz metadata import (for well-known recordings)
+25. [ ] Duplicate detection UI (show recordings with multiple sources)
+26. [ ] Cross-fade, gapless playback
+27. [ ] ReplayGain / volume normalization
+28. [ ] Export playlist to M3U / JSON

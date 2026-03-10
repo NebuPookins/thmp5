@@ -28,7 +28,10 @@ impl ImportManager {
 
     pub fn spawn_scan(&self, db: SqlitePool, root_path: String, acoustid_key: Option<String>) {
         {
-            let mut progress = self.progress.lock().expect("import progress mutex poisoned");
+            let mut progress = self
+                .progress
+                .lock()
+                .expect("import progress mutex poisoned");
             if progress.is_running {
                 return;
             }
@@ -87,11 +90,9 @@ async fn run_scan(
                     Err(error) => {
                         let mut state = progress.lock().expect("import progress mutex poisoned");
                         state.errors += 1;
-                        state.error_messages.push(format!(
-                            "{}: {}",
-                            entry.path().display(),
-                            error
-                        ));
+                        state
+                            .error_messages
+                            .push(format!("{}: {}", entry.path().display(), error));
                     }
                 }
             }

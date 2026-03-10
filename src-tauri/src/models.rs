@@ -2,6 +2,43 @@ use serde::{Deserialize, Serialize};
 
 // ── IPC response types (serialized to frontend) ──────────────────────────────
 
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackStatus {
+    #[default]
+    Stopped,
+    Loading,
+    Playing,
+    Paused,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlayerState {
+    pub status: PlaybackStatus,
+    pub recording_id: Option<String>,
+    pub source_id: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub position_ms: u64,
+    pub volume: f32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlayRequest {
+    pub source_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SeekRequest {
+    pub position_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VolumeRequest {
+    pub volume: f32,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ImportStats {
     pub scanned: u32,

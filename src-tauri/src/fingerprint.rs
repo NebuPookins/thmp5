@@ -5,13 +5,8 @@ use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use serde::Deserialize;
 use std::path::Path;
 use symphonia::core::{
-    audio::SampleBuffer,
-    codecs::DecoderOptions,
-    errors::Error as SymphoniaError,
-    formats::FormatOptions,
-    io::MediaSourceStream,
-    meta::MetadataOptions,
-    probe::Hint,
+    audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
+    formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
 };
 
 /// Decode only the first ~2 minutes of audio for fingerprinting.
@@ -30,8 +25,8 @@ pub struct FingerprintResult {
 ///
 /// CPU-bound — call via `tokio::task::spawn_blocking` from async code.
 pub fn generate_fingerprint(path: &Path) -> Result<FingerprintResult> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Cannot open {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();
@@ -40,7 +35,12 @@ pub fn generate_fingerprint(path: &Path) -> Result<FingerprintResult> {
     }
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .context("Failed to probe audio format")?;
 
     let mut format = probed.format;
@@ -52,10 +52,7 @@ pub fn generate_fingerprint(path: &Path) -> Result<FingerprintResult> {
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
     let sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let n_channels = codec_params
-        .channels
-        .map(|c| c.count() as u32)
-        .unwrap_or(2);
+    let n_channels = codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
@@ -80,9 +77,7 @@ pub fn generate_fingerprint(path: &Path) -> Result<FingerprintResult> {
 
         let packet = match format.next_packet() {
             Ok(p) => p,
-            Err(SymphoniaError::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(SymphoniaError::ResetRequired) => {
@@ -210,7 +205,11 @@ pub async fn lookup_acoustid(
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.score >= MIN_SCORE)
-        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        .max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
     Ok(best.map(|entry| {
         let recording_mbid = entry

@@ -1,7 +1,9 @@
+use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, ImportProgress, ImportStats, InitialSetupRequest,
-    LibrarySummary, PlayHistoryInput, QueueSettingsUpdate, RecordingRow,
+    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, QueueSettingsUpdate, RecordingRow,
+    SeekRequest, VolumeRequest,
 };
 use crate::AppState;
 use sqlx::Row;
@@ -19,10 +21,10 @@ pub async fn import_paths(
 }
 
 #[tauri::command]
-pub async fn get_app_bootstrap(
-    state: tauri::State<'_, AppState>,
-) -> Result<AppBootstrap, String> {
-    let config = load_app_config(&state.db).await.map_err(|e| e.to_string())?;
+pub async fn get_app_bootstrap(state: tauri::State<'_, AppState>) -> Result<AppBootstrap, String> {
+    let config = load_app_config(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     let library_summary = load_library_summary(&state.db)
         .await
         .map_err(|e| e.to_string())?;
@@ -56,7 +58,9 @@ pub async fn complete_initial_setup(
         .await
         .map_err(|e| e.to_string())?;
 
-    let config = load_app_config(&state.db).await.map_err(|e| e.to_string())?;
+    let config = load_app_config(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     state.importer.spawn_scan(
         state.db.clone(),
         root.to_string(),
@@ -81,11 +85,9 @@ pub async fn trigger_library_scan(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Music root is not configured.".to_string())?;
 
-    state.importer.spawn_scan(
-        state.db.clone(),
-        root,
-        state.acoustid_api_key.clone(),
-    );
+    state
+        .importer
+        .spawn_scan(state.db.clone(), root, state.acoustid_api_key.clone());
 
     Ok(state.importer.snapshot())
 }
@@ -122,6 +124,117 @@ pub async fn record_play_history(
 }
 
 // ── Library queries ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn get_player_state(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+    Ok(state.player.snapshot())
+}
+
+#[tauri::command]
+pub fn get_log_file_path(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    Ok(state.log_file_path.clone())
+}
+
+#[tauri::command]
+pub async fn play(
+    state: tauri::State<'_, AppState>,
+    request: PlayRequest,
+) -> Result<PlayerState, String> {
+    tracing::info!(source_id = %request.source_id, "Play command received");
+    let row = sqlx::query(
+        "SELECT
+            s.id                  AS source_id,
+            s.file_path           AS file_path,
+            r.id                  AS recording_id,
+            r.title               AS title,
+            COALESCE(ra.credited_as, a.name) AS artist
+         FROM source s
+         JOIN recording r ON r.id = s.recording_id
+         LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
+         LEFT JOIN artist a ON a.id = ra.artist_id
+         WHERE s.id = ?
+           AND s.source_type = 'local_file'
+           AND s.file_path IS NOT NULL",
+    )
+    .bind(&request.source_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| "Playable local source not found.".to_string())?;
+
+    let source_id: String = row.get("source_id");
+    let file_path: String = row.get("file_path");
+    let recording_id: String = row.get("recording_id");
+    let title: Option<String> = row.get("title");
+    let artist: Option<String> = row.get("artist");
+
+    tracing::info!(
+        source_id = %source_id,
+        recording_id = %recording_id,
+        path = %file_path,
+        "Resolved play request"
+    );
+
+    state
+        .player
+        .play(EnginePlayRequest {
+            recording_id,
+            source_id,
+            file_path,
+            title,
+            artist,
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(state.player.snapshot())
+}
+
+#[tauri::command]
+pub fn pause(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+    tracing::info!("Pause command received");
+    state.player.pause().map_err(|e| e.to_string())?;
+    Ok(state.player.snapshot())
+}
+
+#[tauri::command]
+pub fn resume(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+    tracing::info!("Resume command received");
+    state.player.resume().map_err(|e| e.to_string())?;
+    Ok(state.player.snapshot())
+}
+
+#[tauri::command]
+pub fn seek(
+    state: tauri::State<'_, AppState>,
+    request: SeekRequest,
+) -> Result<PlayerState, String> {
+    tracing::info!(position_ms = request.position_ms, "Seek command received");
+    state
+        .player
+        .seek(request.position_ms)
+        .map_err(|e| e.to_string())?;
+    Ok(state.player.snapshot())
+}
+
+#[tauri::command]
+pub fn set_volume(
+    state: tauri::State<'_, AppState>,
+    request: VolumeRequest,
+) -> Result<PlayerState, String> {
+    tracing::info!(volume = request.volume, "Set volume command received");
+    state
+        .player
+        .set_volume(request.volume)
+        .map_err(|e| e.to_string())?;
+    Ok(state.player.snapshot())
+}
+
+#[tauri::command]
+pub fn stop(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+    tracing::info!("Stop command received");
+    state.player.stop().map_err(|e| e.to_string())?;
+    Ok(state.player.snapshot())
+}
 
 #[tauri::command]
 pub async fn get_library_summary(
@@ -217,9 +330,7 @@ pub async fn list_recordings(
 }
 
 #[tauri::command]
-pub async fn list_artists(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<ArtistRow>, String> {
+pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<ArtistRow>, String> {
     let db = &state.db;
 
     let rows = sqlx::query(
@@ -256,9 +367,11 @@ pub async fn list_artists(
 }
 
 pub async fn load_music_root(db: &sqlx::SqlitePool) -> anyhow::Result<Option<String>> {
-    Ok(sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'music_root'")
-        .fetch_optional(db)
-        .await?)
+    Ok(
+        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'music_root'")
+            .fetch_optional(db)
+            .await?,
+    )
 }
 
 async fn load_app_config(db: &sqlx::SqlitePool) -> anyhow::Result<AppConfig> {

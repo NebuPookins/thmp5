@@ -1,5 +1,6 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
 type LibrarySummary = {
@@ -51,7 +52,35 @@ type RecordingRow = {
   primary_source_path: string | null;
 };
 
+type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
+
+type PlayerState = {
+  status: PlaybackStatus;
+  recording_id: string | null;
+  source_id: string | null;
+  title: string | null;
+  artist: string | null;
+  duration_ms: number | null;
+  position_ms: number;
+  volume: number;
+};
+
+type PlayerErrorEvent = {
+  message: string;
+};
+
 type QueueItem = RecordingRow;
+
+const DEFAULT_PLAYER_STATE: PlayerState = {
+  status: "stopped",
+  recording_id: null,
+  source_id: null,
+  title: null,
+  artist: null,
+  duration_ms: null,
+  position_ms: 0,
+  volume: 1,
+};
 
 function formatDuration(durationMs: number | null): string {
   if (!durationMs || durationMs <= 0) {
@@ -59,34 +88,30 @@ function formatDuration(durationMs: number | null): string {
   }
 
   const totalSeconds = Math.floor(durationMs / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds
+      .toString()
+      .padStart(2, "0")}`;
+  }
+
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
 function formatLastPlayed(value: string | null): string {
-  if (!value) {
-    return "Never";
-  }
-
-  return value;
-}
-
-function sourceUrl(recording: RecordingRow | null): string | null {
-  if (!recording?.primary_source_path) {
-    return null;
-  }
-
-  return convertFileSrc(recording.primary_source_path);
+  return value ?? "Never";
 }
 
 function App() {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<QueueItem[]>([]);
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
+  const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
   const [search, setSearch] = useState("");
   const [wizardPath, setWizardPath] = useState("");
   const [queueHistoryLimitInput, setQueueHistoryLimitInput] = useState("5");
@@ -95,9 +120,10 @@ function App() {
   const [isRefreshingTable, setIsRefreshingTable] = useState(false);
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
+  const isPlaying = playerState.status === "playing";
+  const activeDurationMs = playerState.duration_ms ?? currentTrack?.duration_ms ?? 0;
 
   async function loadRecordings() {
     setIsRefreshingTable(true);
@@ -116,9 +142,13 @@ function App() {
 
   async function loadBootstrap() {
     try {
-      const result = await invoke<AppBootstrap>("get_app_bootstrap");
-      setBootstrap(result);
-      setQueueHistoryLimitInput(String(result.config.queue_history_limit));
+      const [bootstrapResult, currentPlayerState] = await Promise.all([
+        invoke<AppBootstrap>("get_app_bootstrap"),
+        invoke<PlayerState>("get_player_state"),
+      ]);
+      setBootstrap(bootstrapResult);
+      setQueueHistoryLimitInput(String(bootstrapResult.config.queue_history_limit));
+      setPlayerState(currentPlayerState);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
@@ -146,11 +176,13 @@ function App() {
     const interval = window.setInterval(async () => {
       try {
         const progress = await invoke<ImportProgress>("get_import_progress");
+        const summary = await invoke<LibrarySummary>("get_library_summary");
         setBootstrap((current) =>
           current
             ? {
                 ...current,
                 import_progress: progress,
+                library_summary: summary,
               }
             : current,
         );
@@ -160,28 +192,7 @@ function App() {
             limit: 10000,
             offset: 0,
           });
-          const summary = await invoke<LibrarySummary>("get_library_summary");
           setRecordings(rows);
-          setBootstrap((current) =>
-            current
-              ? {
-                  ...current,
-                  import_progress: progress,
-                  library_summary: summary,
-                }
-              : current,
-          );
-        } else {
-          const summary = await invoke<LibrarySummary>("get_library_summary");
-          setBootstrap((current) =>
-            current
-              ? {
-                  ...current,
-                  import_progress: progress,
-                  library_summary: summary,
-                }
-              : current,
-          );
         }
       } catch (pollError) {
         setError(pollError instanceof Error ? pollError.message : String(pollError));
@@ -192,54 +203,108 @@ function App() {
   }, [bootstrap?.needs_setup]);
 
   useEffect(() => {
-    if (currentTrack || queue.length === 0) {
-      return;
+    let isMounted = true;
+
+    async function subscribe() {
+      const unlistenState = await listen<PlayerState>("player-state", (event) => {
+        if (isMounted) {
+          setPlayerState(event.payload);
+        }
+      });
+      const unlistenPosition = await listen<number>("player-position", (event) => {
+        if (!isMounted) {
+          return;
+        }
+
+        setPlayerState((current) => ({
+          ...current,
+          position_ms: event.payload,
+        }));
+      });
+      const unlistenEnded = await listen<{
+        recording_id: string;
+        source_id: string;
+        position_ms: number;
+      }>("player-track-ended", (event) => {
+        if (isMounted) {
+          void completeCurrentTrack(event.payload.position_ms);
+        }
+      });
+      const unlistenError = await listen<PlayerErrorEvent>("player-error", (event) => {
+        if (isMounted) {
+          setError(event.payload.message);
+        }
+      });
+
+      return () => {
+        unlistenState();
+        unlistenPosition();
+        unlistenEnded();
+        unlistenError();
+      };
     }
 
-    setCurrentTrack(queue[0]);
-    setQueue((current) => current.slice(1));
-  }, [currentTrack, queue]);
+    const unsubscribePromise = subscribe();
+
+    return () => {
+      isMounted = false;
+      void unsubscribePromise.then((unsubscribe) => unsubscribe?.());
+    };
+  }, [queueHistoryLimit]);
 
   useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) {
+    if (currentTrack || queue.length === 0 || playerState.status === "loading") {
       return;
     }
 
-    const nextSource = sourceUrl(currentTrack);
-    if (!nextSource) {
-      setIsPlaying(false);
+    const [nextTrack, ...rest] = queue;
+    setCurrentTrack(nextTrack);
+    setQueue(rest);
+  }, [currentTrack, playerState.status, queue]);
+
+  useEffect(() => {
+    if (!currentTrack?.primary_source_id) {
       return;
     }
 
-    audio.src = nextSource;
-    void audio.play().then(
-      () => setIsPlaying(true),
-      (playError) =>
-        setError(playError instanceof Error ? playError.message : String(playError)),
-    );
-  }, [currentTrack]);
+    setError(null);
+    void invoke<PlayerState>("play", {
+      request: { source_id: currentTrack.primary_source_id },
+    })
+      .then((nextState) => setPlayerState(nextState))
+      .catch((playError) => {
+        setError(playError instanceof Error ? playError.message : String(playError));
+        setCurrentTrack(null);
+      });
+  }, [currentTrack?.id, currentTrack?.primary_source_id]);
 
-  async function completeCurrentTrack() {
-    const audio = audioRef.current;
-    if (currentTrack) {
+  async function completeCurrentTrack(positionMs?: number) {
+    const finishedTrack = currentTrack;
+    if (finishedTrack) {
       try {
         await invoke("record_play_history", {
           input: {
-            recording_id: currentTrack.id,
-            source_id: currentTrack.primary_source_id,
-            duration_played_ms: audio ? Math.floor(audio.currentTime * 1000) : null,
+            recording_id: finishedTrack.id,
+            source_id: finishedTrack.primary_source_id,
+            duration_played_ms: positionMs ?? playerState.position_ms,
           },
         });
       } catch (recordError) {
         setError(recordError instanceof Error ? recordError.message : String(recordError));
       }
 
-      setHistory((current) => [currentTrack, ...current].slice(0, queueHistoryLimit));
+      setHistory((current) => [finishedTrack, ...current].slice(0, queueHistoryLimit));
     }
 
     setCurrentTrack(null);
-    setIsPlaying(false);
+    setPlayerState((current) => ({
+      ...current,
+      position_ms: 0,
+      duration_ms: null,
+      status: "stopped",
+      recording_id: null,
+      source_id: null,
+    }));
   }
 
   async function handleWizardSubmit(event: FormEvent<HTMLFormElement>) {
@@ -315,32 +380,73 @@ function App() {
     }
   }
 
-  function addToQueue(recording: RecordingRow) {
-    if (!recording.primary_source_path) {
+  function enqueueRecording(recording: RecordingRow) {
+    if (!recording.primary_source_id) {
       setError(`No playable local file is available for "${recording.title}".`);
+      return;
+    }
+
+    setError(null);
+    if (!currentTrack && playerState.status === "stopped") {
+      setCurrentTrack(recording);
       return;
     }
 
     setQueue((current) => [...current, recording]);
   }
 
-  function handlePauseResume() {
-    const audio = audioRef.current;
-    if (!audio) {
+  async function handlePauseResume() {
+    if (!currentTrack) {
+      if (queue.length > 0) {
+        const [nextTrack, ...rest] = queue;
+        setCurrentTrack(nextTrack);
+        setQueue(rest);
+      }
       return;
     }
 
-    if (audio.paused) {
-      void audio.play().then(() => setIsPlaying(true));
-      return;
+    try {
+      if (playerState.status === "playing") {
+        const nextState = await invoke<PlayerState>("pause");
+        setPlayerState(nextState);
+      } else {
+        const nextState = await invoke<PlayerState>("resume");
+        setPlayerState(nextState);
+      }
+    } catch (playbackError) {
+      setError(playbackError instanceof Error ? playbackError.message : String(playbackError));
     }
-
-    audio.pause();
-    setIsPlaying(false);
   }
 
   async function handleSkip() {
-    await completeCurrentTrack();
+    try {
+      await invoke<PlayerState>("stop");
+    } catch (stopError) {
+      setError(stopError instanceof Error ? stopError.message : String(stopError));
+    }
+    await completeCurrentTrack(playerState.position_ms);
+  }
+
+  async function handleSeek(nextPositionMs: number) {
+    try {
+      const nextState = await invoke<PlayerState>("seek", {
+        request: { position_ms: nextPositionMs },
+      });
+      setPlayerState(nextState);
+    } catch (seekError) {
+      setError(seekError instanceof Error ? seekError.message : String(seekError));
+    }
+  }
+
+  async function handleVolumeChange(nextVolume: number) {
+    try {
+      const nextState = await invoke<PlayerState>("set_volume", {
+        request: { volume: nextVolume },
+      });
+      setPlayerState(nextState);
+    } catch (volumeError) {
+      setError(volumeError instanceof Error ? volumeError.message : String(volumeError));
+    }
   }
 
   const filteredRecordings = useMemo(() => {
@@ -402,15 +508,6 @@ function App() {
 
   return (
     <main className="app-shell">
-      <audio
-        onEnded={() => {
-          void completeCurrentTrack();
-        }}
-        onPause={() => setIsPlaying(false)}
-        onPlay={() => setIsPlaying(true)}
-        ref={audioRef}
-      />
-
       <section className="topbar">
         <div>
           <p className="eyebrow">thmp5</p>
@@ -506,20 +603,20 @@ function App() {
               <tbody>
                 {filteredRecordings.map((recording) => (
                   <tr
-                    className={recording.primary_source_path ? "playable-row" : "muted-row"}
+                    className={recording.primary_source_id ? "playable-row" : "muted-row"}
                     key={recording.id}
-                    onDoubleClick={() => addToQueue(recording)}
+                    onDoubleClick={() => enqueueRecording(recording)}
                     title={
-                      recording.primary_source_path
-                        ? "Double click to queue"
+                      recording.primary_source_id
+                        ? "Double click to play or queue"
                         : "No playable local file"
                     }
                   >
                     <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
                     <td>{recording.title}</td>
                     <td>{recording.release_group_title ?? "Unknown Album"}</td>
-                    <td>{recording.genre ?? "Unknown"}</td>
-                    <td>{recording.rating ?? "–"}</td>
+                    <td>{recording.genre ?? "—"}</td>
+                    <td>{recording.rating ?? "—"}</td>
                     <td>{formatDuration(recording.duration_ms)}</td>
                     <td>{recording.play_count}</td>
                     <td>{formatLastPlayed(recording.last_played)}</td>
@@ -532,19 +629,18 @@ function App() {
 
         <aside className="queue-panel">
           <section className="player-panel">
-            <p className="panel-label">Now playing</p>
-            <h2>{currentTrack?.title ?? "Nothing playing"}</h2>
+            <p className="panel-label">Player</p>
+            <h2>{currentTrack?.title ?? "Nothing queued"}</h2>
             <p className="subtle-text">
-              {currentTrack?.artist_credit_name ?? "Queue a recording by double clicking a row."}
+              {currentTrack?.artist_credit_name ?? "Queue a track from the library"}
             </p>
             <div className="player-controls">
-              <button
-                className="secondary-button"
-                disabled={!currentTrack}
-                onClick={handlePauseResume}
-                type="button"
-              >
-                {isPlaying ? "Pause" : "Play"}
+              <button className="primary-button" onClick={handlePauseResume} type="button">
+                {playerState.status === "loading"
+                  ? "Loading..."
+                  : isPlaying
+                    ? "Pause"
+                    : "Play"}
               </button>
               <button
                 className="secondary-button"
@@ -554,23 +650,58 @@ function App() {
                 }}
                 type="button"
               >
-                Next
+                Skip
               </button>
             </div>
+
+            <div className="player-scrubber">
+              <span>{formatDuration(playerState.position_ms)}</span>
+              <input
+                className="slider-input"
+                disabled={!currentTrack || activeDurationMs <= 0}
+                max={activeDurationMs || 0}
+                min={0}
+                onChange={(event) => {
+                  void handleSeek(Number(event.currentTarget.value));
+                }}
+                type="range"
+                value={Math.min(playerState.position_ms, activeDurationMs || 0)}
+              />
+              <span>{formatDuration(activeDurationMs)}</span>
+            </div>
+
+            <label className="volume-row">
+              <span className="panel-meta">Volume</span>
+              <input
+                className="slider-input"
+                max={1.5}
+                min={0}
+                onChange={(event) => {
+                  void handleVolumeChange(Number(event.currentTarget.value));
+                }}
+                step={0.01}
+                type="range"
+                value={playerState.volume}
+              />
+              <strong>{Math.round(playerState.volume * 100)}%</strong>
+            </label>
           </section>
 
           <section className="queue-settings">
             <p className="panel-label">Queue settings</p>
-            <label className="input-label" htmlFor="history-limit">
-              Keep last N songs
-            </label>
             <div className="settings-row">
-              <input
-                id="history-limit"
-                className="small-input"
-                onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
-                value={queueHistoryLimitInput}
-              />
+              <div>
+                <label className="input-label" htmlFor="queue-history-limit">
+                  History limit
+                </label>
+                <input
+                  id="queue-history-limit"
+                  className="small-input"
+                  inputMode="numeric"
+                  onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
+                  value={queueHistoryLimitInput}
+                />
+              </div>
               <button
                 className="secondary-button"
                 disabled={isSavingQueueSettings}
@@ -582,41 +713,48 @@ function App() {
                 {isSavingQueueSettings ? "Saving..." : "Save"}
               </button>
             </div>
-            <p className="subtle-text">Current limit: {queueHistoryLimit}</p>
           </section>
 
           <section className="queue-list-panel">
             <div className="queue-header">
-              <p className="panel-label">Up next</p>
-              <span className="panel-meta">{queue.length}</span>
+              <div>
+                <p className="panel-label">Up next</p>
+                <strong>{queue.length} queued</strong>
+              </div>
             </div>
-            <ul className="queue-list">
-              {queue.map((item, index) => (
-                <li key={`${item.id}-${index}`}>
-                  <strong>{item.title}</strong>
-                  <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
-                </li>
-              ))}
-              {queue.length === 0 ? <li className="empty-item">Queue is empty.</li> : null}
-            </ul>
+            <ol className="queue-list">
+              {queue.length === 0 ? (
+                <li className="empty-item">Nothing queued.</li>
+              ) : (
+                queue.map((item) => (
+                  <li key={`${item.id}-${item.primary_source_id}`}>
+                    <strong>{item.title}</strong>
+                    <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                  </li>
+                ))
+              )}
+            </ol>
           </section>
 
           <section className="queue-list-panel">
             <div className="queue-header">
-              <p className="panel-label">Recently played</p>
-              <span className="panel-meta">{history.length}</span>
+              <div>
+                <p className="panel-label">Recently played</p>
+                <strong>{history.length} tracked</strong>
+              </div>
             </div>
-            <ul className="queue-list">
-              {history.map((item) => (
-                <li key={`history-${item.id}-${item.primary_source_id ?? "none"}`}>
-                  <strong>{item.title}</strong>
-                  <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
-                </li>
-              ))}
+            <ol className="queue-list">
               {history.length === 0 ? (
-                <li className="empty-item">Playback history is empty.</li>
-              ) : null}
-            </ul>
+                <li className="empty-item">Playback history will show up here.</li>
+              ) : (
+                history.map((item) => (
+                  <li key={`history-${item.id}-${item.play_count}`}>
+                    <strong>{item.title}</strong>
+                    <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                  </li>
+                ))
+              )}
+            </ol>
           </section>
         </aside>
       </section>

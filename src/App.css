@@ -162,7 +162,9 @@ button {
 
 .topbar-actions,
 .player-controls,
-.import-stats {
+.import-stats,
+.player-scrubber,
+.volume-row {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
@@ -292,6 +294,22 @@ thead th {
   padding: 18px;
 }
 
+.player-scrubber,
+.volume-row {
+  align-items: center;
+  margin-top: 16px;
+}
+
+.player-scrubber span,
+.volume-row span {
+  color: #9db0c9;
+}
+
+.slider-input {
+  flex: 1;
+  accent-color: #efb15a;
+}
+
 .queue-header {
   display: flex;
   justify-content: space-between;
@@ -320,6 +338,11 @@ thead th {
 .empty-item,
 .input-label {
   color: #95aac4;
+}
+
+.empty-item {
+  justify-content: center;
+  align-items: flex-start;
 }
 
 .error-banner {
