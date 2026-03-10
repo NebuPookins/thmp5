@@ -2,24 +2,30 @@ use crate::models::{PlaybackStatus, PlayerState};
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 use tauri::{AppHandle, Emitter};
 
 pub const PLAYER_STATE_EVENT: &str = "player-state";
 pub const PLAYER_POSITION_EVENT: &str = "player-position";
 pub const PLAYER_TRACK_ENDED_EVENT: &str = "player-track-ended";
 pub const PLAYER_ERROR_EVENT: &str = "player-error";
+
+const PREBUFFER_FRAMES: usize = 8_192;
+const MAX_BUFFER_FRAMES: usize = 96_000;
 
 #[derive(Debug, Clone)]
 pub struct PlayRequest {
@@ -62,6 +68,7 @@ impl AudioEngineHandle {
         let shared = Arc::new(Mutex::new(SharedState::new(48_000, 2)));
         let (tx, rx) = mpsc::channel();
         let command_shared = Arc::clone(&shared);
+
         thread::Builder::new()
             .name("audio-engine".to_string())
             .spawn(move || {
@@ -80,7 +87,7 @@ impl AudioEngineHandle {
                     }
 
                     if let Err(error) = handle_command(command, &command_shared, &app) {
-                        emit_error(&app, error.to_string());
+                        set_engine_error(&command_shared, &app, error.to_string());
                     }
                 }
             })
@@ -138,11 +145,12 @@ struct SharedState {
     status: PlaybackStatus,
     volume: f32,
     engine_error: Option<String>,
-    current_track: Option<LoadedTrack>,
+    current_track: Option<StreamingTrack>,
     current_recording_id: Option<String>,
     current_source_id: Option<String>,
     current_title: Option<String>,
     current_artist: Option<String>,
+    current_file_path: Option<String>,
     output_frame_position: u64,
     last_position_emit_ms: u64,
 }
@@ -160,6 +168,7 @@ impl SharedState {
             current_source_id: None,
             current_title: None,
             current_artist: None,
+            current_file_path: None,
             output_frame_position: 0,
             last_position_emit_ms: 0,
         }
@@ -186,48 +195,55 @@ impl SharedState {
         self.output_frame_position.saturating_mul(1000) / u64::from(self.output_sample_rate)
     }
 
+    fn stop_decoder(&mut self) {
+        if let Some(track) = &self.current_track {
+            if let Ok(mut buffer) = track.buffer.lock() {
+                buffer.stop_requested = true;
+            }
+        }
+    }
+
     fn clear_track(&mut self) {
+        self.stop_decoder();
         self.status = PlaybackStatus::Stopped;
         self.current_track = None;
         self.current_recording_id = None;
         self.current_source_id = None;
         self.current_title = None;
         self.current_artist = None;
+        self.current_file_path = None;
         self.output_frame_position = 0;
         self.last_position_emit_ms = 0;
     }
 }
 
-struct LoadedTrack {
-    samples: Vec<f32>,
-    source_sample_rate: u32,
-    source_channels: u16,
+#[derive(Clone)]
+struct StreamingTrack {
+    buffer: Arc<Mutex<TrackBuffer>>,
     duration_ms: u64,
-    source_frame_len: usize,
 }
 
-impl LoadedTrack {
-    fn sample_for_output(
-        &self,
-        output_frame_index: u64,
-        output_rate: u32,
-        output_channel: usize,
-    ) -> f32 {
-        let source_frame = ((output_frame_index as u128) * (self.source_sample_rate as u128)
-            / (output_rate as u128)) as usize;
+struct TrackBuffer {
+    samples: VecDeque<f32>,
+    finished: bool,
+    stop_requested: bool,
+}
 
-        if source_frame >= self.source_frame_len {
-            return 0.0;
+impl TrackBuffer {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            finished: false,
+            stop_requested: false,
+        }
+    }
+
+    fn buffered_frames(&self, channels: usize) -> usize {
+        if channels == 0 {
+            return 0;
         }
 
-        let source_channel = if self.source_channels == 1 {
-            0
-        } else {
-            output_channel.min(self.source_channels as usize - 1)
-        };
-
-        let sample_index = source_frame * self.source_channels as usize + source_channel;
-        self.samples.get(sample_index).copied().unwrap_or(0.0)
+        self.samples.len() / channels
     }
 }
 
@@ -242,40 +258,9 @@ fn handle_command(
                 recording_id = %request.recording_id,
                 source_id = %request.source_id,
                 path = %request.file_path,
-                "Beginning track load"
+                "Beginning streaming track load"
             );
-            update_state(shared, app, |state| {
-                state.status = PlaybackStatus::Loading;
-                state.current_recording_id = Some(request.recording_id.clone());
-                state.current_source_id = Some(request.source_id.clone());
-                state.current_title = request.title.clone();
-                state.current_artist = request.artist.clone();
-                state.current_track = None;
-                state.output_frame_position = 0;
-                state.last_position_emit_ms = 0;
-            });
-
-            let track = LocalFileSource::open(Path::new(&request.file_path))
-                .with_context(|| format!("Failed to open {}", request.file_path))?
-                .decode_all()
-                .with_context(|| format!("Failed to decode {}", request.file_path))?;
-
-            tracing::info!(
-                recording_id = %request.recording_id,
-                source_id = %request.source_id,
-                duration_ms = track.duration_ms,
-                frames = track.source_frame_len,
-                sample_rate = track.source_sample_rate,
-                channels = track.source_channels,
-                "Track decoded"
-            );
-
-            update_state(shared, app, |state| {
-                state.current_track = Some(track);
-                state.status = PlaybackStatus::Playing;
-                state.output_frame_position = 0;
-                state.last_position_emit_ms = 0;
-            });
+            start_playback(shared, app, request, 0)?;
         }
         AudioCommand::Pause => {
             tracing::info!("Pausing playback");
@@ -289,22 +274,35 @@ fn handle_command(
             tracing::info!("Resuming playback");
             update_state(shared, app, |state| {
                 if state.current_track.is_some() {
-                    state.status = PlaybackStatus::Playing;
+                    state.status = PlaybackStatus::Loading;
                 }
             });
         }
         AudioCommand::Seek(position_ms) => {
             tracing::info!(position_ms, "Seeking playback");
-            update_state(shared, app, |state| {
-                let duration_ms = state.current_track.as_ref().map(|track| track.duration_ms);
-                let clamped_ms = duration_ms
-                    .map(|duration| position_ms.min(duration))
-                    .unwrap_or(position_ms);
-                state.output_frame_position =
-                    clamped_ms.saturating_mul(u64::from(state.output_sample_rate)) / 1000;
-                state.last_position_emit_ms = clamped_ms.saturating_sub(250);
-            });
-            emit_position(shared, app);
+            let request = {
+                let state = shared
+                    .lock()
+                    .map_err(|_| anyhow!("Audio state lock poisoned"))?;
+                PlayRequest {
+                    recording_id: state
+                        .current_recording_id
+                        .clone()
+                        .ok_or_else(|| anyhow!("No active track to seek"))?,
+                    source_id: state
+                        .current_source_id
+                        .clone()
+                        .ok_or_else(|| anyhow!("No active track to seek"))?,
+                    file_path: state
+                        .current_file_path
+                        .clone()
+                        .ok_or_else(|| anyhow!("No active track to seek"))?,
+                    title: state.current_title.clone(),
+                    artist: state.current_artist.clone(),
+                }
+            };
+
+            start_playback(shared, app, request, position_ms)?;
         }
         AudioCommand::SetVolume(volume) => {
             tracing::info!(volume, "Updating playback volume");
@@ -323,6 +321,180 @@ fn handle_command(
     Ok(())
 }
 
+fn start_playback(
+    shared: &Arc<Mutex<SharedState>>,
+    app: &AppHandle,
+    request: PlayRequest,
+    start_ms: u64,
+) -> Result<()> {
+    let (output_rate, output_channels) = {
+        let state = shared
+            .lock()
+            .map_err(|_| anyhow!("Audio state lock poisoned"))?;
+        (state.output_sample_rate, state.output_channels)
+    };
+
+    let source = LocalFileSource::open(Path::new(&request.file_path))
+        .with_context(|| format!("Failed to open {}", request.file_path))?;
+
+    let buffer = Arc::new(Mutex::new(TrackBuffer::new()));
+    let duration_ms = source.duration_ms;
+    let current_output_position = start_ms.saturating_mul(u64::from(output_rate)) / 1000;
+
+    update_state(shared, app, |state| {
+        state.stop_decoder();
+        state.status = PlaybackStatus::Loading;
+        state.current_track = Some(StreamingTrack {
+            buffer: Arc::clone(&buffer),
+            duration_ms,
+        });
+        state.current_recording_id = Some(request.recording_id.clone());
+        state.current_source_id = Some(request.source_id.clone());
+        state.current_title = request.title.clone();
+        state.current_artist = request.artist.clone();
+        state.current_file_path = Some(request.file_path.clone());
+        state.output_frame_position = current_output_position;
+        state.last_position_emit_ms = start_ms.saturating_sub(250);
+    });
+
+    spawn_decoder_thread(
+        source,
+        start_ms,
+        output_rate,
+        output_channels,
+        buffer,
+        app.clone(),
+    );
+
+    Ok(())
+}
+
+fn spawn_decoder_thread(
+    source: LocalFileSource,
+    start_ms: u64,
+    output_rate: u32,
+    output_channels: u16,
+    buffer: Arc<Mutex<TrackBuffer>>,
+    app: AppHandle,
+) {
+    thread::Builder::new()
+        .name("audio-decoder".to_string())
+        .spawn(move || {
+            if let Err(error) = decode_into_buffer(
+                source,
+                start_ms,
+                output_rate,
+                output_channels,
+                Arc::clone(&buffer),
+            ) {
+                if let Ok(mut state) = buffer.lock() {
+                    state.finished = true;
+                }
+                emit_error(&app, error.to_string());
+            }
+        })
+        .ok();
+}
+
+fn decode_into_buffer(
+    mut source: LocalFileSource,
+    start_ms: u64,
+    output_rate: u32,
+    output_channels: u16,
+    buffer: Arc<Mutex<TrackBuffer>>,
+) -> Result<()> {
+    tracing::info!(
+        start_ms,
+        source_rate = source.sample_rate,
+        source_channels = source.channels,
+        output_rate,
+        output_channels,
+        "Decoder worker started"
+    );
+
+    if start_ms > 0 {
+        source.seek_to_ms(start_ms)?;
+    }
+
+    let mut resampler = StreamResampler::new(
+        source.sample_rate,
+        source.channels,
+        output_rate,
+        output_channels,
+        start_ms,
+    );
+
+    loop {
+        {
+            let state = buffer
+                .lock()
+                .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
+            if state.stop_requested {
+                tracing::info!("Decoder worker stopping early");
+                return Ok(());
+            }
+            if state.buffered_frames(output_channels as usize) >= MAX_BUFFER_FRAMES {
+                drop(state);
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        }
+
+        let packet = match source.format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(SymphoniaError::ResetRequired) => {
+                return Err(anyhow!("Decoder reset required during playback"));
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        if packet.track_id() != source.track_id {
+            continue;
+        }
+
+        let decoded = match source.decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut input = Vec::new();
+        append_audio_buffer(decoded, &mut input);
+        let output = resampler.push(&input);
+
+        if !output.is_empty() {
+            let mut state = buffer
+                .lock()
+                .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
+            if state.stop_requested {
+                return Ok(());
+            }
+            state.samples.extend(output);
+        }
+    }
+
+    let tail = resampler.finish();
+    let mut state = buffer
+        .lock()
+        .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
+    if !tail.is_empty() {
+        state.samples.extend(tail);
+    }
+    state.finished = true;
+    tracing::info!("Decoder worker finished");
+    Ok(())
+}
+
 fn update_state<F>(shared: &Arc<Mutex<SharedState>>, app: &AppHandle, f: F)
 where
     F: FnOnce(&mut SharedState),
@@ -337,18 +509,6 @@ where
     };
 
     let _ = app.emit(PLAYER_STATE_EVENT, snapshot);
-}
-
-fn emit_position(shared: &Arc<Mutex<SharedState>>, app: &AppHandle) {
-    let position = {
-        let state = match shared.lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        state.position_ms()
-    };
-
-    let _ = app.emit(PLAYER_POSITION_EVENT, position);
 }
 
 fn emit_error(app: &AppHandle, message: String) {
@@ -379,7 +539,6 @@ fn ensure_output_stream(
         return Ok(());
     }
 
-    tracing::info!("Initializing output stream");
     let (device, supported_config) = select_output_device(host)?;
     let stream_config = supported_config.config();
     let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
@@ -390,6 +549,7 @@ fn ensure_output_stream(
         format = ?supported_config.sample_format(),
         "Using output device"
     );
+
     if let Ok(mut state) = shared.lock() {
         state.output_sample_rate = stream_config.sample_rate.0;
         state.output_channels = stream_config.channels;
@@ -402,7 +562,6 @@ fn ensure_output_stream(
         .context("Failed to start output stream")?;
     *stream = Some(output_stream);
     clear_engine_error(shared);
-    tracing::info!("Output stream ready");
     Ok(())
 }
 
@@ -527,12 +686,41 @@ fn write_output_data<T, F>(
 
         let output_channels = state.output_channels as usize;
         for frame in output.chunks_mut(output_channels) {
-            let Some(track) = state.current_track.as_ref() else {
+            let Some((track_buffer, track_duration_ms)) = state
+                .current_track
+                .as_ref()
+                .map(|track| (Arc::clone(&track.buffer), track.duration_ms))
+            else {
                 for sample in frame.iter_mut() {
                     *sample = convert(0.0);
                 }
                 continue;
             };
+
+            let mut buffer = match track_buffer.lock() {
+                Ok(buffer) => buffer,
+                Err(_) => {
+                    for sample in frame.iter_mut() {
+                        *sample = convert(0.0);
+                    }
+                    continue;
+                }
+            };
+
+            if state.status == PlaybackStatus::Paused {
+                for sample in frame.iter_mut() {
+                    *sample = convert(0.0);
+                }
+                continue;
+            }
+
+            let ready_frames = buffer.buffered_frames(output_channels);
+            if state.status == PlaybackStatus::Loading
+                && (ready_frames >= PREBUFFER_FRAMES || (buffer.finished && ready_frames > 0))
+            {
+                state.status = PlaybackStatus::Playing;
+                snapshot = Some(state.player_state());
+            }
 
             if state.status != PlaybackStatus::Playing {
                 for sample in frame.iter_mut() {
@@ -541,34 +729,37 @@ fn write_output_data<T, F>(
                 continue;
             }
 
-            let current_ms = state.position_ms();
-            if current_ms >= track.duration_ms {
+            if ready_frames == 0 {
+                if buffer.finished {
+                    ended_event = match (
+                        state.current_recording_id.clone(),
+                        state.current_source_id.clone(),
+                    ) {
+                        (Some(recording_id), Some(source_id)) => Some(TrackEndedEvent {
+                            recording_id,
+                            source_id,
+                            position_ms: track_duration_ms,
+                        }),
+                        _ => None,
+                    };
+                    state.clear_track();
+                    snapshot = Some(state.player_state());
+                    for sample in frame.iter_mut() {
+                        *sample = convert(0.0);
+                    }
+                    break;
+                }
+
+                state.status = PlaybackStatus::Loading;
+                snapshot = Some(state.player_state());
                 for sample in frame.iter_mut() {
                     *sample = convert(0.0);
                 }
-
-                ended_event = match (
-                    state.current_recording_id.clone(),
-                    state.current_source_id.clone(),
-                ) {
-                    (Some(recording_id), Some(source_id)) => Some(TrackEndedEvent {
-                        recording_id,
-                        source_id,
-                        position_ms: track.duration_ms,
-                    }),
-                    _ => None,
-                };
-                state.clear_track();
-                snapshot = Some(state.player_state());
-                break;
+                continue;
             }
 
-            for (channel_index, sample) in frame.iter_mut().enumerate() {
-                let raw_sample = track.sample_for_output(
-                    state.output_frame_position,
-                    state.output_sample_rate,
-                    channel_index,
-                ) * state.volume;
+            for sample in frame.iter_mut() {
+                let raw_sample = buffer.samples.pop_front().unwrap_or(0.0) * state.volume;
                 *sample = convert(raw_sample);
             }
 
@@ -596,6 +787,9 @@ struct LocalFileSource {
     format: Box<dyn symphonia::core::formats::FormatReader>,
     decoder: Box<dyn symphonia::core::codecs::Decoder>,
     track_id: u32,
+    sample_rate: u32,
+    channels: u16,
+    duration_ms: u64,
 }
 
 impl LocalFileSource {
@@ -619,6 +813,21 @@ impl LocalFileSource {
             .default_track()
             .ok_or_else(|| anyhow!("No supported audio track found"))?;
         let track_id = track.id;
+        let sample_rate = track
+            .codec_params
+            .sample_rate
+            .ok_or_else(|| anyhow!("Audio track sample rate is unknown"))?;
+        let channels = track
+            .codec_params
+            .channels
+            .map(|channels| channels.count() as u16)
+            .ok_or_else(|| anyhow!("Audio track channel count is unknown"))?;
+        let duration_ms = match (track.codec_params.n_frames, track.codec_params.sample_rate) {
+            (Some(frame_count), Some(rate)) if rate > 0 => {
+                frame_count.saturating_mul(1000) / u64::from(rate)
+            }
+            _ => 0,
+        };
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())?;
 
@@ -626,77 +835,24 @@ impl LocalFileSource {
             format,
             decoder,
             track_id,
+            sample_rate,
+            channels,
+            duration_ms,
         })
     }
 
-    fn decode_all(mut self) -> Result<LoadedTrack> {
-        tracing::info!("Starting full track decode");
-        let mut samples = Vec::new();
-        let mut source_sample_rate = None;
-        let mut source_channels = None;
-        let mut packet_count: u64 = 0;
-
-        loop {
-            let packet = match self.format.next_packet() {
-                Ok(packet) => packet,
-                Err(SymphoniaError::ResetRequired) => {
-                    return Err(anyhow!("Decoder reset required"));
-                }
-                Err(SymphoniaError::IoError(error))
-                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error.into()),
-            };
-
-            if packet.track_id() != self.track_id {
-                continue;
-            }
-            packet_count = packet_count.saturating_add(1);
-            if packet_count % 500 == 0 {
-                tracing::debug!(packet_count, "Decode progress");
-            }
-
-            let decoded = match self.decoder.decode(&packet) {
-                Ok(decoded) => decoded,
-                Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(SymphoniaError::IoError(error))
-                    if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error.into()),
-            };
-
-            source_sample_rate.get_or_insert(decoded.spec().rate);
-            source_channels.get_or_insert(decoded.spec().channels.count() as u16);
-            append_audio_buffer(decoded, &mut samples);
-        }
-
-        let source_sample_rate =
-            source_sample_rate.ok_or_else(|| anyhow!("Audio stream had no decodable frames"))?;
-        let source_channels =
-            source_channels.ok_or_else(|| anyhow!("Audio stream had no channel data"))?;
-        let source_frame_len = samples.len() / source_channels as usize;
-        let duration_ms =
-            (source_frame_len as u64).saturating_mul(1000) / u64::from(source_sample_rate);
-
-        tracing::info!(
-            packet_count,
-            sample_rate = source_sample_rate,
-            channels = source_channels,
-            duration_ms,
-            "Finished full track decode"
-        );
-
-        Ok(LoadedTrack {
-            samples,
-            source_sample_rate,
-            source_channels,
-            duration_ms,
-            source_frame_len,
-        })
+    fn seek_to_ms(&mut self, position_ms: u64) -> Result<()> {
+        let time = Time::from(position_ms as f64 / 1000.0);
+        self.format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(self.track_id),
+                },
+            )
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }
 
@@ -704,6 +860,89 @@ fn append_audio_buffer(decoded: AudioBufferRef<'_>, samples: &mut Vec<f32>) {
     let mut interleaved = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
     interleaved.copy_interleaved_ref(decoded);
     samples.extend_from_slice(interleaved.samples());
+}
+
+struct StreamResampler {
+    source_rate: u32,
+    source_channels: usize,
+    output_rate: u32,
+    output_channels: usize,
+    pending_source: Vec<f32>,
+    source_frame_offset: u64,
+    next_output_frame: u64,
+}
+
+impl StreamResampler {
+    fn new(
+        source_rate: u32,
+        source_channels: u16,
+        output_rate: u32,
+        output_channels: u16,
+        start_ms: u64,
+    ) -> Self {
+        let next_output_frame = start_ms.saturating_mul(u64::from(output_rate)) / 1000;
+        let source_frame_offset = start_ms.saturating_mul(u64::from(source_rate)) / 1000;
+
+        Self {
+            source_rate,
+            source_channels: source_channels as usize,
+            output_rate,
+            output_channels: output_channels as usize,
+            pending_source: Vec::new(),
+            source_frame_offset,
+            next_output_frame,
+        }
+    }
+
+    fn push(&mut self, input: &[f32]) -> Vec<f32> {
+        self.pending_source.extend_from_slice(input);
+        self.produce_available()
+    }
+
+    fn finish(&mut self) -> Vec<f32> {
+        self.produce_available()
+    }
+
+    fn produce_available(&mut self) -> Vec<f32> {
+        let pending_frames = self.pending_source.len() / self.source_channels;
+        let max_source_frame = self.source_frame_offset + pending_frames as u64;
+        let mut output = Vec::new();
+
+        while self.required_source_frame() < max_source_frame {
+            let source_frame = self.required_source_frame();
+            let local_frame = (source_frame - self.source_frame_offset) as usize;
+
+            for output_channel in 0..self.output_channels {
+                let source_channel = if self.source_channels == 1 {
+                    0
+                } else {
+                    output_channel.min(self.source_channels - 1)
+                };
+                let sample_index = local_frame * self.source_channels + source_channel;
+                output.push(*self.pending_source.get(sample_index).unwrap_or(&0.0));
+            }
+
+            self.next_output_frame = self.next_output_frame.saturating_add(1);
+        }
+
+        let drop_frames = self
+            .required_source_frame()
+            .saturating_sub(self.source_frame_offset);
+        if drop_frames > 0 {
+            let drop_samples = (drop_frames as usize) * self.source_channels;
+            self.pending_source
+                .drain(0..drop_samples.min(self.pending_source.len()));
+            self.source_frame_offset = self.source_frame_offset.saturating_add(drop_frames);
+        }
+
+        output
+    }
+
+    fn required_source_frame(&self) -> u64 {
+        self.next_output_frame
+            .saturating_mul(u64::from(self.source_rate))
+            / u64::from(self.output_rate)
+    }
 }
 
 impl Default for PlayerState {
