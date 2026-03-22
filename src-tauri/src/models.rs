@@ -102,6 +102,7 @@ pub struct RecordingRow {
     pub last_played: Option<String>,
     pub primary_source_id: Option<String>,
     pub primary_source_path: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

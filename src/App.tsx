@@ -52,6 +52,7 @@ type RecordingRow = {
   last_played: string | null;
   primary_source_id: string | null;
   primary_source_path: string | null;
+  tags: string[];
 };
 
 type ArtistRow = {
@@ -208,6 +209,10 @@ function App() {
   const [ratingAlbumKeyInFlight, setRatingAlbumKeyInFlight] = useState<string | null>(null);
   const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [allTags, setAllTags] = useState<string[]>([]);
+  const [tagInputRecordingId, setTagInputRecordingId] = useState<string | null>(null);
+  const [tagInputValue, setTagInputValue] = useState("");
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
   const isPlaying = playerState.status === "playing";
@@ -249,6 +254,12 @@ function App() {
           }
         }
 
+        if (selectedTag) {
+          if (!recording.tags.includes(selectedTag)) {
+            return false;
+          }
+        }
+
         if (!needle) {
           return true;
         }
@@ -258,7 +269,7 @@ function App() {
           .some((value) => value!.toLowerCase().includes(needle));
       })
       .sort(trackSort);
-  }, [recordings, search, selectedArtist, selectedReleaseGroup]);
+  }, [recordings, search, selectedArtist, selectedReleaseGroup, selectedTag]);
 
   async function loadRecordings() {
     const rows = await invoke<RecordingRow[]>("list_recordings", {
@@ -266,6 +277,11 @@ function App() {
       offset: 0,
     });
     setRecordings(rows);
+  }
+
+  async function loadAllTags() {
+    const tags = await invoke<string[]>("list_all_tags");
+    setAllTags(tags);
   }
 
   async function loadArtists() {
@@ -288,6 +304,7 @@ function App() {
         loadRecordings(),
         loadArtists(),
         loadReleaseGroups(nextArtistId, nextSearch),
+        loadAllTags(),
       ]);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
@@ -685,6 +702,46 @@ function App() {
     }
   }
 
+  async function handleAddTag(recordingId: string, tag: string) {
+    const trimmed = tag.trim().toLowerCase();
+    if (!trimmed) return;
+    // Optimistic update
+    setRecordings((current) =>
+      current.map((r) =>
+        r.id === recordingId && !r.tags.includes(trimmed)
+          ? { ...r, tags: [...r.tags, trimmed].sort() }
+          : r,
+      ),
+    );
+    setAllTags((current) =>
+      current.includes(trimmed) ? current : [...current, trimmed].sort(),
+    );
+    setTagInputValue("");
+    setTagInputRecordingId(null);
+    try {
+      await invoke("add_recording_tag", { recordingId, tag: trimmed });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      // Reload to restore accurate state
+      await loadRecordings();
+    }
+  }
+
+  async function handleRemoveTag(recordingId: string, tag: string) {
+    // Optimistic update
+    setRecordings((current) =>
+      current.map((r) =>
+        r.id === recordingId ? { ...r, tags: r.tags.filter((t) => t !== tag) } : r,
+      ),
+    );
+    try {
+      await invoke("remove_recording_tag", { recordingId, tag });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      await loadRecordings();
+    }
+  }
+
   if (isBootstrapping) {
     return <main className="loading-screen">Loading thmp5…</main>;
   }
@@ -913,7 +970,16 @@ function App() {
                   {selectedArtist?.name ?? "All artists"}
                 </span>
               </div>
+              {selectedTag ? (
+                <div className="active-tag-filter">
+                  Filtered by tag: <strong>{selectedTag}</strong>
+                  <button onClick={() => setSelectedTag(null)} type="button" className="tag-remove-btn">×</button>
+                </div>
+              ) : null}
               <div className="table-wrap track-table-wrap">
+                <datalist id="all-tags-list">
+                  {allTags.map((t) => <option key={t} value={t} />)}
+                </datalist>
                 <table className="recordings-table">
                   <thead>
                     <tr>
@@ -922,6 +988,7 @@ function App() {
                       <th>Artist</th>
                       <th>Album</th>
                       <th>Genre</th>
+                      <th>Tags</th>
                       <th>Rating</th>
                       <th>Duration</th>
                       <th>Plays</th>
@@ -949,6 +1016,73 @@ function App() {
                         <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
                         <td>{recording.release_group_title ?? "Unknown Album"}</td>
                         <td>{recording.genre ?? "—"}</td>
+                        <td
+                          onClick={(e) => e.stopPropagation()}
+                          onDoubleClick={(e) => e.stopPropagation()}
+                        >
+                          <div className="tag-chips">
+                            {recording.tags.map((tag) => (
+                              <span
+                                className="tag-chip"
+                                key={tag}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedTag(tag);
+                                }}
+                              >
+                                {tag}
+                                <button
+                                  className="tag-remove-btn"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void handleRemoveTag(recording.id, tag);
+                                  }}
+                                  title={`Remove tag "${tag}"`}
+                                  type="button"
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            ))}
+                            {tagInputRecordingId === recording.id ? (
+                              <input
+                                autoFocus
+                                className="tag-input"
+                                list="all-tags-list"
+                                onBlur={() => {
+                                  setTagInputRecordingId(null);
+                                  setTagInputValue("");
+                                }}
+                                onChange={(e) => setTagInputValue(e.currentTarget.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    void handleAddTag(recording.id, tagInputValue);
+                                  } else if (e.key === "Escape") {
+                                    setTagInputRecordingId(null);
+                                    setTagInputValue("");
+                                  }
+                                }}
+                                placeholder="add tag…"
+                                type="text"
+                                value={tagInputValue}
+                              />
+                            ) : (
+                              <button
+                                className="tag-add-btn"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setTagInputRecordingId(recording.id);
+                                  setTagInputValue("");
+                                }}
+                                title="Add tag"
+                                type="button"
+                              >
+                                +
+                              </button>
+                            )}
+                          </div>
+                        </td>
                         <td>
                           <RatingStars
                             disabled={ratingKeyInFlight === `recording:${recording.id}`}
@@ -965,7 +1099,7 @@ function App() {
                     ))}
                     {filteredRecordings.length === 0 ? (
                       <tr>
-                        <td className="empty-table-state" colSpan={9}>
+                        <td className="empty-table-state" colSpan={10}>
                           No tracks match the current artist, album, and search filters.
                         </td>
                       </tr>

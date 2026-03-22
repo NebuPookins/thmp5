@@ -319,7 +319,13 @@ pub async fn list_recordings(
                   AND s.file_path IS NOT NULL
                 ORDER BY s.file_path
                 LIMIT 1
-            ) AS primary_source_path
+            ) AS primary_source_path,
+            (
+                SELECT GROUP_CONCAT(rt.tag, char(0))
+                FROM recording_tag rt
+                WHERE rt.recording_id = r.id
+                ORDER BY rt.tag
+            ) AS tags_raw
          FROM recording r
          LEFT JOIN recording_artist ra         ON ra.recording_id = r.id AND ra.position = 0
          LEFT JOIN artist a                    ON a.id = ra.artist_id
@@ -358,6 +364,11 @@ pub async fn list_recordings(
             last_played: row.get("last_played"),
             primary_source_id: row.get("primary_source_id"),
             primary_source_path: row.get("primary_source_path"),
+            tags: {
+                let raw: Option<String> = row.get("tags_raw");
+                raw.map(|r| r.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+                   .unwrap_or_default()
+            },
         })
         .collect();
 
@@ -540,6 +551,53 @@ pub async fn set_release_group_rating(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn add_recording_tag(
+    state: tauri::State<'_, AppState>,
+    recording_id: String,
+    tag: String,
+) -> Result<(), String> {
+    let tag = tag.trim().to_lowercase();
+    if tag.is_empty() {
+        return Err("Tag cannot be empty.".to_string());
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO recording_tag (recording_id, tag) VALUES (?, ?)",
+    )
+    .bind(&recording_id)
+    .bind(&tag)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_recording_tag(
+    state: tauri::State<'_, AppState>,
+    recording_id: String,
+    tag: String,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM recording_tag WHERE recording_id = ? AND tag = ?")
+        .bind(&recording_id)
+        .bind(&tag)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let tags = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT tag FROM recording_tag ORDER BY tag",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(tags)
 }
 
 fn validate_rating(stars: Option<i64>) -> Result<(), String> {

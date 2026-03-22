@@ -431,7 +431,7 @@ src/
 12. [ ] Artist/Album/Track tree view with virtualized lists (browser exists; virtualization deferred — needs react-window or similar npm dep)
 13. [x] Cover art extraction and display (`get_cover_art` Tauri command via lofty; displayed in the player panel for the active track)
 14. [x] Inline rating UI (per recording ✓; per album ✓ — `set_release_group_rating` command + `RatingStars` in album browser)
-15. [ ] Tag management UI
+15. [x] Tag management UI (`add_recording_tag`, `remove_recording_tag`, `list_all_tags` commands; Tags column in track table with chip display, inline add-input with datalist autocomplete, click-to-filter-by-tag)
 
 ### Phase 4 — Smart Playlists
 16. [ ] Implement pest grammar + AST types
