@@ -206,10 +206,11 @@ function App() {
   const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false);
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
   const [ratingKeyInFlight, setRatingKeyInFlight] = useState<string | null>(null);
-const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
+  const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
-  const [allTags, setAllTags] = useState<string[]>([]);
+  const [_allTags, setAllTags] = useState<string[]>([]);
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
   const isPlaying = playerState.status === "playing";
@@ -618,6 +619,23 @@ const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
     }
   }
 
+  async function handleSkipBack() {
+    // If more than 3 s in, just restart the current track
+    if (playerState.position_ms >= 3000 || history.length === 0) {
+      void handleSeek(0);
+      return;
+    }
+    const [prev, ...restHistory] = history;
+    setHistory(restHistory);
+    if (currentTrack) {
+      setQueue((current) => [currentTrack, ...current]);
+    }
+    try {
+      await invoke<PlayerState>("stop");
+    } catch { /* engine may already be stopped */ }
+    setCurrentTrack(prev);
+  }
+
   async function handleSkip() {
     try {
       await invoke<PlayerState>("stop");
@@ -719,25 +737,94 @@ const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
   return (
     <main className="app-shell">
       <section className="topbar">
-        <div>
-          <p className="eyebrow">thmp5</p>
-          <h1>Library</h1>
-        </div>
-        <div className="topbar-actions">
+        {playerCoverArt ? (
+          <img alt="Album art" className="topbar-art" src={playerCoverArt} />
+        ) : (
+          <div className="topbar-art topbar-art-placeholder" />
+        )}
+
+        <div className="transport-controls">
           <button
-            className="secondary-button"
-            disabled={isRefreshingLibrary}
-            onClick={() => {
-              void loadLibraryData();
-            }}
+            className="transport-btn"
+            disabled={history.length === 0 && playerState.position_ms < 3000}
+            onClick={() => { void handleSkipBack(); }}
+            title="Previous"
+            type="button"
+          >⏮</button>
+          <button
+            className="transport-btn transport-btn-play"
+            onClick={handlePauseResume}
+            title={isPlaying ? "Pause" : "Play"}
             type="button"
           >
-            {isRefreshingLibrary ? "Refreshing..." : "Refresh library"}
+            {playerState.status === "loading" ? "…" : isPlaying ? "⏸" : "▶"}
           </button>
-          <button className="secondary-button" onClick={handleRescan} type="button">
-            Rescan library
-          </button>
+          <button
+            className="transport-btn"
+            disabled={!currentTrack}
+            onClick={() => { void handleSkip(); }}
+            title="Skip"
+            type="button"
+          >⏭</button>
         </div>
+
+        <div className="now-playing-block">
+          <div className="now-playing-meta">
+            <div className="now-playing-text">
+              <div className="now-playing-title">
+                {currentTrack?.title ?? "Nothing playing"}
+              </div>
+              <div className="now-playing-sub">
+                {currentTrack
+                  ? [currentTrack.artist_credit_name, currentTrack.release_group_title]
+                      .filter(Boolean)
+                      .join(" · ")
+                  : "Queue a track from the library"}
+              </div>
+            </div>
+            {currentTrack ? (
+              <RatingStars
+                disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
+                onChange={(stars) => { void updateRecordingRating(currentTrack.id, stars); }}
+                value={currentTrack.rating}
+              />
+            ) : null}
+          </div>
+          <div className="topbar-scrubber">
+            <span>{formatDuration(playerState.position_ms)}</span>
+            <input
+              className="slider-input"
+              disabled={!currentTrack || activeDurationMs <= 0}
+              max={activeDurationMs || 0}
+              min={0}
+              onChange={(event) => { void handleSeek(Number(event.currentTarget.value)); }}
+              type="range"
+              value={Math.min(playerState.position_ms, activeDurationMs || 0)}
+            />
+            <span>{formatDuration(activeDurationMs)}</span>
+          </div>
+        </div>
+
+        <div className="topbar-volume">
+          <span>🔊</span>
+          <input
+            className="slider-input"
+            max={1.5}
+            min={0}
+            onChange={(event) => { void handleVolumeChange(Number(event.currentTarget.value)); }}
+            step={0.01}
+            type="range"
+            value={playerState.volume}
+          />
+          <span>{Math.round(playerState.volume * 100)}%</span>
+        </div>
+
+        <button
+          className="settings-btn"
+          onClick={() => setIsModalOpen(true)}
+          title="Options"
+          type="button"
+        >⋯</button>
       </section>
 
       {error ? <section className="error-banner">{error}</section> : null}
@@ -900,7 +987,7 @@ const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
               {selectedTag ? (
                 <div className="active-tag-filter">
                   Filtered by tag: <strong>{selectedTag}</strong>
-                  <button onClick={() => setSelectedTag(null)} type="button" className="tag-remove-btn">×</button>
+                  <button onClick={() => setSelectedTag(null)} type="button" className="modal-close-btn">×</button>
                 </div>
               ) : null}
               <div className="table-wrap track-table-wrap">
@@ -989,100 +1076,6 @@ const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
         </section>
 
         <aside className="queue-panel">
-          <section className="player-panel">
-            <p className="panel-label">Player</p>
-            {playerCoverArt ? (
-              <img
-                alt="Album art"
-                className="cover-art"
-                src={playerCoverArt}
-              />
-            ) : null}
-            <h2>{currentTrack?.title ?? "Nothing queued"}</h2>
-            <p className="subtle-text">
-              {currentTrack?.artist_credit_name ?? "Queue a track from the library"}
-            </p>
-            <div className="player-controls">
-              <button className="primary-button" onClick={handlePauseResume} type="button">
-                {playerState.status === "loading"
-                  ? "Loading..."
-                  : isPlaying
-                    ? "Pause"
-                    : "Play"}
-              </button>
-              <button
-                className="secondary-button"
-                disabled={!currentTrack}
-                onClick={() => {
-                  void handleSkip();
-                }}
-                type="button"
-              >
-                Skip
-              </button>
-            </div>
-
-            <div className="player-scrubber">
-              <span>{formatDuration(playerState.position_ms)}</span>
-              <input
-                className="slider-input"
-                disabled={!currentTrack || activeDurationMs <= 0}
-                max={activeDurationMs || 0}
-                min={0}
-                onChange={(event) => {
-                  void handleSeek(Number(event.currentTarget.value));
-                }}
-                type="range"
-                value={Math.min(playerState.position_ms, activeDurationMs || 0)}
-              />
-              <span>{formatDuration(activeDurationMs)}</span>
-            </div>
-
-            <label className="volume-row">
-              <span className="panel-meta">Volume</span>
-              <input
-                className="slider-input"
-                max={1.5}
-                min={0}
-                onChange={(event) => {
-                  void handleVolumeChange(Number(event.currentTarget.value));
-                }}
-                step={0.01}
-                type="range"
-                value={playerState.volume}
-              />
-              <strong>{Math.round(playerState.volume * 100)}%</strong>
-            </label>
-          </section>
-
-          <section className="queue-settings">
-            <p className="panel-label">Queue settings</p>
-            <div className="settings-row">
-              <div>
-                <label className="input-label" htmlFor="queue-history-limit">
-                  History limit
-                </label>
-                <input
-                  id="queue-history-limit"
-                  className="small-input"
-                  inputMode="numeric"
-                  onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
-                  value={queueHistoryLimitInput}
-                />
-              </div>
-              <button
-                className="secondary-button"
-                disabled={isSavingQueueSettings}
-                onClick={() => {
-                  void saveQueueSettings();
-                }}
-                type="button"
-              >
-                {isSavingQueueSettings ? "Saving..." : "Save"}
-              </button>
-            </div>
-          </section>
-
           <section className="queue-list-panel">
             <div className="queue-header">
               <div>
@@ -1126,6 +1119,73 @@ const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
           </section>
         </aside>
       </section>
+
+      {isModalOpen ? (
+        <div
+          className="modal-overlay"
+          onClick={() => setIsModalOpen(false)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Options</h2>
+              <button
+                className="modal-close-btn"
+                onClick={() => setIsModalOpen(false)}
+                type="button"
+              >✕</button>
+            </div>
+
+            <div className="modal-section">
+              <p className="modal-section-label">Library</p>
+              <div className="modal-actions">
+                <button
+                  className="secondary-button"
+                  disabled={isRefreshingLibrary}
+                  onClick={() => { void loadLibraryData(); }}
+                  type="button"
+                >
+                  {isRefreshingLibrary ? "Refreshing…" : "Refresh library"}
+                </button>
+                <button
+                  className="secondary-button"
+                  onClick={handleRescan}
+                  type="button"
+                >
+                  Rescan library
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-section">
+              <p className="modal-section-label">Queue</p>
+              <div className="settings-row">
+                <div>
+                  <label className="input-label" htmlFor="modal-queue-history-limit">
+                    History limit
+                  </label>
+                  <input
+                    id="modal-queue-history-limit"
+                    className="small-input"
+                    inputMode="numeric"
+                    onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
+                    value={queueHistoryLimitInput}
+                  />
+                </div>
+                <button
+                  className="secondary-button"
+                  disabled={isSavingQueueSettings}
+                  onClick={() => { void saveQueueSettings(); }}
+                  type="button"
+                >
+                  {isSavingQueueSettings ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
