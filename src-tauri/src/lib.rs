@@ -91,7 +91,6 @@ pub fn run() {
             commands::set_volume,
             commands::stop,
             commands::get_cover_art,
-            commands::set_release_group_rating,
             commands::list_all_tags,
         ])
         .run(tauri::generate_context!())

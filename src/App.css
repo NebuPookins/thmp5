@@ -544,12 +544,6 @@ thead th {
   object-fit: cover;
 }
 
-.album-rating-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 4px;
-}
 
 .tag-chips {
   display: flex;

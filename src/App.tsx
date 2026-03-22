@@ -61,6 +61,7 @@ type ArtistRow = {
   sort_name: string;
   release_group_count: number;
   recording_count: number;
+  rating: number | null;
 };
 
 type ReleaseGroupRow = {
@@ -72,7 +73,6 @@ type ReleaseGroupRow = {
   recording_count: number;
   release_date: string | null;
   rating: number | null;
-  explicit_rating: number | null;
 };
 
 type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
@@ -206,8 +206,7 @@ function App() {
   const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false);
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
   const [ratingKeyInFlight, setRatingKeyInFlight] = useState<string | null>(null);
-  const [ratingAlbumKeyInFlight, setRatingAlbumKeyInFlight] = useState<string | null>(null);
-  const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
+const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [allTags, setAllTags] = useState<string[]>([]);
@@ -678,28 +677,6 @@ function App() {
     }
   }
 
-  async function updateReleaseGroupRating(releaseGroupId: string, stars: number | null) {
-    const ratingKey = `rg:${releaseGroupId}`;
-    const previousReleaseGroups = releaseGroups;
-    setRatingAlbumKeyInFlight(ratingKey);
-    setReleaseGroups((current) =>
-      current.map((rg) =>
-        rg.id === releaseGroupId ? { ...rg, explicit_rating: stars } : rg,
-      ),
-    );
-
-    try {
-      await invoke("set_release_group_rating", {
-        request: { id: releaseGroupId, stars },
-      });
-    } catch (ratingError) {
-      setReleaseGroups(previousReleaseGroups);
-      setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
-    } finally {
-      setRatingAlbumKeyInFlight((current) => (current === ratingKey ? null : current));
-    }
-  }
-
   if (isBootstrapping) {
     return <main className="loading-screen">Loading thmp5…</main>;
   }
@@ -853,6 +830,7 @@ function App() {
                       <span>
                         {artist.release_group_count} albums · {artist.recording_count} tracks
                       </span>
+                      <span className="rating-summary">{formatAlbumRating(artist.rating)}</span>
                     </button>
                   ))
                 )}
@@ -902,16 +880,7 @@ function App() {
                         {releaseGroup.artist_credit_name ?? "Unknown Artist"} ·{" "}
                         {formatYear(releaseGroup.release_date)}
                       </span>
-                      <div className="album-rating-row" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
-                        <RatingStars
-                          disabled={ratingAlbumKeyInFlight === `rg:${releaseGroup.id}`}
-                          onChange={(stars) => {
-                            void updateReleaseGroupRating(releaseGroup.id, stars);
-                          }}
-                          value={releaseGroup.explicit_rating}
-                        />
-                        <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
-                      </div>
+                      <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
                     </div>
                   ))
                 )}

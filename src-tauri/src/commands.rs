@@ -385,10 +385,12 @@ pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<Artis
             a.name,
             a.sort_name,
             COUNT(DISTINCT rga.release_group_id) AS release_group_count,
-            COUNT(DISTINCT ra.recording_id)      AS recording_count
+            COUNT(DISTINCT ra.recording_id)      AS recording_count,
+            AVG(ur.stars)                        AS rating
          FROM artist a
          LEFT JOIN recording_artist ra      ON ra.artist_id = a.id
          LEFT JOIN release_group_artist rga ON rga.artist_id = a.id
+         LEFT JOIN user_rating ur           ON ur.recording_id = ra.recording_id
          GROUP BY a.id
          ORDER BY lower(a.sort_name)",
     )
@@ -406,6 +408,7 @@ pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<Artis
                 .get::<Option<i64>, _>("release_group_count")
                 .unwrap_or(0),
             recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
+            rating: row.get("rating"),
         })
         .collect();
 
@@ -447,8 +450,7 @@ pub async fn list_release_groups(
                         ON ur2.recording_id = t2.recording_id
                     WHERE rel2.release_group_id = rg.id
                 ) AS track_ratings
-            )                                                        AS rating,
-            rgr2.stars                                               AS explicit_rating
+            )                                                        AS rating
          FROM release_group rg
          LEFT JOIN release_group_artist rga
              ON rga.release_group_id = rg.id AND rga.position = 0
@@ -460,8 +462,6 @@ pub async fn list_release_groups(
              ON m.release_id = rel.id
          LEFT JOIN track t
              ON t.medium_id = m.id
-         LEFT JOIN release_group_rating rgr2
-             ON rgr2.release_group_id = rg.id
          WHERE (? IS NULL OR a.id = ?)
            AND (
                ? IS NULL
@@ -491,7 +491,6 @@ pub async fn list_release_groups(
             recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
             release_date: row.get("release_date"),
             rating: row.get("rating"),
-            explicit_rating: row.get("explicit_rating"),
         })
         .collect();
 
@@ -520,37 +519,6 @@ pub async fn get_cover_art(
 
     crate::library::scanner::extract_cover_art(std::path::Path::new(&path))
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn set_release_group_rating(
-    state: tauri::State<'_, AppState>,
-    request: RatingUpdateRequest,
-) -> Result<(), String> {
-    validate_rating(request.stars)?;
-
-    if let Some(stars) = request.stars {
-        sqlx::query(
-            "INSERT INTO release_group_rating (release_group_id, stars, updated_at)
-             VALUES (?, ?, datetime('now'))
-             ON CONFLICT(release_group_id) DO UPDATE SET
-                stars = excluded.stars,
-                updated_at = datetime('now')",
-        )
-        .bind(&request.id)
-        .bind(stars)
-        .execute(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
-    } else {
-        sqlx::query("DELETE FROM release_group_rating WHERE release_group_id = ?")
-            .bind(&request.id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    Ok(())
 }
 
 

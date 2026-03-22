@@ -112,6 +112,7 @@ pub struct ArtistRow {
     pub sort_name: String,
     pub release_group_count: i64,
     pub recording_count: i64,
+    pub rating: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,7 +125,6 @@ pub struct ReleaseGroupRow {
     pub recording_count: i64,
     pub release_date: Option<String>,
     pub rating: Option<f64>,
-    pub explicit_rating: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
