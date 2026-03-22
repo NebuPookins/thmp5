@@ -92,8 +92,6 @@ pub fn run() {
             commands::stop,
             commands::get_cover_art,
             commands::set_release_group_rating,
-            commands::add_recording_tag,
-            commands::remove_recording_tag,
             commands::list_all_tags,
         ])
         .run(tauri::generate_context!())

@@ -553,41 +553,6 @@ pub async fn set_release_group_rating(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn add_recording_tag(
-    state: tauri::State<'_, AppState>,
-    recording_id: String,
-    tag: String,
-) -> Result<(), String> {
-    let tag = tag.trim().to_lowercase();
-    if tag.is_empty() {
-        return Err("Tag cannot be empty.".to_string());
-    }
-    sqlx::query(
-        "INSERT OR IGNORE INTO recording_tag (recording_id, tag) VALUES (?, ?)",
-    )
-    .bind(&recording_id)
-    .bind(&tag)
-    .execute(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn remove_recording_tag(
-    state: tauri::State<'_, AppState>,
-    recording_id: String,
-    tag: String,
-) -> Result<(), String> {
-    sqlx::query("DELETE FROM recording_tag WHERE recording_id = ? AND tag = ?")
-        .bind(&recording_id)
-        .bind(&tag)
-        .execute(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 #[tauri::command]
 pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {

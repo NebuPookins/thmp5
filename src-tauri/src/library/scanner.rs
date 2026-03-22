@@ -89,6 +89,38 @@ pub fn read_metadata(path: &Path) -> Result<TrackMetadata> {
     Ok(meta)
 }
 
+/// Parse a comment field into tags.
+///
+/// Two kinds of tags are extracted:
+/// - `#token` runs (stored verbatim, including `#`): plain (`#chill`) and parameterized (`#TS:5/8`, `#drumdiff:7`)
+/// - Delimiter-split plain text: the remainder after removing `#tokens` is split on `,`, `;`, and `\n`
+pub fn parse_comment_tags(comment: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    let mut plain_buf = String::new();
+    let mut rest = comment;
+
+    while let Some(hash_pos) = rest.find('#') {
+        plain_buf.push_str(&rest[..hash_pos]);
+        rest = &rest[hash_pos..];
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        let token = &rest[..end];
+        if token.len() > 1 {
+            tags.push(token.to_string());
+        }
+        rest = &rest[end..];
+    }
+    plain_buf.push_str(rest);
+
+    for part in plain_buf.split([',', ';', '\n']) {
+        let t = part.trim();
+        if !t.is_empty() {
+            tags.push(t.to_string());
+        }
+    }
+
+    tags
+}
+
 /// Extract embedded cover art from an audio file. Returns a data URL (data:image/...;base64,...) or None.
 pub fn extract_cover_art(path: &Path) -> Result<Option<String>> {
     use lofty::picture::PictureType;

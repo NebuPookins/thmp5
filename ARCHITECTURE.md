@@ -271,6 +271,12 @@ When the user adds a file or directory:
 7. **Deduplication** — if AcoustID matches an existing Recording, add a new Source row
    rather than creating a new Recording
 8. **Store** — write all entities to SQLite in a transaction
+9. **Comment → tag sync** — parse the `comment` field into `recording_tag` rows (runs on
+   every import, including rescans, so editing a file's comment and rescanning updates tags):
+   - `#token` runs (e.g. `#chill`, `#TS:5/8`, `#drumdiff:7`) are stored verbatim
+   - Remaining text split on `,` `;` `\n` yields plain tags
+   - Parameterized form `#key:value` is first-class; Phase 4 query language will support
+     `HasTag "#TS" != "4/4"` and `HasTag "#drumdiff" < 5` style predicates
 
 ---
 
@@ -431,7 +437,7 @@ src/
 12. [ ] Artist/Album/Track tree view with virtualized lists (browser exists; virtualization deferred — needs react-window or similar npm dep)
 13. [x] Cover art extraction and display (`get_cover_art` Tauri command via lofty; displayed in the player panel for the active track)
 14. [x] Inline rating UI (per recording ✓; per album ✓ — `set_release_group_rating` command + `RatingStars` in album browser)
-15. [x] Tag management UI (`add_recording_tag`, `remove_recording_tag`, `list_all_tags` commands; Tags column in track table with chip display, inline add-input with datalist autocomplete, click-to-filter-by-tag)
+15. [x] Tag management UI (tags derived from file `comment` field — not editable in app; `list_all_tags` command; Tags column shows read-only chips, click to filter; `parse_comment_tags` handles `#token` and `#key:value` parameterized forms alongside delimiter-split plain tags)
 
 ### Phase 4 — Smart Playlists
 16. [ ] Implement pest grammar + AST types

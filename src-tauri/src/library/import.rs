@@ -204,6 +204,7 @@ pub(crate) async fn store_prepared_import(
     // ── 7. Find or create Recording (3-level dedup) ───────────────────────────
     let recording_id =
         find_or_create_recording(&mut tx, &meta, &artist_id, acoustid_match.as_ref()).await?;
+    sync_tags_from_comment(&mut tx, &recording_id, meta.comment.as_deref()).await?;
 
     // ── 8. ReleaseGroup / Release / Medium ────────────────────────────────────
     let album_title = meta.album.as_deref().unwrap_or("Unknown Album").to_string();
@@ -531,6 +532,42 @@ async fn insert_recording_artist(
     .bind(role)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// Sync `recording_tag` rows from the recording's comment field.
+///
+/// Always updates `recording.comment` so rescans pick up changes, then
+/// replaces all tag rows with ones freshly parsed from the comment.
+async fn sync_tags_from_comment(
+    tx: &mut Transaction<'_, Sqlite>,
+    recording_id: &str,
+    comment: Option<&str>,
+) -> Result<()> {
+    sqlx::query("UPDATE recording SET comment = ? WHERE id = ?")
+        .bind(comment)
+        .bind(recording_id)
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query("DELETE FROM recording_tag WHERE recording_id = ?")
+        .bind(recording_id)
+        .execute(&mut **tx)
+        .await?;
+
+    let tags = comment
+        .map(super::scanner::parse_comment_tags)
+        .unwrap_or_default();
+
+    for tag in tags {
+        sqlx::query(
+            "INSERT OR IGNORE INTO recording_tag (recording_id, tag) VALUES (?, ?)",
+        )
+        .bind(recording_id)
+        .bind(&tag)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
