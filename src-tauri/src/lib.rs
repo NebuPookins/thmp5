@@ -90,6 +90,8 @@ pub fn run() {
             commands::seek,
             commands::set_volume,
             commands::stop,
+            commands::get_cover_art,
+            commands::set_release_group_rating,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

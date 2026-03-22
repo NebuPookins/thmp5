@@ -71,6 +71,7 @@ type ReleaseGroupRow = {
   recording_count: number;
   release_date: string | null;
   rating: number | null;
+  explicit_rating: number | null;
 };
 
 type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
@@ -204,6 +205,8 @@ function App() {
   const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false);
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
   const [ratingKeyInFlight, setRatingKeyInFlight] = useState<string | null>(null);
+  const [ratingAlbumKeyInFlight, setRatingAlbumKeyInFlight] = useState<string | null>(null);
+  const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
@@ -450,6 +453,17 @@ function App() {
     });
   }, [currentTrack?.id, currentTrack?.primary_source_id]);
 
+  useEffect(() => {
+    if (!playerState.recording_id) {
+      setPlayerCoverArt(null);
+      return;
+    }
+    void invoke<string | null>("get_cover_art", { recordingId: playerState.recording_id }).then(
+      (art) => setPlayerCoverArt(art),
+      () => setPlayerCoverArt(null),
+    );
+  }, [playerState.recording_id]);
+
   async function completeCurrentTrack(positionMs?: number) {
     const finishedTrack = currentTrack;
     if (finishedTrack) {
@@ -646,6 +660,28 @@ function App() {
       setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
     } finally {
       setRatingKeyInFlight((current) => (current === ratingKey ? null : current));
+    }
+  }
+
+  async function updateReleaseGroupRating(releaseGroupId: string, stars: number | null) {
+    const ratingKey = `rg:${releaseGroupId}`;
+    const previousReleaseGroups = releaseGroups;
+    setRatingAlbumKeyInFlight(ratingKey);
+    setReleaseGroups((current) =>
+      current.map((rg) =>
+        rg.id === releaseGroupId ? { ...rg, explicit_rating: stars } : rg,
+      ),
+    );
+
+    try {
+      await invoke("set_release_group_rating", {
+        request: { id: releaseGroupId, stars },
+      });
+    } catch (ratingError) {
+      setReleaseGroups(previousReleaseGroups);
+      setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
+    } finally {
+      setRatingAlbumKeyInFlight((current) => (current === ratingKey ? null : current));
     }
   }
 
@@ -851,7 +887,16 @@ function App() {
                         {releaseGroup.artist_credit_name ?? "Unknown Artist"} ·{" "}
                         {formatYear(releaseGroup.release_date)}
                       </span>
-                      <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
+                      <div className="album-rating-row" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                        <RatingStars
+                          disabled={ratingAlbumKeyInFlight === `rg:${releaseGroup.id}`}
+                          onChange={(stars) => {
+                            void updateReleaseGroupRating(releaseGroup.id, stars);
+                          }}
+                          value={releaseGroup.explicit_rating}
+                        />
+                        <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
+                      </div>
                     </div>
                   ))
                 )}
@@ -935,6 +980,13 @@ function App() {
         <aside className="queue-panel">
           <section className="player-panel">
             <p className="panel-label">Player</p>
+            {playerCoverArt ? (
+              <img
+                alt="Album art"
+                className="cover-art"
+                src={playerCoverArt}
+              />
+            ) : null}
             <h2>{currentTrack?.title ?? "Nothing queued"}</h2>
             <p className="subtle-text">
               {currentTrack?.artist_credit_name ?? "Queue a track from the library"}

@@ -88,3 +88,45 @@ pub fn read_metadata(path: &Path) -> Result<TrackMetadata> {
 
     Ok(meta)
 }
+
+/// Extract embedded cover art from an audio file. Returns a data URL (data:image/...;base64,...) or None.
+pub fn extract_cover_art(path: &Path) -> Result<Option<String>> {
+    use lofty::picture::PictureType;
+
+    let tagged_file = match Probe::open(path)
+        .context("Failed to open file for cover art")?
+        .guess_file_type()
+        .context("Failed to detect file type")?
+        .read()
+    {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag());
+
+    let Some(tag) = tag else {
+        return Ok(None);
+    };
+
+    let picture = tag
+        .pictures()
+        .iter()
+        .find(|p| p.pic_type() == PictureType::CoverFront)
+        .or_else(|| tag.pictures().first());
+
+    let Some(picture) = picture else {
+        return Ok(None);
+    };
+
+    let mime = picture
+        .mime_type()
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "image/jpeg".to_string());
+
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(picture.data());
+    Ok(Some(format!("data:{mime};base64,{encoded}")))
+}

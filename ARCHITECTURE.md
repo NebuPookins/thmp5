@@ -421,16 +421,16 @@ src/
 6. [x] Tauri commands: `import_paths`, `get_library_summary`
 
 ### Phase 2 — Playback
-7. [ ] Implement `LocalFileSource` using symphonia
-8. [ ] Implement `AudioEngine` with cpal output, command/event channels
-9. [ ] Tauri commands: `play`, `pause`, `resume`, `seek`, `set_volume`
-10. [ ] Basic `PlayerBar` React component wired to Tauri events
+7. [x] Implement `LocalFileSource` using symphonia
+8. [x] Implement `AudioEngine` with cpal output, command/event channels
+9. [x] Tauri commands: `play`, `pause`, `resume`, `seek`, `set_volume`
+10. [x] Basic `PlayerBar` React component wired to Tauri events
 11. [x] Basic `LibraryView` (list recordings, queue/play from the UI)
 
 ### Phase 3 — Library UI
-12. [ ] Artist/Album/Track tree view with virtualized lists
-13. [ ] Cover art extraction and display
-14. [ ] Inline rating UI (per recording + per album)
+12. [ ] Artist/Album/Track tree view with virtualized lists (browser exists; virtualization deferred — needs react-window or similar npm dep)
+13. [x] Cover art extraction and display (`get_cover_art` Tauri command via lofty; displayed in the player panel for the active track)
+14. [x] Inline rating UI (per recording ✓; per album ✓ — `set_release_group_rating` command + `RatingStars` in album browser)
 15. [ ] Tag management UI
 
 ### Phase 4 — Smart Playlists

@@ -436,7 +436,8 @@ pub async fn list_release_groups(
                         ON ur2.recording_id = t2.recording_id
                     WHERE rel2.release_group_id = rg.id
                 ) AS track_ratings
-            )                                                        AS rating
+            )                                                        AS rating,
+            rgr2.stars                                               AS explicit_rating
          FROM release_group rg
          LEFT JOIN release_group_artist rga
              ON rga.release_group_id = rg.id AND rga.position = 0
@@ -448,6 +449,8 @@ pub async fn list_release_groups(
              ON m.release_id = rel.id
          LEFT JOIN track t
              ON t.medium_id = m.id
+         LEFT JOIN release_group_rating rgr2
+             ON rgr2.release_group_id = rg.id
          WHERE (? IS NULL OR a.id = ?)
            AND (
                ? IS NULL
@@ -477,10 +480,66 @@ pub async fn list_release_groups(
             recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
             release_date: row.get("release_date"),
             rating: row.get("rating"),
+            explicit_rating: row.get("explicit_rating"),
         })
         .collect();
 
     Ok(release_groups)
+}
+
+#[tauri::command]
+pub async fn get_cover_art(
+    state: tauri::State<'_, AppState>,
+    recording_id: String,
+) -> Result<Option<String>, String> {
+    let file_path: Option<String> = sqlx::query_scalar(
+        "SELECT file_path FROM source
+         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
+         ORDER BY file_path LIMIT 1",
+    )
+    .bind(&recording_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| e.to_string())?
+    .flatten();
+
+    let Some(path) = file_path else {
+        return Ok(None);
+    };
+
+    crate::library::scanner::extract_cover_art(std::path::Path::new(&path))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_release_group_rating(
+    state: tauri::State<'_, AppState>,
+    request: RatingUpdateRequest,
+) -> Result<(), String> {
+    validate_rating(request.stars)?;
+
+    if let Some(stars) = request.stars {
+        sqlx::query(
+            "INSERT INTO release_group_rating (release_group_id, stars, updated_at)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(release_group_id) DO UPDATE SET
+                stars = excluded.stars,
+                updated_at = datetime('now')",
+        )
+        .bind(&request.id)
+        .bind(stars)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    } else {
+        sqlx::query("DELETE FROM release_group_rating WHERE release_group_id = ?")
+            .bind(&request.id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 fn validate_rating(stars: Option<i64>) -> Result<(), String> {

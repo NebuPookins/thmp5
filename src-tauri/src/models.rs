@@ -123,6 +123,7 @@ pub struct ReleaseGroupRow {
     pub recording_count: i64,
     pub release_date: Option<String>,
     pub rating: Option<f64>,
+    pub explicit_rating: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
