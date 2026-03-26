@@ -457,3 +457,17 @@ src/
 26. [ ] Cross-fade, gapless playback
 27. [ ] ReplayGain / volume normalization
 28. [ ] Export playlist to M3U / JSON
+
+### Audio Engine — Lock-free hot path (architectural debt)
+29. [ ] Replace `Mutex<SharedState>` access inside the cpal audio callback with lock-free
+        atomics, eliminating the possibility of blocking on the real-time thread:
+        - `status` → `Arc<AtomicU8>` (PlaybackStatus as u8)
+        - `volume` → `Arc<AtomicU32>` (f32 bits via `f32::to_bits` / `f32::from_bits`)
+        - `stop_requested` (currently in TrackBuffer) → `Arc<AtomicBool>`
+        - track-ended notification → pre-allocated `crossbeam_channel::bounded(1)` sender
+          in the callback, received by the engine thread
+        - The callback uses `try_lock` on TrackBuffer with a silence fallback rather than
+          blocking; SharedState mutex is never acquired from the cpal thread at all
+        - Benefit: eliminates the whole class of deadlocks where the audio callback holds
+          a lock that command/state threads also need; also prevents buffer underruns if
+          any other thread briefly holds the lock
