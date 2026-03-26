@@ -419,6 +419,35 @@ thead th {
   color: #7a93b0;
 }
 
+.auto-dj-btn {
+  border: 1px solid rgba(140, 164, 190, 0.22);
+  background: rgba(16, 25, 38, 0.84);
+  color: #8fa5c2;
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+  transition: border-color 150ms ease, background 150ms ease, color 150ms ease;
+}
+
+.auto-dj-btn:hover {
+  border-color: rgba(94, 166, 255, 0.38);
+  color: #c8dcf0;
+}
+
+.auto-dj-btn-on {
+  background: linear-gradient(135deg, #f8d367 0%, #ef9f4f 100%);
+  border-color: transparent;
+  color: #0b1018;
+}
+
+.auto-dj-btn-on:hover {
+  color: #0b1018;
+  border-color: transparent;
+}
+
 .queue-now-playing {
   background: linear-gradient(180deg, rgba(41, 54, 76, 0.94), rgba(18, 28, 42, 0.94)) !important;
   border: 1px solid rgba(239, 177, 90, 0.55);

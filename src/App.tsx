@@ -194,6 +194,7 @@ function App() {
   const [releaseGroups, setReleaseGroups] = useState<ReleaseGroupRow[]>([]);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<QueueItem[]>([]);
+  const [autoDj, setAutoDj] = useState(false);
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const currentTrackRef = useRef<QueueItem | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
@@ -454,6 +455,18 @@ function App() {
     setCurrentTrack(nextTrack);
     setQueue(rest);
   }, [currentTrack, playerState.status, queue]);
+
+  useEffect(() => {
+    if (!autoDj || queue.length > 0) {
+      return;
+    }
+    const playable = recordings.filter((r) => r.primary_source_id !== null);
+    if (playable.length === 0) {
+      return;
+    }
+    const pick = playable[Math.floor(Math.random() * playable.length)];
+    setQueue((current) => [...current, pick]);
+  }, [autoDj, queue, recordings]);
 
   useEffect(() => {
     if (!currentTrack?.primary_source_id) {
@@ -1055,6 +1068,14 @@ function App() {
                     : "Nothing playing"}
                 </strong>
               </div>
+              <button
+                className={`auto-dj-btn ${autoDj ? "auto-dj-btn-on" : ""}`}
+                onClick={() => setAutoDj((v) => !v)}
+                title={autoDj ? "Auto DJ on — click to disable" : "Auto DJ off — click to enable"}
+                type="button"
+              >
+                Auto DJ
+              </button>
             </div>
             <ol className="queue-list">
               {history.length === 0 && !currentTrack && queue.length === 0 ? (
