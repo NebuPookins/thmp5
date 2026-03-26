@@ -1063,20 +1063,50 @@ function App() {
                 <>
                   {[...history].reverse().map((item, i) => (
                     <li className="queue-history-item" key={`history-${i}-${item.id}`}>
-                      <strong>{item.title}</strong>
-                      <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                      <div className="queue-row">
+                        <strong>{item.title}</strong>
+                        <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
+                      </div>
+                      <div className="queue-row">
+                        <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                        <RatingStars
+                          disabled={ratingKeyInFlight === `recording:${item.id}`}
+                          onChange={(stars) => { void updateRecordingRating(item.id, stars); }}
+                          value={item.rating}
+                        />
+                      </div>
                     </li>
                   ))}
                   {currentTrack ? (
                     <li className="queue-now-playing">
-                      <strong>{currentTrack.title}</strong>
-                      <span>{currentTrack.artist_credit_name ?? "Unknown Artist"}</span>
+                      <div className="queue-row">
+                        <strong>{currentTrack.title}</strong>
+                        <span className="queue-duration">{formatDuration(currentTrack.duration_ms)}</span>
+                      </div>
+                      <div className="queue-row">
+                        <span>{currentTrack.artist_credit_name ?? "Unknown Artist"}</span>
+                        <RatingStars
+                          disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
+                          onChange={(stars) => { void updateRecordingRating(currentTrack.id, stars); }}
+                          value={currentTrack.rating}
+                        />
+                      </div>
                     </li>
                   ) : null}
                   {queue.map((item) => (
                     <li key={`${item.id}-${item.primary_source_id}`}>
-                      <strong>{item.title}</strong>
-                      <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                      <div className="queue-row">
+                        <strong>{item.title}</strong>
+                        <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
+                      </div>
+                      <div className="queue-row">
+                        <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                        <RatingStars
+                          disabled={ratingKeyInFlight === `recording:${item.id}`}
+                          onChange={(stars) => { void updateRecordingRating(item.id, stars); }}
+                          value={item.rating}
+                        />
+                      </div>
                     </li>
                   ))}
                 </>

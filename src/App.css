@@ -396,21 +396,35 @@ thead th {
   color: #95aac4;
 }
 
+.queue-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.queue-row > strong,
+.queue-row > span:first-child {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-duration {
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  color: #7a93b0;
+}
+
 .queue-now-playing {
   background: linear-gradient(180deg, rgba(41, 54, 76, 0.94), rgba(18, 28, 42, 0.94)) !important;
   border: 1px solid rgba(239, 177, 90, 0.55);
   position: relative;
 }
 
-.queue-now-playing::before {
-  content: "▶";
-  position: absolute;
-  right: 12px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 0.6rem;
-  color: #efb15a;
-}
 
 .queue-history-item {
   opacity: 0.45;
