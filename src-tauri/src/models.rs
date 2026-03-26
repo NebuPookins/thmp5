@@ -60,6 +60,8 @@ pub struct ImportProgress {
     pub error_messages: Vec<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// Number of files currently being fingerprinted (CPU-bound).
+    pub fingerprinting_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

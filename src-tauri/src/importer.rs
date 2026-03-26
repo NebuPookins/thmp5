@@ -90,8 +90,15 @@ async fn run_scan(
                 let db = db.clone();
                 let path = entry.path().to_path_buf();
                 let acoustid_key = acoustid_key.map(ToOwned::to_owned);
+                let progress = Arc::clone(progress);
                 tasks.spawn(async move {
+                    progress
+                        .lock()
+                        .expect("import progress mutex poisoned")
+                        .fingerprinting_count += 1;
                     let prepared = prepare_import(&db, &path, acoustid_key.as_deref()).await;
+                    let mut state = progress.lock().expect("import progress mutex poisoned");
+                    state.fingerprinting_count = state.fingerprinting_count.saturating_sub(1);
                     (path, prepared)
                 });
             }

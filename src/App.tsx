@@ -20,6 +20,7 @@ type ImportProgress = {
   errors: number;
   error_messages: string[];
   started_at: string | null;
+  fingerprinting_count: number;
   finished_at: string | null;
 };
 
@@ -371,6 +372,8 @@ function App() {
       return;
     }
 
+    let wasRunning = bootstrap.import_progress.is_running;
+
     const interval = window.setInterval(async () => {
       try {
         const progress = await invoke<ImportProgress>("get_import_progress");
@@ -385,13 +388,14 @@ function App() {
             : current,
         );
 
-        if (progress.is_running) {
+        if (wasRunning && !progress.is_running) {
           await loadLibraryData(selectedArtistId, search);
         }
+        wasRunning = progress.is_running;
       } catch (pollError) {
         setError(pollError instanceof Error ? pollError.message : String(pollError));
       }
-    }, 2000);
+    }, 60000);
 
     return () => window.clearInterval(interval);
   }, [bootstrap?.needs_setup, search, selectedArtistId]);
@@ -757,6 +761,8 @@ function App() {
       </main>
     );
   }
+
+  const fingerprintCores = Math.min(6, Math.max(2, navigator.hardwareConcurrency ?? 4));
 
   return (
     <main className="app-shell">
@@ -1218,6 +1224,14 @@ function App() {
             <span className="status-bar-sep">·</span>
             <span className="status-bar-path" title={bootstrap.import_progress.current_path}>
               {bootstrap.import_progress.current_path}
+            </span>
+          </>
+        ) : null}
+        {(bootstrap?.import_progress.fingerprinting_count ?? 0) > 0 ? (
+          <>
+            <span className="status-bar-sep">·</span>
+            <span>
+              Fingerprinting {bootstrap!.import_progress.fingerprinting_count} song{bootstrap!.import_progress.fingerprinting_count !== 1 ? "s" : ""} using {fingerprintCores} CPU core{fingerprintCores !== 1 ? "s" : ""}
             </span>
           </>
         ) : null}

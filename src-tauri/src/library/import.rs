@@ -119,7 +119,13 @@ pub(crate) async fn prepare_import(
 
     let fp = {
         let p = path.to_path_buf();
-        match tokio::task::spawn_blocking(move || fingerprint::generate_fingerprint(&p)).await {
+        match tokio::task::spawn_blocking(move || {
+            let _ = thread_priority::set_current_thread_priority(
+                thread_priority::ThreadPriority::Min,
+            );
+            fingerprint::generate_fingerprint(&p)
+        })
+        .await {
             Ok(Ok(fp)) => Some(fp),
             Ok(Err(e)) => {
                 tracing::warn!(path = %path.display(), "Fingerprint generation failed: {e}");
