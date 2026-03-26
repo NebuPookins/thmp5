@@ -682,6 +682,9 @@ function App() {
         recording.id === recordingId ? { ...recording, rating: stars } : recording,
       ),
     );
+    setCurrentTrack((current) =>
+      current?.id === recordingId ? { ...current, rating: stars } : current,
+    );
 
     try {
       await invoke("set_recording_rating", {
@@ -689,6 +692,9 @@ function App() {
       });
     } catch (ratingError) {
       setRecordings(previousRecordings);
+      setCurrentTrack((current) =>
+        current?.id === recordingId ? { ...current, rating: recordings.find((r) => r.id === recordingId)?.rating ?? null } : current,
+      );
       setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
     } finally {
       setRatingKeyInFlight((current) => (current === ratingKey ? null : current));
