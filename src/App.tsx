@@ -835,48 +835,6 @@ function App() {
 
       {error ? <section className="error-banner">{error}</section> : null}
 
-      <section className="summary-grid">
-        <article className="summary-card">
-          <span className="summary-value">
-            {bootstrap?.library_summary.recording_count ?? 0}
-          </span>
-          <span className="summary-label">Recordings</span>
-        </article>
-        <article className="summary-card">
-          <span className="summary-value">
-            {bootstrap?.library_summary.artist_count ?? 0}
-          </span>
-          <span className="summary-label">Artists</span>
-        </article>
-        <article className="summary-card">
-          <span className="summary-value">
-            {bootstrap?.library_summary.source_count ?? 0}
-          </span>
-          <span className="summary-label">Sources</span>
-        </article>
-      </section>
-
-      <section className="import-banner">
-        <div>
-          <p className="panel-label">Library scan</p>
-          <strong>
-            {bootstrap?.import_progress.is_running ? "Scanning in background" : "Idle"}
-          </strong>
-          <p className="subtle-text">
-            Root: {bootstrap?.config.music_root ?? "Not configured"}
-          </p>
-        </div>
-        <div className="import-stats">
-          <span>Scanned {bootstrap?.import_progress.scanned ?? 0}</span>
-          <span>Imported {bootstrap?.import_progress.imported ?? 0}</span>
-          <span>Skipped {bootstrap?.import_progress.skipped ?? 0}</span>
-          <span>Errors {bootstrap?.import_progress.errors ?? 0}</span>
-        </div>
-        {bootstrap?.import_progress.current_path ? (
-          <p className="current-path">{bootstrap.import_progress.current_path}</p>
-        ) : null}
-      </section>
-
       <section className="layout-grid">
         <section className="table-panel">
           <div className="table-toolbar browser-toolbar">
@@ -1192,6 +1150,25 @@ function App() {
           </div>
         </div>
       ) : null}
+
+      <footer className="status-bar">
+        <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running ? "status-bar-indicator-active" : ""}`} />
+        <span>Scanned {bootstrap?.import_progress.scanned ?? 0}</span>
+        <span className="status-bar-sep">·</span>
+        <span>Imported {bootstrap?.import_progress.imported ?? 0}</span>
+        <span className="status-bar-sep">·</span>
+        <span className={bootstrap?.import_progress.errors ? "status-bar-errors" : ""}>
+          Errors {bootstrap?.import_progress.errors ?? 0}
+        </span>
+        {bootstrap?.import_progress.current_path ? (
+          <>
+            <span className="status-bar-sep">·</span>
+            <span className="status-bar-path" title={bootstrap.import_progress.current_path}>
+              {bootstrap.import_progress.current_path}
+            </span>
+          </>
+        ) : null}
+      </footer>
     </main>
   );
 }

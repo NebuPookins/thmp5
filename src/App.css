@@ -47,8 +47,6 @@ button {
 
 .wizard-card,
 .topbar,
-.summary-card,
-.import-banner,
 .table-panel,
 .queue-list-panel,
 .error-banner {
@@ -146,7 +144,7 @@ button {
 .app-shell {
   width: min(1580px, calc(100vw - 28px));
   margin: 0 auto;
-  padding: 18px 0 28px;
+  padding: 18px 0 42px;
 }
 
 .topbar {
@@ -158,11 +156,6 @@ button {
   margin-bottom: 14px;
 }
 
-.import-stats {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
 
 .eyebrow,
 .panel-label,
@@ -174,40 +167,6 @@ button {
   color: #8fa5c2;
 }
 
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-  margin: 14px 0;
-}
-
-.summary-card {
-  padding: 18px;
-  border-radius: 22px;
-}
-
-.summary-value {
-  display: block;
-  font-size: clamp(1.8rem, 3vw, 2.8rem);
-  line-height: 1;
-  font-weight: 700;
-}
-
-.summary-label {
-  color: #9eb2cc;
-}
-
-.import-banner {
-  padding: 16px 20px;
-  border-radius: 22px;
-  margin-bottom: 14px;
-}
-
-.current-path {
-  margin: 10px 0 0;
-  color: #b8cae0;
-  word-break: break-all;
-}
 
 .layout-grid {
   display: grid;
@@ -489,9 +448,7 @@ thead th {
     display: grid;
   }
 
-  .summary-grid {
-    grid-template-columns: 1fr;
-  }
+
 }
 
 @media (max-width: 640px) {
@@ -501,8 +458,6 @@ thead th {
   }
 
   .topbar,
-  .summary-card,
-  .import-banner,
   .table-panel,
   .player-panel,
   .queue-settings,
@@ -763,6 +718,64 @@ thead th {
   border-color: #888;
 }
 
+
+/* ── Status bar ──────────────────────────────────────────────────────────────── */
+
+.status-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.75rem;
+  color: #7a93b0;
+  background: rgba(8, 14, 22, 0.92);
+  border-top: 1px solid rgba(149, 173, 198, 0.1);
+  backdrop-filter: blur(10px);
+  z-index: 50;
+}
+
+.status-bar-sep {
+  color: rgba(149, 173, 198, 0.3);
+}
+
+.status-bar-indicator {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(149, 173, 198, 0.3);
+  flex-shrink: 0;
+}
+
+.status-bar-indicator-active {
+  background: #4caf7d;
+  box-shadow: 0 0 6px rgba(76, 175, 125, 0.7);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.status-bar-errors {
+  color: #f08080;
+}
+
+.status-bar-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #6a87a6;
+}
+
+/* ── Active tag filter ───────────────────────────────────────────────────────── */
 
 .active-tag-filter {
   display: flex;
