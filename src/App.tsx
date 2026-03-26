@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
@@ -195,6 +195,7 @@ function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<QueueItem[]>([]);
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
+  const currentTrackRef = useRef<QueueItem | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
   const [search, setSearch] = useState("");
   const [selectedArtistId, setSelectedArtistId] = useState<string | null>(null);
@@ -479,8 +480,12 @@ function App() {
     );
   }, [playerState.recording_id]);
 
+  // Keep ref in sync so stale-closure callbacks (e.g. player-track-ended listener)
+  // always see the latest value.
+  currentTrackRef.current = currentTrack;
+
   async function completeCurrentTrack(positionMs?: number) {
-    const finishedTrack = currentTrack;
+    const finishedTrack = currentTrackRef.current;
     if (finishedTrack) {
       try {
         await invoke("record_play_history", {
