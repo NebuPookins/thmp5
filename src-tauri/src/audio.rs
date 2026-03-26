@@ -87,7 +87,7 @@ impl AudioEngineHandle {
                     }
 
                     if let Err(error) = handle_command(command, &command_shared, &app) {
-                        set_engine_error(&command_shared, &app, error.to_string());
+                        set_engine_error(&command_shared, &app, format!("{error:#}"));
                     }
                 }
             })
@@ -440,46 +440,20 @@ fn decode_into_buffer(
             }
         }
 
-        let packet = match source.format.next_packet() {
-            Ok(packet) => packet,
-            Err(SymphoniaError::IoError(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
+        match source.decode_next()? {
+            None => break,
+            Some(input) => {
+                let output = resampler.push(&input);
+                if !output.is_empty() {
+                    let mut state = buffer
+                        .lock()
+                        .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
+                    if state.stop_requested {
+                        return Ok(());
+                    }
+                    state.samples.extend(output);
+                }
             }
-            Err(SymphoniaError::ResetRequired) => {
-                return Err(anyhow!("Decoder reset required during playback"));
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        if packet.track_id() != source.track_id {
-            continue;
-        }
-
-        let decoded = match source.decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(SymphoniaError::IoError(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        let mut input = Vec::new();
-        append_audio_buffer(decoded, &mut input);
-        let output = resampler.push(&input);
-
-        if !output.is_empty() {
-            let mut state = buffer
-                .lock()
-                .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
-            if state.stop_requested {
-                return Ok(());
-            }
-            state.samples.extend(output);
         }
     }
 
@@ -795,6 +769,9 @@ struct LocalFileSource {
     sample_rate: u32,
     channels: u16,
     duration_ms: u64,
+    /// Samples buffered during open() when a packet had to be decoded to discover the audio spec.
+    /// Drained by the first call to decode_next().
+    pending: Vec<f32>,
 }
 
 impl LocalFileSource {
@@ -818,15 +795,8 @@ impl LocalFileSource {
             .default_track()
             .ok_or_else(|| anyhow!("No supported audio track found"))?;
         let track_id = track.id;
-        let sample_rate = track
-            .codec_params
-            .sample_rate
-            .ok_or_else(|| anyhow!("Audio track sample rate is unknown"))?;
-        let channels = track
-            .codec_params
-            .channels
-            .map(|channels| channels.count() as u16)
-            .ok_or_else(|| anyhow!("Audio track channel count is unknown"))?;
+        let sample_rate = track.codec_params.sample_rate;
+        let channels = track.codec_params.channels.map(|c| c.count() as u16);
         let duration_ms = match (track.codec_params.n_frames, track.codec_params.sample_rate) {
             (Some(frame_count), Some(rate)) if rate > 0 => {
                 frame_count.saturating_mul(1000) / u64::from(rate)
@@ -835,18 +805,97 @@ impl LocalFileSource {
         };
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())?;
+        // track borrow of format ends here (NLL)
 
-        Ok(Self {
+        let mut source = Self {
             format,
             decoder,
             track_id,
-            sample_rate,
-            channels,
+            sample_rate: sample_rate.unwrap_or(0),
+            channels: channels.unwrap_or(0),
             duration_ms,
-        })
+            pending: Vec::new(),
+        };
+
+        // M4A/AAC and some other formats don't expose sample_rate/channels in the container
+        // metadata — those values live inside the codec's private data and only become known
+        // after the first packet is decoded.  Prime the source by decoding one packet so that
+        // sample_rate and channels are always valid by the time open() returns.
+        if source.sample_rate == 0 || source.channels == 0 {
+            source.prime_spec()?;
+        }
+
+        Ok(source)
+    }
+
+    /// Decode the first decodable packet to discover sample_rate / channels, storing
+    /// the resulting samples in `pending` so they aren't lost.
+    fn prime_spec(&mut self) -> Result<()> {
+        loop {
+            let packet = self.format.next_packet()?;
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let spec = *decoded.spec();
+                    if self.sample_rate == 0 {
+                        self.sample_rate = spec.rate;
+                    }
+                    if self.channels == 0 {
+                        self.channels = spec.channels.count() as u16;
+                    }
+                    append_audio_buffer(decoded, &mut self.pending);
+                    return Ok(());
+                }
+                Err(SymphoniaError::DecodeError(_)) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Decode the next chunk of interleaved f32 samples.  Returns `None` at end-of-stream.
+    /// All format- and codec-specific concerns (packet filtering, decode errors, pending
+    /// buffers) are handled here; callers see a uniform stream of sample chunks.
+    fn decode_next(&mut self) -> Result<Option<Vec<f32>>> {
+        if !self.pending.is_empty() {
+            return Ok(Some(std::mem::take(&mut self.pending)));
+        }
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(p) => p,
+                Err(SymphoniaError::IoError(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(None);
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    return Err(anyhow!("Decoder reset required during playback"));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let mut samples = Vec::new();
+                    append_audio_buffer(decoded, &mut samples);
+                    return Ok(Some(samples));
+                }
+                Err(SymphoniaError::DecodeError(_)) => continue,
+                Err(SymphoniaError::IoError(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     fn seek_to_ms(&mut self, position_ms: u64) -> Result<()> {
+        self.pending.clear();
         let time = Time::from(position_ms as f64 / 1000.0);
         self.format
             .seek(
