@@ -2,9 +2,11 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, ImportProgress, ImportStats, InitialSetupRequest,
-    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, QueueSettingsUpdate,
-    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SeekRequest, VolumeRequest,
+    LibrarySummary, PlayHistoryInput, PlaylistRow, PlayRequest, PlayerState, QueueSettingsUpdate,
+    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
+    SmartPlaylistResult, VolumeRequest,
 };
+use crate::query::{self, LimitUnit};
 use crate::AppState;
 use sqlx::Row;
 
@@ -531,6 +533,209 @@ pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<Stri
     .await
     .map_err(|e| e.to_string())?;
     Ok(tags)
+}
+
+// ── Smart playlists ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn evaluate_smart_playlist(
+    state: tauri::State<'_, AppState>,
+    query: String,
+) -> Result<SmartPlaylistResult, String> {
+    let parsed = query::parse(&query).map_err(|e| e.to_string())?;
+    let (where_sql, limit) = query::compile(&parsed);
+
+    // Build the full query: fetch matching recording IDs from smart_playlist_view,
+    // then JOIN to get the full RecordingRow data.
+    let full_sql = format!(
+        "SELECT
+            r.id,
+            r.title,
+            r.duration_ms,
+            a.id                  AS primary_artist_id,
+            rg.id                 AS release_group_id,
+            COALESCE(ra.credited_as, a.name) AS artist_credit_name,
+            rg.title             AS release_group_title,
+            r.genre,
+            rel.release_date,
+            t.position           AS track_position,
+            m.position           AS disc_position,
+            ur.stars             AS rating,
+            COUNT(ph.id)         AS play_count,
+            MAX(ph.played_at)    AS last_played,
+            (
+                SELECT s.id FROM source s
+                WHERE s.recording_id = r.id AND s.source_type = 'local_file'
+                  AND s.file_path IS NOT NULL
+                ORDER BY s.file_path LIMIT 1
+            ) AS primary_source_id,
+            (
+                SELECT s.file_path FROM source s
+                WHERE s.recording_id = r.id AND s.source_type = 'local_file'
+                  AND s.file_path IS NOT NULL
+                ORDER BY s.file_path LIMIT 1
+            ) AS primary_source_path,
+            (
+                SELECT GROUP_CONCAT(rt.tag, char(0))
+                FROM recording_tag rt WHERE rt.recording_id = r.id ORDER BY rt.tag
+            ) AS tags_raw
+         FROM recording r
+         LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
+         LEFT JOIN artist a             ON a.id = ra.artist_id
+         LEFT JOIN track t              ON t.recording_id = r.id
+         LEFT JOIN medium m             ON m.id = t.medium_id
+         LEFT JOIN release rel          ON rel.id = m.release_id
+         LEFT JOIN release_group rg     ON rg.id = rel.release_group_id
+         LEFT JOIN user_rating ur       ON ur.recording_id = r.id
+         LEFT JOIN play_history ph      ON ph.recording_id = r.id
+         WHERE r.id IN (
+             SELECT spv.id FROM smart_playlist_view spv WHERE {}
+         )
+         GROUP BY r.id
+         ORDER BY RANDOM()",
+        where_sql
+    );
+
+    tracing::debug!(sql = %full_sql, "Evaluating smart playlist");
+
+    let rows = sqlx::query(&full_sql)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| format!("Query error: {e}"))?;
+
+    let mut recordings: Vec<_> = rows
+        .into_iter()
+        .map(|row| RecordingRow {
+            id: row.get("id"),
+            title: row.get("title"),
+            duration_ms: row.get("duration_ms"),
+            primary_artist_id: row.get("primary_artist_id"),
+            release_group_id: row.get("release_group_id"),
+            artist_credit_name: row.get("artist_credit_name"),
+            release_group_title: row.get("release_group_title"),
+            genre: row.get("genre"),
+            release_date: row.get("release_date"),
+            track_position: row.get("track_position"),
+            disc_position: row.get("disc_position"),
+            rating: row.get("rating"),
+            play_count: row.get::<Option<i64>, _>("play_count").unwrap_or(0),
+            last_played: row.get("last_played"),
+            primary_source_id: row.get("primary_source_id"),
+            primary_source_path: row.get("primary_source_path"),
+            tags: {
+                let raw: Option<String> = row.get("tags_raw");
+                raw.map(|r| r.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+                   .unwrap_or_default()
+            },
+        })
+        .collect();
+
+    // Apply LIMIT post-filter in Rust (track count or duration)
+    if let Some(lim) = limit {
+        match lim.unit {
+            LimitUnit::Tracks => {
+                recordings.truncate(lim.value as usize);
+            }
+            LimitUnit::Minutes | LimitUnit::Hours => {
+                let target_ms = match lim.unit {
+                    LimitUnit::Minutes => lim.value * 60_000,
+                    LimitUnit::Hours   => lim.value * 3_600_000,
+                    LimitUnit::Tracks  => unreachable!(),
+                };
+                let mut accumulated: i64 = 0;
+                recordings.retain(|r| {
+                    if accumulated >= target_ms {
+                        return false;
+                    }
+                    accumulated += r.duration_ms.unwrap_or(0);
+                    true
+                });
+            }
+        }
+    }
+
+    let total_duration_ms = recordings.iter().map(|r| r.duration_ms.unwrap_or(0)).sum();
+
+    Ok(SmartPlaylistResult {
+        recordings,
+        total_duration_ms,
+        sql: full_sql,
+    })
+}
+
+#[tauri::command]
+pub async fn list_playlists(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PlaylistRow>, String> {
+    let rows = sqlx::query(
+        "SELECT id, name, kind, query FROM playlist ORDER BY name",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| PlaylistRow {
+            id: row.get("id"),
+            name: row.get("name"),
+            kind: row.get("kind"),
+            query: row.get("query"),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn save_smart_playlist(
+    state: tauri::State<'_, AppState>,
+    request: SaveSmartPlaylistRequest,
+) -> Result<PlaylistRow, String> {
+    // Validate the query parses before saving
+    query::parse(&request.query).map_err(|e| format!("Invalid query: {e}"))?;
+
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err("Playlist name cannot be empty.".to_string());
+    }
+
+    sqlx::query(
+        "INSERT INTO playlist (name, kind, query)
+         VALUES (?, 'smart', ?)
+         ON CONFLICT(name) DO UPDATE SET query = excluded.query",
+    )
+    .bind(name)
+    .bind(&request.query)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let row = sqlx::query(
+        "SELECT id, name, kind, query FROM playlist WHERE name = ?",
+    )
+    .bind(name)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(PlaylistRow {
+        id: row.get("id"),
+        name: row.get("name"),
+        kind: row.get("kind"),
+        query: row.get("query"),
+    })
+}
+
+#[tauri::command]
+pub async fn delete_playlist(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM playlist WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn validate_rating(stars: Option<i64>) -> Result<(), String> {

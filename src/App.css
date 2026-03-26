@@ -850,3 +850,168 @@ thead th {
   font-size: 0.8rem;
   color: #aac;
 }
+
+/* ── Tab bar ─────────────────────────────────────────────────────────────── */
+
+.tab-bar {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px 0;
+  border-bottom: 1px solid rgba(149, 173, 198, 0.12);
+  background: rgba(11, 18, 28, 0.6);
+}
+
+.tab-btn {
+  padding: 6px 16px;
+  border: none;
+  background: transparent;
+  color: #8fa5be;
+  border-radius: 4px 4px 0 0;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.tab-btn:hover {
+  color: #d4e4f0;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.tab-btn-active {
+  color: #e2a042;
+  border-bottom: 2px solid #e2a042;
+}
+
+/* ── Smart Playlist editor ───────────────────────────────────────────────── */
+
+.smart-playlist-panel {
+  overflow: auto;
+  flex: 1;
+  padding: 12px;
+}
+
+.smart-pl-layout {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 12px;
+  min-height: 100%;
+}
+
+.smart-pl-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.saved-playlist-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.saved-playlist-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.saved-playlist-name {
+  flex: 1;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: #c5d8e8;
+  font-size: 0.82rem;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.saved-playlist-name:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #e2a042;
+}
+
+.saved-playlist-delete {
+  background: transparent;
+  border: none;
+  color: #5a6a7a;
+  font-size: 0.8rem;
+  padding: 2px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.saved-playlist-delete:hover {
+  color: #d06060;
+  background: rgba(200, 60, 60, 0.1);
+}
+
+.smart-pl-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.smart-pl-query-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.smart-pl-textarea {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(149, 173, 198, 0.2);
+  border-radius: 6px;
+  color: #d4eaf8;
+  font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+  font-size: 0.88rem;
+  line-height: 1.6;
+  padding: 10px 12px;
+  resize: vertical;
+}
+
+.smart-pl-textarea:focus {
+  outline: none;
+  border-color: rgba(226, 160, 66, 0.5);
+}
+
+.smart-pl-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.smart-pl-save-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.smart-pl-error {
+  font-size: 0.85rem;
+  padding: 8px 12px;
+}
+
+.smart-pl-results {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.smart-pl-results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0;
+}

@@ -188,3 +188,17 @@ pub struct SmartPlaylistResult {
     pub total_duration_ms: i64,
     pub sql: String, // for debugging/display
 }
+
+#[derive(Debug, Serialize)]
+pub struct PlaylistRow {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveSmartPlaylistRequest {
+    pub name: String,
+    pub query: String,
+}

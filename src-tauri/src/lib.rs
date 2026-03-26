@@ -6,6 +6,7 @@ mod importer;
 mod library;
 mod logging;
 mod models;
+pub mod query;
 
 use audio::AudioEngineHandle;
 use importer::ImportManager;
@@ -92,6 +93,10 @@ pub fn run() {
             commands::stop,
             commands::get_cover_art,
             commands::list_all_tags,
+            commands::evaluate_smart_playlist,
+            commands::list_playlists,
+            commands::save_smart_playlist,
+            commands::delete_playlist,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

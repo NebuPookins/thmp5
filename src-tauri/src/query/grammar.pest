@@ -1,0 +1,57 @@
+// Smart playlist query grammar for thmp5
+// Example: Rating >= 4 AND LastPlayed NotInLast 8 Months LIMIT 60 minutes
+//
+// Note: WHITESPACE is defined as a silent rule so pest auto-inserts WHITESPACE*
+// between every token (~). Do NOT use explicit WHITESPACE+ — it conflicts with
+// the implicit insertion and causes parse failures.
+
+query      = { SOI ~ expr ~ limit? ~ EOI }
+expr       = { or_expr }
+or_expr    = { and_expr ~ ("OR" ~ and_expr)* }
+and_expr   = { factor ~ ("AND" ~ factor)* }
+factor     = { paren_expr | not_expr | predicate }
+paren_expr = { "(" ~ expr ~ ")" }
+not_expr   = { "NOT" ~ factor }
+
+predicate = {
+    album_rating_pred
+  | rating_pred
+  | last_played_pred
+  | play_count_pred
+  | not_in_playlist_pred
+  | in_playlist_pred
+  | has_tag_pred
+  | title_pred
+  | artist_pred
+  | genre_pred
+  | year_pred
+}
+
+// Note: album_rating_pred must come before rating_pred to avoid "Rating" prefix match
+rating_pred       = { "Rating" ~ (rating_null | cmp_pred) }
+rating_null       = { "is" ~ "null" }
+cmp_pred          = { cmp_op ~ integer }
+album_rating_pred = { "AlbumRating" ~ cmp_op ~ integer }
+last_played_pred  = { "LastPlayed" ~ last_played_dir ~ integer ~ time_unit }
+last_played_dir   = { "NotInLast" | "InLast" }
+play_count_pred   = { "PlayCount" ~ cmp_op ~ integer }
+in_playlist_pred  = { "InPlaylist" ~ string }
+not_in_playlist_pred = { "NotInPlaylist" ~ string }
+has_tag_pred      = { "HasTag" ~ string }
+title_pred        = { "Title" ~ str_op ~ string }
+artist_pred       = { "Artist" ~ str_op ~ string }
+genre_pred        = { "Genre" ~ str_op ~ string }
+year_pred         = { "Year" ~ cmp_op ~ integer }
+
+str_op     = { "contains" | "is" }
+limit      = { "LIMIT" ~ integer ~ limit_unit }
+limit_unit = { "tracks" | "minutes" | "hours" }
+cmp_op     = { ">=" | "<=" | "!=" | ">" | "<" | "=" }
+time_unit  = { "Days" | "Weeks" | "Months" | "Years" }
+integer    = @{ ASCII_DIGIT+ }
+ident      = @{ (ASCII_ALPHANUMERIC | "_")+ }
+string     = { quoted_string | ident }
+quoted_string = { "\"" ~ quoted_inner ~ "\"" }
+quoted_inner  = @{ (!"\"" ~ ANY)* }
+
+WHITESPACE = _{ " " | "\t" | "\n" | "\r" }

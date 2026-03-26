@@ -440,10 +440,10 @@ src/
 15. [x] Tag management UI (tags derived from file `comment` field — not editable in app; `list_all_tags` command; Tags column shows read-only chips, click to filter; `parse_comment_tags` handles `#token` and `#key:value` parameterized forms alongside delimiter-split plain tags)
 
 ### Phase 4 — Smart Playlists
-16. [ ] Implement pest grammar + AST types
-17. [ ] Implement SQL codegen + duration-limit post-filter
-18. [ ] `SmartPlaylistEditor` with live preview (shows first N matching tracks)
-19. [ ] Save/load smart playlists; evaluate at queue time
+16. [x] Implement pest grammar + AST types (`src-tauri/src/query/grammar.pest` + `mod.rs`)
+17. [x] Implement SQL codegen + duration-limit post-filter (`query::compile` → WHERE clause injected into smart_playlist_view subquery; Rust post-filter for LIMIT tracks/minutes/hours)
+18. [x] `SmartPlaylistEditor` tab with query textarea, run button (Ctrl+Enter), results table, Queue All button
+19. [x] Save/load/delete smart playlists via `save_smart_playlist` / `list_playlists` / `delete_playlist` Tauri commands; saved playlists sidebar in the editor
 
 ### Phase 5 — Additional Sources
 20. [ ] `YouTubeSource` via yt-dlp subprocess

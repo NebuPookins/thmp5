@@ -76,6 +76,19 @@ type ReleaseGroupRow = {
   rating: number | null;
 };
 
+type SmartPlaylistResult = {
+  recordings: RecordingRow[];
+  total_duration_ms: number;
+  sql: string;
+};
+
+type PlaylistRow = {
+  id: number;
+  name: string;
+  kind: string;
+  query: string | null;
+};
+
 type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
 
 type PlayerState = {
@@ -214,6 +227,14 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [_allTags, setAllTags] = useState<string[]>([]);
+  const [activeTab, setActiveTab] = useState<"library" | "smartplaylist">("library");
+  const [smartQuery, setSmartQuery] = useState("");
+  const [smartResult, setSmartResult] = useState<SmartPlaylistResult | null>(null);
+  const [smartError, setSmartError] = useState<string | null>(null);
+  const [isRunningQuery, setIsRunningQuery] = useState(false);
+  const [playlists, setPlaylists] = useState<PlaylistRow[]>([]);
+  const [savePlaylistName, setSavePlaylistName] = useState("");
+  const [isSavingPlaylist, setIsSavingPlaylist] = useState(false);
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
   const isPlaying = playerState.status === "playing";
@@ -285,6 +306,69 @@ function App() {
     setAllTags(tags);
   }
 
+  async function loadPlaylists() {
+    const rows = await invoke<PlaylistRow[]>("list_playlists");
+    setPlaylists(rows);
+  }
+
+  async function runSmartQuery() {
+    const q = smartQuery.trim();
+    if (!q) return;
+    setIsRunningQuery(true);
+    setSmartError(null);
+    try {
+      const result = await invoke<SmartPlaylistResult>("evaluate_smart_playlist", { query: q });
+      setSmartResult(result);
+    } catch (e) {
+      setSmartError(e instanceof Error ? e.message : String(e));
+      setSmartResult(null);
+    } finally {
+      setIsRunningQuery(false);
+    }
+  }
+
+  async function saveSmartPlaylist() {
+    const name = savePlaylistName.trim();
+    const q = smartQuery.trim();
+    if (!name || !q) return;
+    setIsSavingPlaylist(true);
+    setSmartError(null);
+    try {
+      await invoke<PlaylistRow>("save_smart_playlist", { request: { name, query: q } });
+      setSavePlaylistName("");
+      await loadPlaylists();
+    } catch (e) {
+      setSmartError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsSavingPlaylist(false);
+    }
+  }
+
+  async function deletePlaylist(id: number) {
+    try {
+      await invoke("delete_playlist", { id });
+      await loadPlaylists();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function enqueueAll(recordings: RecordingRow[]) {
+    const playable = recordings.filter((r) => r.primary_source_id !== null);
+    if (playable.length === 0) {
+      setError("No playable tracks in results.");
+      return;
+    }
+    setError(null);
+    if (!currentTrack && playerState.status === "stopped" && playable.length > 0) {
+      const [first, ...rest] = playable;
+      setCurrentTrack(first);
+      setQueue((q) => [...q, ...rest]);
+    } else {
+      setQueue((q) => [...q, ...playable]);
+    }
+  }
+
   async function loadArtists() {
     const rows = await invoke<ArtistRow[]>("list_artists");
     setArtists(rows);
@@ -306,6 +390,7 @@ function App() {
         loadArtists(),
         loadReleaseGroups(nextArtistId, nextSearch),
         loadAllTags(),
+        loadPlaylists(),
       ]);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
@@ -861,6 +946,171 @@ function App() {
 
       <section className="layout-grid">
         <section className="table-panel">
+          <div className="tab-bar">
+            <button
+              className={`tab-btn ${activeTab === "library" ? "tab-btn-active" : ""}`}
+              onClick={() => setActiveTab("library")}
+              type="button"
+            >Library</button>
+            <button
+              className={`tab-btn ${activeTab === "smartplaylist" ? "tab-btn-active" : ""}`}
+              onClick={() => setActiveTab("smartplaylist")}
+              type="button"
+            >Smart Playlist</button>
+          </div>
+
+          {activeTab === "smartplaylist" ? (
+            <div className="smart-playlist-panel">
+              <div className="smart-pl-layout">
+                <aside className="smart-pl-sidebar">
+                  <p className="panel-label">Saved playlists</p>
+                  {playlists.filter((p) => p.kind === "smart").length === 0 ? (
+                    <p className="empty-browser-state">No saved playlists yet.</p>
+                  ) : (
+                    <ul className="saved-playlist-list">
+                      {playlists
+                        .filter((p) => p.kind === "smart")
+                        .map((pl) => (
+                          <li className="saved-playlist-item" key={pl.id}>
+                            <button
+                              className="saved-playlist-name"
+                              onClick={() => {
+                                setSmartQuery(pl.query ?? "");
+                                setSavePlaylistName(pl.name);
+                              }}
+                              type="button"
+                              title={pl.query ?? ""}
+                            >{pl.name}</button>
+                            <button
+                              className="saved-playlist-delete"
+                              onClick={() => { void deletePlaylist(pl.id); }}
+                              title="Delete"
+                              type="button"
+                            >✕</button>
+                          </li>
+                        ))}
+                    </ul>
+                  )}
+                </aside>
+
+                <div className="smart-pl-editor">
+                  <div className="smart-pl-query-area">
+                    <textarea
+                      className="smart-pl-textarea"
+                      onChange={(e) => setSmartQuery(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                          e.preventDefault();
+                          void runSmartQuery();
+                        }
+                      }}
+                      placeholder={
+                        "Rating >= 4 AND LastPlayed NotInLast 8 Months\n" +
+                        "HasTag chill AND PlayCount >= 3\n" +
+                        "Artist contains \"Radiohead\" LIMIT 30 minutes"
+                      }
+                      rows={4}
+                      spellCheck={false}
+                      value={smartQuery}
+                    />
+                    <div className="smart-pl-actions">
+                      <button
+                        className="primary-button"
+                        disabled={isRunningQuery || !smartQuery.trim()}
+                        onClick={() => { void runSmartQuery(); }}
+                        type="button"
+                      >
+                        {isRunningQuery ? "Running…" : "Run (Ctrl+Enter)"}
+                      </button>
+                      <div className="smart-pl-save-row">
+                        <input
+                          className="small-input"
+                          onChange={(e) => setSavePlaylistName(e.currentTarget.value)}
+                          placeholder="Playlist name"
+                          value={savePlaylistName}
+                        />
+                        <button
+                          className="secondary-button"
+                          disabled={isSavingPlaylist || !savePlaylistName.trim() || !smartQuery.trim()}
+                          onClick={() => { void saveSmartPlaylist(); }}
+                          type="button"
+                        >
+                          {isSavingPlaylist ? "Saving…" : "Save"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {smartError ? (
+                    <div className="error-banner smart-pl-error">{smartError}</div>
+                  ) : null}
+
+                  {smartResult ? (
+                    <div className="smart-pl-results">
+                      <div className="smart-pl-results-header">
+                        <span className="panel-meta">
+                          {smartResult.recordings.length} tracks · {formatDuration(smartResult.total_duration_ms)}
+                        </span>
+                        <button
+                          className="secondary-button"
+                          disabled={smartResult.recordings.length === 0}
+                          onClick={() => enqueueAll(smartResult.recordings)}
+                          type="button"
+                        >Queue all</button>
+                      </div>
+                      <div className="table-wrap">
+                        <table className="recordings-table">
+                          <thead>
+                            <tr>
+                              <th>Title</th>
+                              <th>Artist</th>
+                              <th>Album</th>
+                              <th>Rating</th>
+                              <th>Duration</th>
+                              <th>Plays</th>
+                              <th>Last played</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {smartResult.recordings.map((recording) => (
+                              <tr
+                                className={recording.primary_source_id ? "playable-row" : "muted-row"}
+                                key={recording.id}
+                                onDoubleClick={() => enqueueRecording(recording)}
+                                title={recording.primary_source_id ? "Double click to queue" : "No playable file"}
+                              >
+                                <td>{recording.title}</td>
+                                <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
+                                <td>{recording.release_group_title ?? "Unknown Album"}</td>
+                                <td>
+                                  <RatingStars
+                                    disabled={ratingKeyInFlight === `recording:${recording.id}`}
+                                    onChange={(stars) => { void updateRecordingRating(recording.id, stars); }}
+                                    value={recording.rating}
+                                  />
+                                </td>
+                                <td>{formatDuration(recording.duration_ms)}</td>
+                                <td>{recording.play_count}</td>
+                                <td>{formatLastPlayed(recording.last_played)}</td>
+                              </tr>
+                            ))}
+                            {smartResult.recordings.length === 0 ? (
+                              <tr>
+                                <td className="empty-table-state" colSpan={7}>
+                                  No tracks match this query.
+                                </td>
+                              </tr>
+                            ) : null}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          ) : (
+          <>
           <div className="table-toolbar browser-toolbar">
             <input
               className="search-input"
@@ -1061,6 +1311,8 @@ function App() {
               </div>
             </section>
           </div>
+          </>
+          )}
         </section>
 
         <aside className="queue-panel">
