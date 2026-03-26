@@ -396,6 +396,26 @@ thead th {
   color: #95aac4;
 }
 
+.queue-now-playing {
+  background: linear-gradient(180deg, rgba(41, 54, 76, 0.94), rgba(18, 28, 42, 0.94)) !important;
+  border: 1px solid rgba(239, 177, 90, 0.55);
+  position: relative;
+}
+
+.queue-now-playing::before {
+  content: "▶";
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.6rem;
+  color: #efb15a;
+}
+
+.queue-history-item {
+  opacity: 0.45;
+}
+
 .empty-item {
   justify-content: center;
   align-items: flex-start;
@@ -427,7 +447,7 @@ thead th {
   }
 
   .queue-panel {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: 1fr;
   }
 
   .browser-grid {

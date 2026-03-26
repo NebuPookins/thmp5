@@ -1043,41 +1043,38 @@ function App() {
           <section className="queue-list-panel">
             <div className="queue-header">
               <div>
-                <p className="panel-label">Up next</p>
-                <strong>{queue.length} queued</strong>
+                <p className="panel-label">Timeline</p>
+                <strong>
+                  {history.length > 0 || currentTrack || queue.length > 0
+                    ? `${history.length} played · ${queue.length} queued`
+                    : "Nothing playing"}
+                </strong>
               </div>
             </div>
             <ol className="queue-list">
-              {queue.length === 0 ? (
-                <li className="empty-item">Nothing queued.</li>
+              {history.length === 0 && !currentTrack && queue.length === 0 ? (
+                <li className="empty-item">Double-click a track to start playing.</li>
               ) : (
-                queue.map((item) => (
-                  <li key={`${item.id}-${item.primary_source_id}`}>
-                    <strong>{item.title}</strong>
-                    <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
-                  </li>
-                ))
-              )}
-            </ol>
-          </section>
-
-          <section className="queue-list-panel">
-            <div className="queue-header">
-              <div>
-                <p className="panel-label">Recently played</p>
-                <strong>{history.length} tracked</strong>
-              </div>
-            </div>
-            <ol className="queue-list">
-              {history.length === 0 ? (
-                <li className="empty-item">Playback history will show up here.</li>
-              ) : (
-                history.map((item) => (
-                  <li key={`history-${item.id}-${item.play_count}`}>
-                    <strong>{item.title}</strong>
-                    <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
-                  </li>
-                ))
+                <>
+                  {[...history].reverse().map((item, i) => (
+                    <li className="queue-history-item" key={`history-${i}-${item.id}`}>
+                      <strong>{item.title}</strong>
+                      <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                    </li>
+                  ))}
+                  {currentTrack ? (
+                    <li className="queue-now-playing">
+                      <strong>{currentTrack.title}</strong>
+                      <span>{currentTrack.artist_credit_name ?? "Unknown Artist"}</span>
+                    </li>
+                  ) : null}
+                  {queue.map((item) => (
+                    <li key={`${item.id}-${item.primary_source_id}`}>
+                      <strong>{item.title}</strong>
+                      <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
+                    </li>
+                  ))}
+                </>
               )}
             </ol>
           </section>
