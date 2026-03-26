@@ -742,6 +742,11 @@ fn write_output_data<T, F>(
                         }),
                         _ => None,
                     };
+                    // Drop the TrackBuffer guard before calling clear_track, which
+                    // internally calls stop_decoder → TrackBuffer::lock().  Holding
+                    // the guard here while re-entering the same lock causes a
+                    // self-deadlock on the cpal output thread.
+                    drop(buffer);
                     state.clear_track();
                     snapshot = Some(state.player_state());
                     for sample in frame.iter_mut() {
