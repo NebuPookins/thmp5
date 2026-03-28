@@ -1,9 +1,17 @@
 use anyhow::Result;
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     SqlitePool,
 };
 use std::path::Path;
+
+/// Number of concurrent workers (and DB pool connections) to use.
+/// Computed once as `max(1, min(cpu_count - 1, 6))`.
+pub fn worker_count() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() as u32).saturating_sub(1).clamp(1, 6))
+        .unwrap_or(4)
+}
 
 pub async fn init_pool(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
@@ -12,7 +20,10 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true);
 
-    let pool = SqlitePool::connect_with(opts).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(worker_count())
+        .connect_with(opts)
+        .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
 }

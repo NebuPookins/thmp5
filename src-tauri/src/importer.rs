@@ -184,9 +184,7 @@ async fn handle_task_result(
 }
 
 fn import_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().min(6).max(2))
-        .unwrap_or(4)
+    crate::db::worker_count() as usize
 }
 
 fn now_iso() -> String {
