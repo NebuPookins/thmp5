@@ -1,4 +1,5 @@
 import { FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
@@ -301,6 +302,14 @@ function App() {
       })
       .sort(trackSort);
   }, [recordings, search, selectedArtist, selectedReleaseGroup, selectedTag]);
+
+  const trackTableScrollRef = useRef<HTMLDivElement>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: filteredRecordings.length,
+    getScrollElement: () => trackTableScrollRef.current,
+    estimateSize: () => 41,
+    overscan: 10,
+  });
 
   async function loadRecordings() {
     const rows = await invoke<RecordingRow[]>("list_recordings", {
@@ -1253,7 +1262,7 @@ function App() {
                   <button onClick={() => setSelectedTag(null)} type="button" className="modal-close-btn">×</button>
                 </div>
               ) : null}
-              <div className="table-wrap track-table-wrap">
+              <div className="table-wrap track-table-wrap" ref={trackTableScrollRef}>
                 <table className="recordings-table">
                   <thead>
                     <tr>
@@ -1270,66 +1279,91 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredRecordings.map((recording) => (
-                      <tr
-                        className={recording.primary_source_id ? "playable-row" : "muted-row"}
-                        key={recording.id}
-                        onDoubleClick={() => enqueueRecording(recording)}
-                        title={
-                          recording.primary_source_id
-                            ? "Double click to play or queue"
-                            : "No playable local file"
-                        }
-                      >
-                        <td>
-                          {recording.disc_position && recording.disc_position > 1
-                            ? `${recording.disc_position}.${recording.track_position ?? "—"}`
-                            : recording.track_position ?? "—"}
-                        </td>
-                        <td>{recording.title}</td>
-                        <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
-                        <td>{recording.release_group_title ?? "Unknown Album"}</td>
-                        <td>{recording.genre ?? "—"}</td>
-                        <td
-                          onClick={(e) => e.stopPropagation()}
-                          onDoubleClick={(e) => e.stopPropagation()}
-                        >
-                          <div className="tag-chips">
-                            {recording.tags.map((tag) => (
-                              <span
-                                className="tag-chip"
-                                key={tag}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setSelectedTag(tag);
-                                }}
-                                title={`Filter by tag "${tag}"`}
-                              >
-                                {tag}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                        <td>
-                          <RatingStars
-                            disabled={ratingKeyInFlight === `recording:${recording.id}`}
-                            onRate={handleRate}
-                            recordingId={recording.id}
-                            value={recording.rating}
-                          />
-                        </td>
-                        <td>{formatDuration(recording.duration_ms)}</td>
-                        <td>{recording.play_count}</td>
-                        <td>{formatLastPlayed(recording.last_played)}</td>
-                      </tr>
-                    ))}
                     {filteredRecordings.length === 0 ? (
                       <tr>
                         <td className="empty-table-state" colSpan={10}>
                           No tracks match the current artist, album, and search filters.
                         </td>
                       </tr>
-                    ) : null}
+                    ) : (
+                      <>
+                        {rowVirtualizer.getVirtualItems()[0]?.start > 0 && (
+                          <tr style={{ height: rowVirtualizer.getVirtualItems()[0].start }}>
+                            <td colSpan={10} />
+                          </tr>
+                        )}
+                        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                          const recording = filteredRecordings[virtualRow.index];
+                          return (
+                            <tr
+                              className={recording.primary_source_id ? "playable-row" : "muted-row"}
+                              key={recording.id}
+                              data-index={virtualRow.index}
+                              ref={rowVirtualizer.measureElement}
+                              onDoubleClick={() => enqueueRecording(recording)}
+                              title={
+                                recording.primary_source_id
+                                  ? "Double click to play or queue"
+                                  : "No playable local file"
+                              }
+                            >
+                              <td>
+                                {recording.disc_position && recording.disc_position > 1
+                                  ? `${recording.disc_position}.${recording.track_position ?? "—"}`
+                                  : recording.track_position ?? "—"}
+                              </td>
+                              <td>{recording.title}</td>
+                              <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
+                              <td>{recording.release_group_title ?? "Unknown Album"}</td>
+                              <td>{recording.genre ?? "—"}</td>
+                              <td
+                                onClick={(e) => e.stopPropagation()}
+                                onDoubleClick={(e) => e.stopPropagation()}
+                              >
+                                <div className="tag-chips">
+                                  {recording.tags.map((tag) => (
+                                    <span
+                                      className="tag-chip"
+                                      key={tag}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setSelectedTag(tag);
+                                      }}
+                                      title={`Filter by tag "${tag}"`}
+                                    >
+                                      {tag}
+                                    </span>
+                                  ))}
+                                </div>
+                              </td>
+                              <td>
+                                <RatingStars
+                                  disabled={ratingKeyInFlight === `recording:${recording.id}`}
+                                  onRate={handleRate}
+                                  recordingId={recording.id}
+                                  value={recording.rating}
+                                />
+                              </td>
+                              <td>{formatDuration(recording.duration_ms)}</td>
+                              <td>{recording.play_count}</td>
+                              <td>{formatLastPlayed(recording.last_played)}</td>
+                            </tr>
+                          );
+                        })}
+                        {(() => {
+                          const items = rowVirtualizer.getVirtualItems();
+                          const last = items[items.length - 1];
+                          const remaining = last
+                            ? rowVirtualizer.getTotalSize() - last.end
+                            : 0;
+                          return remaining > 0 ? (
+                            <tr style={{ height: remaining }}>
+                              <td colSpan={10} />
+                            </tr>
+                          ) : null;
+                        })()}
+                      </>
+                    )}
                   </tbody>
                 </table>
               </div>
