@@ -762,6 +762,24 @@ fn write_output_data<T, F>(
     }
 }
 
+/// Reads the 10-byte ID3v2 header from `file` and returns the byte offset of the
+/// first byte after the entire tag (i.e. where the actual audio data begins).
+/// Returns `None` if there is no ID3v2 header at the current file position.
+fn id3v2_end_offset(file: &mut File) -> Option<u64> {
+    use std::io::Read;
+    let mut header = [0u8; 10];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..3] != b"ID3" {
+        return None;
+    }
+    // Bytes 6–9 encode the tag body size as a syncsafe integer (7 bits per byte).
+    let size = ((header[6] as u64) << 21)
+        | ((header[7] as u64) << 14)
+        | ((header[8] as u64) << 7)
+        | (header[9] as u64);
+    Some(10 + size)
+}
+
 struct LocalFileSource {
     format: Box<dyn symphonia::core::formats::FormatReader>,
     decoder: Box<dyn symphonia::core::codecs::Decoder>,
@@ -778,6 +796,32 @@ impl LocalFileSource {
     fn open(path: &Path) -> Result<Self> {
         tracing::info!(path = %path.display(), "Opening local file source");
         let file = File::open(path)?;
+        match Self::probe_file(path, file) {
+            Ok(source) => Ok(source),
+            Err(first_err) => {
+                // Some files have malformed ID3v2 headers (e.g. flag bits not cleared) that
+                // cause symphonia's probe to fail even though the audio data is fine.  Retry
+                // by skipping the ID3v2 block entirely so symphonia sees only raw MP3 frames.
+                let msg = first_err.to_string();
+                if msg.contains("id3v2") || msg.contains("malformed") {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %first_err,
+                        "Retrying after skipping malformed ID3v2 header"
+                    );
+                    let mut file2 = File::open(path)?;
+                    if let Some(offset) = id3v2_end_offset(&mut file2) {
+                        use std::io::Seek;
+                        file2.seek(std::io::SeekFrom::Start(offset))?;
+                        return Self::probe_file(path, file2);
+                    }
+                }
+                Err(first_err)
+            }
+        }
+    }
+
+    fn probe_file(path: &Path, file: File) -> Result<Self> {
         let media_source = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
