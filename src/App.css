@@ -142,7 +142,7 @@ button {
 }
 
 .app-shell {
-  width: min(1580px, calc(100vw - 28px));
+  width: calc(100vw - 28px);
   margin: 0 auto;
   padding: 18px 0 42px;
 }
@@ -359,6 +359,8 @@ thead th {
 
 .queue-list-panel {
   padding: 18px;
+  max-width: 360px;
+  min-width: 0;
 }
 
 .slider-input {
@@ -388,6 +390,7 @@ thead th {
   padding: 11px 12px;
   border-radius: 14px;
   background: rgba(22, 32, 47, 0.72);
+  min-width: 0;
 }
 
 .queue-list li span,
