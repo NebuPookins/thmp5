@@ -5168,6 +5168,7 @@ dependencies = [
  "base64 0.22.1",
  "cpal",
  "hex",
+ "libc",
  "lofty",
  "pest",
  "pest_derive",

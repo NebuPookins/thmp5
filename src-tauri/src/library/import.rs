@@ -10,6 +10,15 @@ use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+/// Set the calling thread's I/O priority to idle class (Linux only).
+fn set_io_priority_idle() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // ioprio_set(IOPRIO_WHO_PROCESS=1, pid=0 (self), IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE=3, 0))
+        libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, (3i64 << 13) | 0i64);
+    }
+}
+
 pub(crate) struct PreparedImport {
     path: PathBuf,
     path_str: String,
@@ -125,6 +134,7 @@ pub(crate) async fn prepare_import(
         let _ = thread_priority::set_current_thread_priority(
             thread_priority::ThreadPriority::Min,
         );
+        set_io_priority_idle();
         let hash = file_sha256(&p).context("Failed to hash file")?;
         let meta = read_metadata(&p).context("Failed to read metadata")?;
         let fp = match fingerprint::generate_fingerprint(&p) {
