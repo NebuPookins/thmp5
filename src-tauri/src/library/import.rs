@@ -114,29 +114,37 @@ pub(crate) async fn prepare_import(
 
     let existing_source_id = existing_source.as_ref().map(|(id, _, _)| id.as_str());
 
-    let hash = file_sha256(path).context("Failed to hash file")?;
-    let meta = read_metadata(path).context("Failed to read metadata")?;
+    struct BlockingResult {
+        hash: String,
+        meta: TrackMetadata,
+        fp: Option<fingerprint::FingerprintResult>,
+    }
 
-    let fp = {
-        let p = path.to_path_buf();
-        match tokio::task::spawn_blocking(move || {
-            let _ = thread_priority::set_current_thread_priority(
-                thread_priority::ThreadPriority::Min,
-            );
-            fingerprint::generate_fingerprint(&p)
-        })
-        .await {
-            Ok(Ok(fp)) => Some(fp),
-            Ok(Err(e)) => {
-                tracing::warn!(path = %path.display(), "Fingerprint generation failed: {e}");
-                None
-            }
+    let p = path.to_path_buf();
+    let blocking = tokio::task::spawn_blocking(move || {
+        let _ = thread_priority::set_current_thread_priority(
+            thread_priority::ThreadPriority::Min,
+        );
+        let hash = file_sha256(&p).context("Failed to hash file")?;
+        let meta = read_metadata(&p).context("Failed to read metadata")?;
+        let fp = match fingerprint::generate_fingerprint(&p) {
+            Ok(fp) => Some(fp),
             Err(e) => {
-                tracing::warn!(path = %path.display(), "Fingerprint task panicked: {e}");
+                tracing::warn!(path = %p.display(), "Fingerprint generation failed: {e}");
                 None
             }
-        }
+        };
+        Ok::<_, anyhow::Error>(BlockingResult { hash, meta, fp })
+    })
+    .await;
+
+    let blocking = match blocking {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => anyhow::bail!("Blocking import task panicked: {e}"),
     };
+
+    let (hash, meta, fp) = (blocking.hash, blocking.meta, blocking.fp);
 
     let acoustid_match: Option<AcoustIdMatch> = match (acoustid_key, fp.as_ref()) {
         (Some(key), Some(fp_result)) => match fingerprint::lookup_acoustid(key, fp_result).await {
