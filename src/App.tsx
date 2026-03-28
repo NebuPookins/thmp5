@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
@@ -177,11 +177,12 @@ function trackSort(a: RecordingRow, b: RecordingRow): number {
 
 type RatingStarsProps = {
   value: number | null;
-  onChange: (value: number | null) => void;
+  recordingId: string;
+  onRate: (recordingId: string, value: number | null) => void;
   disabled?: boolean;
 };
 
-function RatingStars({ value, onChange, disabled = false }: RatingStarsProps) {
+const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disabled = false }: RatingStarsProps) {
   return (
     <div className="rating-stars" role="group">
       {[1, 2, 3, 4, 5].map((star) => {
@@ -195,7 +196,7 @@ function RatingStars({ value, onChange, disabled = false }: RatingStarsProps) {
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              onChange(value === star ? null : star);
+              onRate(recordingId, value === star ? null : star);
             }}
             type="button"
           >
@@ -205,7 +206,7 @@ function RatingStars({ value, onChange, disabled = false }: RatingStarsProps) {
       })}
     </div>
   );
-}
+});
 
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
@@ -797,6 +798,11 @@ function App() {
     }
   }
 
+  const handleRate = useCallback((recordingId: string, stars: number | null) => {
+    void updateRecordingRating(recordingId, stars);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recordings]);
+
   async function updateRecordingRating(recordingId: string, stars: number | null) {
     const ratingKey = `recording:${recordingId}`;
     const previousRecordings = recordings;
@@ -917,7 +923,8 @@ function App() {
             {currentTrack ? (
               <RatingStars
                 disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
-                onChange={(stars) => { void updateRecordingRating(currentTrack.id, stars); }}
+                onRate={handleRate}
+                recordingId={currentTrack.id}
                 value={currentTrack.rating}
               />
             ) : null}
@@ -1102,7 +1109,8 @@ function App() {
                                 <td>
                                   <RatingStars
                                     disabled={ratingKeyInFlight === `recording:${recording.id}`}
-                                    onChange={(stars) => { void updateRecordingRating(recording.id, stars); }}
+                                    onRate={handleRate}
+                                    recordingId={recording.id}
                                     value={recording.rating}
                                   />
                                 </td>
@@ -1305,9 +1313,8 @@ function App() {
                         <td>
                           <RatingStars
                             disabled={ratingKeyInFlight === `recording:${recording.id}`}
-                            onChange={(stars) => {
-                              void updateRecordingRating(recording.id, stars);
-                            }}
+                            onRate={handleRate}
+                            recordingId={recording.id}
                             value={recording.rating}
                           />
                         </td>
@@ -1367,7 +1374,8 @@ function App() {
                         <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
                         <RatingStars
                           disabled={ratingKeyInFlight === `recording:${item.id}`}
-                          onChange={(stars) => { void updateRecordingRating(item.id, stars); }}
+                          onRate={handleRate}
+                          recordingId={item.id}
                           value={item.rating}
                         />
                       </div>
@@ -1383,7 +1391,8 @@ function App() {
                         <span>{currentTrack.artist_credit_name ?? "Unknown Artist"}</span>
                         <RatingStars
                           disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
-                          onChange={(stars) => { void updateRecordingRating(currentTrack.id, stars); }}
+                          onRate={handleRate}
+                          recordingId={currentTrack.id}
                           value={currentTrack.rating}
                         />
                       </div>
@@ -1399,7 +1408,8 @@ function App() {
                         <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
                         <RatingStars
                           disabled={ratingKeyInFlight === `recording:${item.id}`}
-                          onChange={(stars) => { void updateRecordingRating(item.id, stars); }}
+                          onRate={handleRate}
+                          recordingId={item.id}
                           value={item.rating}
                         />
                       </div>
