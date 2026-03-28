@@ -56,7 +56,7 @@ pub async fn import_paths(
                             Ok(false) => stats.skipped += 1,
                             Err(e) => {
                                 stats.errors += 1;
-                                stats.error_messages.push(e.to_string());
+                                stats.error_messages.push(format!("{:#}", e));
                             }
                         }
                     }
@@ -78,7 +78,7 @@ pub async fn import_paths(
                 Ok(false) => stats.skipped += 1,
                 Err(e) => {
                     stats.errors += 1;
-                    stats.error_messages.push(e.to_string());
+                    stats.error_messages.push(format!("{:#}", e));
                 }
             }
         }

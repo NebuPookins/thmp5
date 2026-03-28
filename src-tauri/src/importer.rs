@@ -153,8 +153,9 @@ async fn handle_task_result(
                 state.skipped += 1;
             }
             Err(error) => {
-                let msg = format!("{}: {}", path.display(), error);
-                file_issues.push_import_error(path.to_string_lossy(), error.to_string());
+                let detail = format!("{:#}", error);
+                let msg = format!("{}: {}", path.display(), detail);
+                file_issues.push_import_error(path.to_string_lossy(), detail);
                 let mut state = progress.lock().expect("import progress mutex poisoned");
                 state.errors += 1;
                 state.error_messages.push(msg);
@@ -165,8 +166,9 @@ async fn handle_task_result(
             state.skipped += 1;
         }
         Ok((path, Err(error))) => {
-            let msg = format!("{}: {}", path.display(), error);
-            file_issues.push_import_error(path.to_string_lossy(), error.to_string());
+            let detail = format!("{:#}", error);
+            let msg = format!("{}: {}", path.display(), detail);
+            file_issues.push_import_error(path.to_string_lossy(), detail);
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.errors += 1;
             state.error_messages.push(msg);
