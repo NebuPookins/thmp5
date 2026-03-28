@@ -600,6 +600,7 @@ function App() {
       } catch (recordError) {
         setError(recordError instanceof Error ? recordError.message : String(recordError));
       }
+      void loadRecordings();
 
       setHistory((current) => [finishedTrack, ...current].slice(0, queueHistoryLimit));
     }
