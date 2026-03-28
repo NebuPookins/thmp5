@@ -106,6 +106,12 @@ type PlayerErrorEvent = {
   message: string;
 };
 
+type FileIssue = {
+  file_path: string;
+  kind: "import_error" | "playback_error";
+  message: string;
+};
+
 type QueueItem = RecordingRow;
 
 const DEFAULT_PLAYER_STATE: PlayerState = {
@@ -224,6 +230,8 @@ function App() {
   const [ratingKeyInFlight, setRatingKeyInFlight] = useState<string | null>(null);
   const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"options" | "issues">("options");
+  const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [_allTags, setAllTags] = useState<string[]>([]);
@@ -418,6 +426,14 @@ function App() {
   useEffect(() => {
     void loadBootstrap();
   }, []);
+
+  // Reload the file issue list whenever the issues tab is visible.
+  useEffect(() => {
+    if (!isModalOpen || settingsTab !== "issues") return;
+    invoke<FileIssue[]>("get_file_issues")
+      .then(setFileIssues)
+      .catch(() => {});
+  }, [isModalOpen, settingsTab]);
 
   useEffect(() => {
     if (!bootstrap || bootstrap.needs_setup) {
@@ -1405,7 +1421,25 @@ function App() {
         >
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2>Options</h2>
+              <div className="modal-tabs">
+                <button
+                  className={`modal-tab${settingsTab === "options" ? " modal-tab-active" : ""}`}
+                  onClick={() => setSettingsTab("options")}
+                  type="button"
+                >
+                  Options
+                </button>
+                <button
+                  className={`modal-tab${settingsTab === "issues" ? " modal-tab-active" : ""}`}
+                  onClick={() => setSettingsTab("issues")}
+                  type="button"
+                >
+                  File Issues
+                  {fileIssues.length > 0 && (
+                    <span className="modal-tab-badge">{fileIssues.length}</span>
+                  )}
+                </button>
+              </div>
               <button
                 className="modal-close-btn"
                 onClick={() => setIsModalOpen(false)}
@@ -1413,52 +1447,78 @@ function App() {
               >✕</button>
             </div>
 
-            <div className="modal-section">
-              <p className="modal-section-label">Library</p>
-              <div className="modal-actions">
-                <button
-                  className="secondary-button"
-                  disabled={isRefreshingLibrary}
-                  onClick={() => { void loadLibraryData(); }}
-                  type="button"
-                >
-                  {isRefreshingLibrary ? "Refreshing…" : "Refresh library"}
-                </button>
-                <button
-                  className="secondary-button"
-                  onClick={handleRescan}
-                  type="button"
-                >
-                  Rescan library
-                </button>
-              </div>
-            </div>
-
-            <div className="modal-section">
-              <p className="modal-section-label">Queue</p>
-              <div className="settings-row">
-                <div>
-                  <label className="input-label" htmlFor="modal-queue-history-limit">
-                    History limit
-                  </label>
-                  <input
-                    id="modal-queue-history-limit"
-                    className="small-input"
-                    inputMode="numeric"
-                    onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
-                    value={queueHistoryLimitInput}
-                  />
+            {settingsTab === "options" ? (
+              <>
+                <div className="modal-section">
+                  <p className="modal-section-label">Library</p>
+                  <div className="modal-actions">
+                    <button
+                      className="secondary-button"
+                      disabled={isRefreshingLibrary}
+                      onClick={() => { void loadLibraryData(); }}
+                      type="button"
+                    >
+                      {isRefreshingLibrary ? "Refreshing…" : "Refresh library"}
+                    </button>
+                    <button
+                      className="secondary-button"
+                      onClick={handleRescan}
+                      type="button"
+                    >
+                      Rescan library
+                    </button>
+                  </div>
                 </div>
-                <button
-                  className="secondary-button"
-                  disabled={isSavingQueueSettings}
-                  onClick={() => { void saveQueueSettings(); }}
-                  type="button"
-                >
-                  {isSavingQueueSettings ? "Saving…" : "Save"}
-                </button>
+
+                <div className="modal-section">
+                  <p className="modal-section-label">Queue</p>
+                  <div className="settings-row">
+                    <div>
+                      <label className="input-label" htmlFor="modal-queue-history-limit">
+                        History limit
+                      </label>
+                      <input
+                        id="modal-queue-history-limit"
+                        className="small-input"
+                        inputMode="numeric"
+                        onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
+                        value={queueHistoryLimitInput}
+                      />
+                    </div>
+                    <button
+                      className="secondary-button"
+                      disabled={isSavingQueueSettings}
+                      onClick={() => { void saveQueueSettings(); }}
+                      type="button"
+                    >
+                      {isSavingQueueSettings ? "Saving…" : "Save"}
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="modal-section">
+                {fileIssues.length === 0 ? (
+                  <p className="issue-empty">No file issues recorded this session.</p>
+                ) : (
+                  <ol className="issue-list">
+                    {fileIssues.map((issue, i) => (
+                      <li key={i} className="issue-item">
+                        <div className="issue-item-header">
+                          <span className={`issue-kind issue-kind-${issue.kind}`}>
+                            {issue.kind === "import_error" ? "Import" : "Playback"}
+                          </span>
+                        </div>
+                        <span className="issue-path" title={issue.file_path}>
+                          {issue.file_path}
+                        </span>
+                        <span className="issue-message">{issue.message}</span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
               </div>
-            </div>
+            )}
           </div>
         </div>
       ) : null}
