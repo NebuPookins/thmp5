@@ -1320,12 +1320,12 @@ function App() {
           <section className="queue-list-panel">
             <div className="queue-header">
               <div>
-                <p className="panel-label">Timeline</p>
-                <strong>
+                <p className="panel-label">
+                  Timeline |
                   {history.length > 0 || currentTrack || queue.length > 0
                     ? `${history.length} played · ${queue.length} queued`
                     : "Nothing playing"}
-                </strong>
+                </p>
               </div>
               <button
                 className={`auto-dj-btn ${autoDj ? "auto-dj-btn-on" : ""}`}

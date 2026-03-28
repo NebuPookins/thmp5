@@ -1,4 +1,5 @@
 :root {
+  --queue-panel-width: 330px;
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   line-height: 1.5;
   font-weight: 400;
@@ -142,9 +143,12 @@ button {
 }
 
 .app-shell {
+  display: grid;
+  grid-template-rows: auto auto 1fr 28px;
+  height: 100vh;
   width: calc(100vw - 28px);
   margin: 0 auto;
-  padding: 18px 0 42px;
+  padding: 18px 0 0;
 }
 
 .topbar {
@@ -170,18 +174,24 @@ button {
 
 .layout-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr) var(--queue-panel-width);
+  grid-template-rows: 100%;
   gap: 14px;
-  align-items: start;
+  grid-row: 3;
+  overflow: hidden;
+  min-height: 0;
 }
 
-.table-panel,
-.queue-list-panel {
+.table-panel {
   border-radius: 24px;
 }
 
 .table-panel {
   padding: 18px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .table-toolbar {
@@ -194,7 +204,7 @@ button {
 
 .table-wrap {
   overflow: auto;
-  max-height: calc(100vh - 270px);
+  flex: 1;
   border-radius: 18px;
   border: 1px solid rgba(124, 148, 177, 0.14);
 }
@@ -202,12 +212,20 @@ button {
 .browser-grid {
   display: grid;
   grid-template-columns: minmax(220px, 0.8fr) minmax(240px, 1fr) minmax(0, 2.2fr);
+  grid-template-rows: 100%;
   gap: 14px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .browser-column,
 .track-column {
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .browser-column-header {
@@ -221,7 +239,8 @@ button {
 .browser-list {
   display: grid;
   gap: 10px;
-  max-height: calc(100vh - 330px);
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding-right: 2px;
 }
@@ -314,7 +333,8 @@ button {
 }
 
 .track-table-wrap {
-  max-height: calc(100vh - 330px);
+  flex: 1;
+  min-height: 0;
 }
 
 table {
@@ -358,8 +378,8 @@ thead th {
 }
 
 .queue-list-panel {
-  padding: 18px;
-  max-width: 360px;
+  padding: 1px 8px;
+  max-width: var(--queue-panel-width);
   min-width: 0;
 }
 
@@ -426,8 +446,6 @@ thead th {
   border: 1px solid rgba(140, 164, 190, 0.22);
   background: rgba(16, 25, 38, 0.84);
   color: #8fa5c2;
-  border-radius: 999px;
-  padding: 5px 12px;
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.04em;
@@ -527,7 +545,6 @@ thead th {
   .table-panel,
   .player-panel,
   .queue-settings,
-  .queue-list-panel,
   .wizard-card {
     border-radius: 18px;
     padding: 14px;
@@ -788,10 +805,7 @@ thead th {
 /* ── Status bar ──────────────────────────────────────────────────────────────── */
 
 .status-bar {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  grid-row: 4;
   height: 28px;
   padding: 0 14px;
   display: flex;
@@ -802,7 +816,6 @@ thead th {
   background: rgba(8, 14, 22, 0.92);
   border-top: 1px solid rgba(149, 173, 198, 0.1);
   backdrop-filter: blur(10px);
-  z-index: 50;
 }
 
 .status-bar-sep {
