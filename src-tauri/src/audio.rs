@@ -1,3 +1,4 @@
+use crate::file_issues::FileIssueLog;
 use crate::models::{PlaybackStatus, PlayerState};
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -64,7 +65,7 @@ pub struct AudioEngineHandle {
 }
 
 impl AudioEngineHandle {
-    pub fn new(app: AppHandle) -> Result<Self> {
+    pub fn new(app: AppHandle, file_issues: FileIssueLog) -> Result<Self> {
         let shared = Arc::new(Mutex::new(SharedState::new(48_000, 2)));
         let (tx, rx) = mpsc::channel();
         let command_shared = Arc::clone(&shared);
@@ -86,7 +87,8 @@ impl AudioEngineHandle {
                         }
                     }
 
-                    if let Err(error) = handle_command(command, &command_shared, &app) {
+                    if let Err(error) = handle_command(command, &command_shared, &app, &file_issues)
+                    {
                         set_engine_error(&command_shared, &app, format!("{error:#}"));
                     }
                 }
@@ -251,6 +253,7 @@ fn handle_command(
     command: AudioCommand,
     shared: &Arc<Mutex<SharedState>>,
     app: &AppHandle,
+    file_issues: &FileIssueLog,
 ) -> Result<()> {
     match command {
         AudioCommand::Play(request) => {
@@ -260,7 +263,11 @@ fn handle_command(
                 path = %request.file_path,
                 "Beginning streaming track load"
             );
-            start_playback(shared, app, request, 0)?;
+            let file_path = request.file_path.clone();
+            if let Err(e) = start_playback(shared, app, request, 0) {
+                file_issues.push_playback_error(file_path, e.to_string());
+                return Err(e);
+            }
         }
         AudioCommand::Pause => {
             tracing::info!("Pausing playback");

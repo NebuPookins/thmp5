@@ -1,6 +1,7 @@
 mod audio;
 mod commands;
 mod db;
+pub mod file_issues;
 pub mod fingerprint;
 mod importer;
 mod library;
@@ -9,6 +10,7 @@ mod models;
 pub mod query;
 
 use audio::AudioEngineHandle;
+use file_issues::FileIssueLog;
 use importer::ImportManager;
 use sqlx::SqlitePool;
 use tauri::Manager;
@@ -21,6 +23,7 @@ pub struct AppState {
     pub importer: ImportManager,
     pub player: AudioEngineHandle,
     pub log_file_path: String,
+    pub file_issues: FileIssueLog,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -48,8 +51,9 @@ pub fn run() {
             } else {
                 tracing::info!("ACOUSTID_API_KEY not set — fingerprint lookups disabled");
             }
-            let importer = ImportManager::new();
-            let player = AudioEngineHandle::new(app.handle().clone())
+            let file_issues = FileIssueLog::new();
+            let importer = ImportManager::new(file_issues.clone());
+            let player = AudioEngineHandle::new(app.handle().clone(), file_issues.clone())
                 .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
             let state = AppState {
                 db: pool.clone(),
@@ -57,6 +61,7 @@ pub fn run() {
                 importer,
                 player,
                 log_file_path: log_path.display().to_string(),
+                file_issues,
             };
 
             if let Ok(Some(root_path)) =
@@ -97,6 +102,7 @@ pub fn run() {
             commands::list_playlists,
             commands::save_smart_playlist,
             commands::delete_playlist,
+            commands::get_file_issues,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

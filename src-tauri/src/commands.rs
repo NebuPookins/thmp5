@@ -1,4 +1,5 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
+use crate::file_issues::FileIssue;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, ImportProgress, ImportStats, InitialSetupRequest,
@@ -166,6 +167,11 @@ pub fn get_player_state(state: tauri::State<'_, AppState>) -> Result<PlayerState
 #[tauri::command]
 pub fn get_log_file_path(state: tauri::State<'_, AppState>) -> Result<String, String> {
     Ok(state.log_file_path.clone())
+}
+
+#[tauri::command]
+pub fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssue>, String> {
+    Ok(state.file_issues.all())
 }
 
 #[tauri::command]

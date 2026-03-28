@@ -1,3 +1,4 @@
+use crate::file_issues::FileIssueLog;
 use crate::library::import::{prepare_import, store_prepared_import};
 use crate::library::scanner::is_audio_file;
 use crate::models::ImportProgress;
@@ -11,12 +12,14 @@ use walkdir::WalkDir;
 #[derive(Clone)]
 pub struct ImportManager {
     progress: Arc<Mutex<ImportProgress>>,
+    file_issues: FileIssueLog,
 }
 
 impl ImportManager {
-    pub fn new() -> Self {
+    pub fn new(file_issues: FileIssueLog) -> Self {
         Self {
             progress: Arc::new(Mutex::new(ImportProgress::default())),
+            file_issues,
         }
     }
 
@@ -46,8 +49,10 @@ impl ImportManager {
         }
 
         let progress = Arc::clone(&self.progress);
+        let file_issues = self.file_issues.clone();
         tauri::async_runtime::spawn(async move {
-            let result = run_scan(&db, &root_path, acoustid_key.as_deref(), &progress).await;
+            let result =
+                run_scan(&db, &root_path, acoustid_key.as_deref(), &progress, &file_issues).await;
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.is_running = false;
             state.finished_at = Some(now_iso());
@@ -64,6 +69,7 @@ async fn run_scan(
     root_path: &str,
     acoustid_key: Option<&str>,
     progress: &Arc<Mutex<ImportProgress>>,
+    file_issues: &FileIssueLog,
 ) -> Result<()> {
     let concurrency = import_concurrency();
     let path = Path::new(root_path);
@@ -83,7 +89,7 @@ async fn run_scan(
 
                 if tasks.len() >= concurrency {
                     if let Some(result) = tasks.join_next().await {
-                        handle_task_result(db, progress, result).await;
+                        handle_task_result(db, progress, file_issues, result).await;
                     }
                 }
 
@@ -106,13 +112,17 @@ async fn run_scan(
             Err(error) => {
                 let mut state = progress.lock().expect("import progress mutex poisoned");
                 state.errors += 1;
-                state.error_messages.push(error.to_string());
+                let msg = error.to_string();
+                if let Some(p) = error.path() {
+                    file_issues.push_import_error(p.to_string_lossy(), msg.clone());
+                }
+                state.error_messages.push(msg);
             }
         }
     }
 
     while let Some(result) = tasks.join_next().await {
-        handle_task_result(db, progress, result).await;
+        handle_task_result(db, progress, file_issues, result).await;
     }
 
     let mut state = progress.lock().expect("import progress mutex poisoned");
@@ -123,6 +133,7 @@ async fn run_scan(
 async fn handle_task_result(
     db: &SqlitePool,
     progress: &Arc<Mutex<ImportProgress>>,
+    file_issues: &FileIssueLog,
     result: std::result::Result<
         (
             std::path::PathBuf,
@@ -142,11 +153,11 @@ async fn handle_task_result(
                 state.skipped += 1;
             }
             Err(error) => {
+                let msg = format!("{}: {}", path.display(), error);
+                file_issues.push_import_error(path.to_string_lossy(), error.to_string());
                 let mut state = progress.lock().expect("import progress mutex poisoned");
                 state.errors += 1;
-                state
-                    .error_messages
-                    .push(format!("{}: {}", path.display(), error));
+                state.error_messages.push(msg);
             }
         },
         Ok((_, Ok(None))) => {
@@ -154,11 +165,11 @@ async fn handle_task_result(
             state.skipped += 1;
         }
         Ok((path, Err(error))) => {
+            let msg = format!("{}: {}", path.display(), error);
+            file_issues.push_import_error(path.to_string_lossy(), error.to_string());
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.errors += 1;
-            state
-                .error_messages
-                .push(format!("{}: {}", path.display(), error));
+            state.error_messages.push(msg);
         }
         Err(error) => {
             let mut state = progress.lock().expect("import progress mutex poisoned");
