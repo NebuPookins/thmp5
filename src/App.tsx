@@ -403,13 +403,11 @@ function App() {
   async function loadLibraryData(nextArtistId = selectedArtistId, nextSearch = search) {
     setIsRefreshingLibrary(true);
     try {
-      await Promise.all([
-        loadRecordings(),
-        loadArtists(),
-        loadReleaseGroups(nextArtistId, nextSearch),
-        loadAllTags(),
-        loadPlaylists(),
-      ]);
+      await loadRecordings();
+      await loadArtists();
+      await loadReleaseGroups(nextArtistId, nextSearch);
+      await loadAllTags();
+      await loadPlaylists();
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
