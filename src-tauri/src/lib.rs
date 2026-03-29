@@ -10,13 +10,13 @@ mod models;
 pub mod query;
 
 use audio::AudioEngineHandle;
+use db::DbPool;
 use file_issues::FileIssueLog;
 use importer::ImportManager;
-use sqlx::SqlitePool;
 use tauri::Manager;
 
 pub struct AppState {
-    pub db: SqlitePool,
+    pub db: DbPool,
     /// AcoustID client API key, read from the `ACOUSTID_API_KEY` environment variable.
     /// AcoustID lookups are skipped when this is `None`.
     pub acoustid_api_key: Option<String>,
@@ -90,6 +90,7 @@ pub fn run() {
             commands::set_recording_rating,
             commands::get_player_state,
             commands::get_log_file_path,
+            commands::get_db_pool_debug_snapshot,
             commands::play,
             commands::pause,
             commands::resume,

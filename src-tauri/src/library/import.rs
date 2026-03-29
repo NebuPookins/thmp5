@@ -1,9 +1,10 @@
 use super::scanner::{is_audio_file, read_metadata};
+use crate::db::DbPool;
 use crate::fingerprint::{self, AcoustIdMatch};
 use crate::models::{ImportStats, TrackMetadata};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection, Sqlite, Transaction};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -32,7 +33,7 @@ pub(crate) struct PreparedImport {
 }
 
 pub async fn import_paths(
-    db: &SqlitePool,
+    db: &DbPool,
     paths: Vec<String>,
     acoustid_key: Option<&str>,
 ) -> Result<ImportStats> {
@@ -89,7 +90,7 @@ pub async fn import_paths(
 
 /// Returns `Ok(true)` if imported, `Ok(false)` if skipped (already exists).
 pub(crate) async fn import_file(
-    db: &SqlitePool,
+    db: &DbPool,
     path: &Path,
     acoustid_key: Option<&str>,
 ) -> Result<bool> {
@@ -101,17 +102,23 @@ pub(crate) async fn import_file(
 }
 
 pub(crate) async fn prepare_import(
-    db: &SqlitePool,
+    db: &DbPool,
     path: &Path,
     acoustid_key: Option<&str>,
 ) -> Result<Option<PreparedImport>> {
     let (file_size, file_mtime_ms) = file_identity(path).context("Failed to read file metadata")?;
     let path_str = path.to_string_lossy().to_string();
+    let mut conn = db
+        .acquire(format!(
+            "import.prepare.check_existing_source path={path_str}"
+        ))
+        .await
+        .context("Failed to acquire DB connection for import path check")?;
     let existing_source = sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
         "SELECT id, file_size, file_mtime_ms FROM source WHERE file_path = ?",
     )
     .bind(&path_str)
-    .fetch_optional(db)
+    .fetch_optional(&mut *conn)
     .await
     .context("DB error checking existing path")?;
 
@@ -178,10 +185,7 @@ pub(crate) async fn prepare_import(
     }))
 }
 
-pub(crate) async fn store_prepared_import(
-    db: &SqlitePool,
-    prepared: PreparedImport,
-) -> Result<bool> {
+pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport) -> Result<bool> {
     let PreparedImport {
         path,
         path_str,
@@ -194,6 +198,10 @@ pub(crate) async fn store_prepared_import(
         acoustid_match,
     } = prepared;
 
+    let mut dup_conn = db
+        .acquire(format!("import.store.check_duplicate_hash path={path_str}"))
+        .await
+        .context("Failed to acquire DB connection for duplicate hash check")?;
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM source
          WHERE file_hash = ?
@@ -202,14 +210,19 @@ pub(crate) async fn store_prepared_import(
     .bind(&hash)
     .bind(existing_source_id.as_deref())
     .bind(existing_source_id.as_deref())
-    .fetch_one(db)
+    .fetch_one(&mut *dup_conn)
     .await
     .context("DB error checking hash")?;
+    drop(dup_conn);
     if count > 0 {
         return Ok(false);
     }
 
-    let mut tx = db
+    let mut conn = db
+        .acquire(format!("import.store.transaction path={path_str}"))
+        .await
+        .context("Failed to acquire DB connection for import transaction")?;
+    let mut tx = conn
         .begin()
         .await
         .context("Failed to start import transaction")?;

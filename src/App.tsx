@@ -11,6 +11,29 @@ type LibrarySummary = {
   source_count: number;
 };
 
+type DbPoolLeaseInfo = {
+  id: number;
+  purpose: string;
+  acquired_at_unix_ms: number;
+  held_for_ms: number;
+};
+
+type DbPoolWaiterInfo = {
+  id: number;
+  purpose: string;
+  requested_at_unix_ms: number;
+  waiting_for_ms: number;
+};
+
+type DbPoolDebugSnapshot = {
+  size: number;
+  idle: number;
+  active_connection_count: number;
+  waiting_request_count: number;
+  active_connections: DbPoolLeaseInfo[];
+  waiting_requests: DbPoolWaiterInfo[];
+};
+
 type ImportProgress = {
   is_running: boolean;
   root_path: string | null;
@@ -209,6 +232,20 @@ const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disa
   );
 });
 
+async function reportPoolTimeout(context: string, value: unknown) {
+  const message = value instanceof Error ? value.message : String(value);
+  if (!message.includes("pool timed out while waiting for an open connection")) {
+    return;
+  }
+
+  try {
+    const snapshot = await invoke<DbPoolDebugSnapshot>("get_db_pool_debug_snapshot");
+    console.error(`DB pool snapshot after timeout in ${context}`, snapshot);
+  } catch (snapshotError) {
+    console.error(`Failed to fetch DB pool snapshot after timeout in ${context}`, snapshotError);
+  }
+}
+
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
@@ -245,6 +282,8 @@ function App() {
   const [playlists, setPlaylists] = useState<PlaylistRow[]>([]);
   const [savePlaylistName, setSavePlaylistName] = useState("");
   const [isSavingPlaylist, setIsSavingPlaylist] = useState(false);
+  const releaseGroupSearchInFlightRef = useRef(false);
+  const queuedReleaseGroupSearchRef = useRef<{ artistId: string | null; search: string } | null>(null);
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
   const isPlaying = playerState.status === "playing";
@@ -400,6 +439,38 @@ function App() {
     setReleaseGroups(rows);
   }
 
+  function scheduleReleaseGroupSearch(nextArtistId: string | null, nextSearch: string) {
+    queuedReleaseGroupSearchRef.current = {
+      artistId: nextArtistId,
+      search: nextSearch,
+    };
+
+    if (releaseGroupSearchInFlightRef.current) {
+      return;
+    }
+
+    releaseGroupSearchInFlightRef.current = true;
+    void (async () => {
+      while (queuedReleaseGroupSearchRef.current) {
+        const request = queuedReleaseGroupSearchRef.current;
+        queuedReleaseGroupSearchRef.current = null;
+
+        try {
+          await loadReleaseGroups(request.artistId, request.search);
+        } catch (loadError) {
+          await reportPoolTimeout("release group search", loadError);
+          setError(loadError instanceof Error ? loadError.message : String(loadError));
+        }
+      }
+
+      releaseGroupSearchInFlightRef.current = false;
+      const pendingRequest = queuedReleaseGroupSearchRef.current as { artistId: string | null; search: string } | null;
+      if (pendingRequest) {
+        scheduleReleaseGroupSearch(pendingRequest.artistId, pendingRequest.search);
+      }
+    })();
+  }
+
   async function loadLibraryData(nextArtistId = selectedArtistId, nextSearch = search) {
     setIsRefreshingLibrary(true);
     try {
@@ -409,6 +480,7 @@ function App() {
       await loadAllTags();
       await loadPlaylists();
     } catch (loadError) {
+      await reportPoolTimeout("loadLibraryData", loadError);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
       setIsRefreshingLibrary(false);
@@ -425,6 +497,7 @@ function App() {
       setQueueHistoryLimitInput(String(bootstrapResult.config.queue_history_limit));
       setPlayerState(currentPlayerState);
     } catch (loadError) {
+      await reportPoolTimeout("loadBootstrap", loadError);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
       setIsBootstrapping(false);
@@ -457,10 +530,8 @@ function App() {
     }
 
     const timeoutId = window.setTimeout(() => {
-      void loadReleaseGroups(selectedArtistId, search).catch((loadError) => {
-        setError(loadError instanceof Error ? loadError.message : String(loadError));
-      });
-    }, 120);
+      scheduleReleaseGroupSearch(selectedArtistId, search);
+    }, 250);
 
     return () => window.clearTimeout(timeoutId);
   }, [bootstrap?.needs_setup, search, selectedArtistId]);
@@ -502,6 +573,7 @@ function App() {
         }
         wasRunning = progress.is_running;
       } catch (pollError) {
+        await reportPoolTimeout("import progress poll", pollError);
         setError(pollError instanceof Error ? pollError.message : String(pollError));
       }
     }, 60000);

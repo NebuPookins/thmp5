@@ -86,6 +86,32 @@ pub struct LibrarySummary {
     pub source_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DbPoolLeaseInfo {
+    pub id: u64,
+    pub purpose: String,
+    pub acquired_at_unix_ms: i64,
+    pub held_for_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DbPoolWaiterInfo {
+    pub id: u64,
+    pub purpose: String,
+    pub requested_at_unix_ms: i64,
+    pub waiting_for_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DbPoolDebugSnapshot {
+    pub size: u32,
+    pub idle: usize,
+    pub active_connection_count: usize,
+    pub waiting_request_count: usize,
+    pub active_connections: Vec<DbPoolLeaseInfo>,
+    pub waiting_requests: Vec<DbPoolWaiterInfo>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecordingRow {
     pub id: String,

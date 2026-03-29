@@ -1,9 +1,9 @@
+use crate::db::DbPool;
 use crate::file_issues::FileIssueLog;
 use crate::library::import::{prepare_import, store_prepared_import};
 use crate::library::scanner::is_audio_file;
 use crate::models::ImportProgress;
 use anyhow::Result;
-use sqlx::SqlitePool;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinSet;
@@ -30,7 +30,7 @@ impl ImportManager {
             .clone()
     }
 
-    pub fn spawn_scan(&self, db: SqlitePool, root_path: String, acoustid_key: Option<String>) {
+    pub fn spawn_scan(&self, db: DbPool, root_path: String, acoustid_key: Option<String>) {
         {
             let mut progress = self
                 .progress
@@ -71,7 +71,7 @@ impl ImportManager {
 }
 
 async fn run_scan(
-    db: &SqlitePool,
+    db: &DbPool,
     root_path: &str,
     acoustid_key: Option<&str>,
     progress: &Arc<Mutex<ImportProgress>>,
@@ -137,7 +137,7 @@ async fn run_scan(
 }
 
 async fn handle_task_result(
-    db: &SqlitePool,
+    db: &DbPool,
     progress: &Arc<Mutex<ImportProgress>>,
     file_issues: &FileIssueLog,
     result: std::result::Result<

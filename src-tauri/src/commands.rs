@@ -2,10 +2,10 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::file_issues::FileIssue;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
-    AppBootstrap, AppConfig, ArtistRow, ImportProgress, ImportStats, InitialSetupRequest,
-    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
-    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
-    SmartPlaylistResult, VolumeRequest,
+    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, ImportProgress, ImportStats,
+    InitialSetupRequest, LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow,
+    QueueSettingsUpdate, RatingUpdateRequest, RecordingRow, ReleaseGroupRow,
+    SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult, VolumeRequest,
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
@@ -112,6 +112,14 @@ pub async fn record_play_history(
     state: tauri::State<'_, AppState>,
     input: PlayHistoryInput,
 ) -> Result<(), String> {
+    let mut conn = state
+        .db
+        .acquire(format!(
+            "command.record_play_history recording_id={}",
+            input.recording_id
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO play_history (recording_id, source_id, duration_played_ms)
          VALUES (?, ?, ?)",
@@ -119,7 +127,7 @@ pub async fn record_play_history(
     .bind(input.recording_id)
     .bind(input.source_id)
     .bind(input.duration_played_ms)
-    .execute(&state.db)
+    .execute(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -134,6 +142,14 @@ pub async fn set_recording_rating(
     validate_rating(request.stars)?;
 
     if let Some(stars) = request.stars {
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.set_recording_rating upsert recording_id={}",
+                request.id
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
         sqlx::query(
             "INSERT INTO user_rating (recording_id, stars, updated_at)
              VALUES (?, ?, datetime('now'))
@@ -143,13 +159,21 @@ pub async fn set_recording_rating(
         )
         .bind(&request.id)
         .bind(stars)
-        .execute(&state.db)
+        .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
     } else {
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.set_recording_rating delete recording_id={}",
+                request.id
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
         sqlx::query("DELETE FROM user_rating WHERE recording_id = ?")
             .bind(&request.id)
-            .execute(&state.db)
+            .execute(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -170,6 +194,13 @@ pub fn get_log_file_path(state: tauri::State<'_, AppState>) -> Result<String, St
 }
 
 #[tauri::command]
+pub fn get_db_pool_debug_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Result<DbPoolDebugSnapshot, String> {
+    Ok(state.db.snapshot())
+}
+
+#[tauri::command]
 pub fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssue>, String> {
     Ok(state.file_issues.all())
 }
@@ -180,6 +211,14 @@ pub async fn play(
     request: PlayRequest,
 ) -> Result<PlayerState, String> {
     tracing::info!(source_id = %request.source_id, "Play command received");
+    let mut conn = state
+        .db
+        .acquire(format!(
+            "command.play resolve_source source_id={}",
+            request.source_id
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
     let row = sqlx::query(
         "SELECT
             s.id                  AS source_id,
@@ -196,7 +235,7 @@ pub async fn play(
            AND s.file_path IS NOT NULL",
     )
     .bind(&request.source_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "Playable local source not found.".to_string())?;
@@ -290,9 +329,15 @@ pub async fn list_recordings(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<RecordingRow>, String> {
-    let db = &state.db;
     let limit = limit.unwrap_or(200);
     let offset = offset.unwrap_or(0);
+    let mut conn = state
+        .db
+        .acquire(format!(
+            "command.list_recordings limit={limit} offset={offset}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
 
     let rows = sqlx::query(
         "SELECT
@@ -349,7 +394,7 @@ pub async fn list_recordings(
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(db)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -390,7 +435,11 @@ pub async fn list_recordings(
 
 #[tauri::command]
 pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<ArtistRow>, String> {
-    let db = &state.db;
+    let mut conn = state
+        .db
+        .acquire("command.list_artists")
+        .await
+        .map_err(|e| e.to_string())?;
 
     let rows = sqlx::query(
         "SELECT
@@ -407,7 +456,7 @@ pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<Artis
          GROUP BY a.id
          ORDER BY lower(a.sort_name)",
     )
-    .fetch_all(db)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -434,12 +483,20 @@ pub async fn list_release_groups(
     artist_id: Option<String>,
     search: Option<String>,
 ) -> Result<Vec<ReleaseGroupRow>, String> {
-    let db = &state.db;
     let artist_filter = artist_id.as_deref();
     let search_filter = search
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let mut conn = state
+        .db
+        .acquire(format!(
+            "command.list_release_groups artist_id={} search={}",
+            artist_filter.unwrap_or("<all>"),
+            search_filter.unwrap_or("<none>")
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
 
     let rows = sqlx::query(
         "SELECT
@@ -489,7 +546,7 @@ pub async fn list_release_groups(
     .bind(search_filter)
     .bind(search_filter)
     .bind(search_filter)
-    .fetch_all(db)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -515,13 +572,18 @@ pub async fn get_cover_art(
     state: tauri::State<'_, AppState>,
     recording_id: String,
 ) -> Result<Option<String>, String> {
+    let mut conn = state
+        .db
+        .acquire(format!("command.get_cover_art recording_id={recording_id}"))
+        .await
+        .map_err(|e| e.to_string())?;
     let file_path: Option<String> = sqlx::query_scalar(
         "SELECT file_path FROM source
          WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
          ORDER BY file_path LIMIT 1",
     )
     .bind(&recording_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|e| e.to_string())?
     .flatten();
@@ -536,9 +598,14 @@ pub async fn get_cover_art(
 
 #[tauri::command]
 pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mut conn = state
+        .db
+        .acquire("command.list_all_tags")
+        .await
+        .map_err(|e| e.to_string())?;
     let tags =
         sqlx::query_scalar::<_, String>("SELECT DISTINCT tag FROM recording_tag ORDER BY tag")
-            .fetch_all(&state.db)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
     Ok(tags)
@@ -607,8 +674,13 @@ pub async fn evaluate_smart_playlist(
 
     tracing::debug!(sql = %full_sql, "Evaluating smart playlist");
 
+    let mut conn = state
+        .db
+        .acquire(format!("command.evaluate_smart_playlist query={query}"))
+        .await
+        .map_err(|e| e.to_string())?;
     let rows = sqlx::query(&full_sql)
-        .fetch_all(&state.db)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| format!("Query error: {e}"))?;
 
@@ -679,8 +751,13 @@ pub async fn evaluate_smart_playlist(
 
 #[tauri::command]
 pub async fn list_playlists(state: tauri::State<'_, AppState>) -> Result<Vec<PlaylistRow>, String> {
+    let mut conn = state
+        .db
+        .acquire("command.list_playlists")
+        .await
+        .map_err(|e| e.to_string())?;
     let rows = sqlx::query("SELECT id, name, kind, query FROM playlist ORDER BY name")
-        .fetch_all(&state.db)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -708,6 +785,11 @@ pub async fn save_smart_playlist(
         return Err("Playlist name cannot be empty.".to_string());
     }
 
+    let mut conn = state
+        .db
+        .acquire(format!("command.save_smart_playlist name={name}"))
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query(
         "INSERT INTO playlist (name, kind, query)
          VALUES (?, 'smart', ?)
@@ -715,13 +797,13 @@ pub async fn save_smart_playlist(
     )
     .bind(name)
     .bind(&request.query)
-    .execute(&state.db)
+    .execute(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
 
     let row = sqlx::query("SELECT id, name, kind, query FROM playlist WHERE name = ?")
         .bind(name)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -735,9 +817,14 @@ pub async fn save_smart_playlist(
 
 #[tauri::command]
 pub async fn delete_playlist(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
+    let mut conn = state
+        .db
+        .acquire(format!("command.delete_playlist id={id}"))
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query("DELETE FROM playlist WHERE id = ?")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -753,20 +840,24 @@ fn validate_rating(stars: Option<i64>) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn load_music_root(db: &sqlx::SqlitePool) -> anyhow::Result<Option<String>> {
+pub async fn load_music_root(db: &crate::db::DbPool) -> anyhow::Result<Option<String>> {
+    let mut conn = db.acquire("config.load_music_root").await?;
     Ok(
         sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'music_root'")
-            .fetch_optional(db)
+            .fetch_optional(&mut *conn)
             .await?,
     )
 }
 
-async fn load_app_config(db: &sqlx::SqlitePool) -> anyhow::Result<AppConfig> {
+async fn load_app_config(db: &crate::db::DbPool) -> anyhow::Result<AppConfig> {
     let music_root = load_music_root(db).await?;
+    let mut conn = db
+        .acquire("config.load_app_config.queue_history_limit")
+        .await?;
     let queue_history_limit = sqlx::query_scalar::<_, String>(
         "SELECT value FROM app_config WHERE key = 'queue_history_limit'",
     )
-    .fetch_optional(db)
+    .fetch_optional(&mut *conn)
     .await?
     .and_then(|value| value.parse::<i64>().ok())
     .unwrap_or(5);
@@ -777,7 +868,8 @@ async fn load_app_config(db: &sqlx::SqlitePool) -> anyhow::Result<AppConfig> {
     })
 }
 
-async fn set_config_value(db: &sqlx::SqlitePool, key: &str, value: &str) -> anyhow::Result<()> {
+async fn set_config_value(db: &crate::db::DbPool, key: &str, value: &str) -> anyhow::Result<()> {
+    let mut conn = db.acquire(format!("config.set key={key}")).await?;
     sqlx::query(
         "INSERT INTO app_config (key, value)
          VALUES (?, ?)
@@ -785,27 +877,28 @@ async fn set_config_value(db: &sqlx::SqlitePool, key: &str, value: &str) -> anyh
     )
     .bind(key)
     .bind(value)
-    .execute(db)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
 }
 
-async fn load_library_summary(db: &sqlx::SqlitePool) -> anyhow::Result<LibrarySummary> {
+async fn load_library_summary(db: &crate::db::DbPool) -> anyhow::Result<LibrarySummary> {
+    let mut conn = db.acquire("summary.load_library_summary").await?;
     let recording_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM recording")
-        .fetch_one(db)
+        .fetch_one(&mut *conn)
         .await?;
 
     let artist_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artist")
-        .fetch_one(db)
+        .fetch_one(&mut *conn)
         .await?;
 
     let release_group_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM release_group")
-        .fetch_one(db)
+        .fetch_one(&mut *conn)
         .await?;
 
     let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source")
-        .fetch_one(db)
+        .fetch_one(&mut *conn)
         .await?;
 
     Ok(LibrarySummary {
