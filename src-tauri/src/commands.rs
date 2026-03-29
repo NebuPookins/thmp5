@@ -3,7 +3,7 @@ use crate::file_issues::FileIssue;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, ImportProgress, ImportStats, InitialSetupRequest,
-    LibrarySummary, PlayHistoryInput, PlaylistRow, PlayRequest, PlayerState, QueueSettingsUpdate,
+    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
     RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
     SmartPlaylistResult, VolumeRequest,
 };
@@ -374,8 +374,13 @@ pub async fn list_recordings(
             primary_source_path: row.get("primary_source_path"),
             tags: {
                 let raw: Option<String> = row.get("tags_raw");
-                raw.map(|r| r.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
-                   .unwrap_or_default()
+                raw.map(|r| {
+                    r.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
             },
         })
         .collect();
@@ -529,15 +534,13 @@ pub async fn get_cover_art(
         .map_err(|e| e.to_string())
 }
 
-
 #[tauri::command]
 pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    let tags = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT tag FROM recording_tag ORDER BY tag",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let tags =
+        sqlx::query_scalar::<_, String>("SELECT DISTINCT tag FROM recording_tag ORDER BY tag")
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
     Ok(tags)
 }
 
@@ -630,8 +633,13 @@ pub async fn evaluate_smart_playlist(
             primary_source_path: row.get("primary_source_path"),
             tags: {
                 let raw: Option<String> = row.get("tags_raw");
-                raw.map(|r| r.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
-                   .unwrap_or_default()
+                raw.map(|r| {
+                    r.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
             },
         })
         .collect();
@@ -645,8 +653,8 @@ pub async fn evaluate_smart_playlist(
             LimitUnit::Minutes | LimitUnit::Hours => {
                 let target_ms = match lim.unit {
                     LimitUnit::Minutes => lim.value * 60_000,
-                    LimitUnit::Hours   => lim.value * 3_600_000,
-                    LimitUnit::Tracks  => unreachable!(),
+                    LimitUnit::Hours => lim.value * 3_600_000,
+                    LimitUnit::Tracks => unreachable!(),
                 };
                 let mut accumulated: i64 = 0;
                 recordings.retain(|r| {
@@ -670,15 +678,11 @@ pub async fn evaluate_smart_playlist(
 }
 
 #[tauri::command]
-pub async fn list_playlists(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<PlaylistRow>, String> {
-    let rows = sqlx::query(
-        "SELECT id, name, kind, query FROM playlist ORDER BY name",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+pub async fn list_playlists(state: tauri::State<'_, AppState>) -> Result<Vec<PlaylistRow>, String> {
+    let rows = sqlx::query("SELECT id, name, kind, query FROM playlist ORDER BY name")
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(rows
         .into_iter()
@@ -715,13 +719,11 @@ pub async fn save_smart_playlist(
     .await
     .map_err(|e| e.to_string())?;
 
-    let row = sqlx::query(
-        "SELECT id, name, kind, query FROM playlist WHERE name = ?",
-    )
-    .bind(name)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let row = sqlx::query("SELECT id, name, kind, query FROM playlist WHERE name = ?")
+        .bind(name)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(PlaylistRow {
         id: row.get("id"),
@@ -732,10 +734,7 @@ pub async fn save_smart_playlist(
 }
 
 #[tauri::command]
-pub async fn delete_playlist(
-    state: tauri::State<'_, AppState>,
-    id: i64,
-) -> Result<(), String> {
+pub async fn delete_playlist(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
     sqlx::query("DELETE FROM playlist WHERE id = ?")
         .bind(id)
         .execute(&state.db)

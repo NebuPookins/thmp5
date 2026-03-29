@@ -89,8 +89,7 @@ pub struct ParsedQuery {
 
 /// Parse a smart-playlist query string into an AST.
 pub fn parse(input: &str) -> anyhow::Result<ParsedQuery> {
-    let mut pairs = QueryParser::parse(Rule::query, input)
-        .context("Query syntax error")?;
+    let mut pairs = QueryParser::parse(Rule::query, input).context("Query syntax error")?;
     let query_pair = pairs.next().context("empty parse")?;
 
     let mut expr: Option<Expr> = None;
@@ -135,26 +134,36 @@ fn parse_expr(pair: Pair<Rule>) -> anyhow::Result<Expr> {
 fn parse_or_expr(pair: Pair<Rule>) -> anyhow::Result<Expr> {
     // or_expr = { and_expr ~ ("OR" ~ and_expr)* }
     let mut children = pair.into_inner().map(parse_and_expr);
-    let first = children.next().context("or_expr: empty")?? ;
-    children.try_fold(first, |acc, next| Ok(Expr::Or(Box::new(acc), Box::new(next?))))
+    let first = children.next().context("or_expr: empty")??;
+    children.try_fold(first, |acc, next| {
+        Ok(Expr::Or(Box::new(acc), Box::new(next?)))
+    })
 }
 
 fn parse_and_expr(pair: Pair<Rule>) -> anyhow::Result<Expr> {
     // and_expr = { factor ~ ("AND" ~ factor)* }
     let mut children = pair.into_inner().map(parse_factor);
-    let first = children.next().context("and_expr: empty")?? ;
-    children.try_fold(first, |acc, next| Ok(Expr::And(Box::new(acc), Box::new(next?))))
+    let first = children.next().context("and_expr: empty")??;
+    children.try_fold(first, |acc, next| {
+        Ok(Expr::And(Box::new(acc), Box::new(next?)))
+    })
 }
 
 fn parse_factor(pair: Pair<Rule>) -> anyhow::Result<Expr> {
     let inner = pair.into_inner().next().context("factor: empty")?;
     match inner.as_rule() {
         Rule::paren_expr => {
-            let expr_pair = inner.into_inner().next().context("paren_expr: missing expr")?;
+            let expr_pair = inner
+                .into_inner()
+                .next()
+                .context("paren_expr: missing expr")?;
             parse_expr(expr_pair)
         }
         Rule::not_expr => {
-            let factor_pair = inner.into_inner().next().context("not_expr: missing factor")?;
+            let factor_pair = inner
+                .into_inner()
+                .next()
+                .context("not_expr: missing factor")?;
             Ok(Expr::Not(Box::new(parse_factor(factor_pair)?)))
         }
         Rule::predicate => parse_predicate(inner),
@@ -180,11 +189,21 @@ fn parse_predicate(pair: Pair<Rule>) -> anyhow::Result<Expr> {
             Predicate::PlayCount(op, n)
         }
         Rule::in_playlist_pred => {
-            let name = extract_string(inner.into_inner().next().context("InPlaylist: missing name")?)?;
+            let name = extract_string(
+                inner
+                    .into_inner()
+                    .next()
+                    .context("InPlaylist: missing name")?,
+            )?;
             Predicate::InPlaylist(name)
         }
         Rule::not_in_playlist_pred => {
-            let name = extract_string(inner.into_inner().next().context("NotInPlaylist: missing name")?)?;
+            let name = extract_string(
+                inner
+                    .into_inner()
+                    .next()
+                    .context("NotInPlaylist: missing name")?,
+            )?;
             Predicate::NotInPlaylist(name)
         }
         Rule::has_tag_pred => {
@@ -265,21 +284,21 @@ fn parse_cmp_op(pair: Pair<Rule>) -> anyhow::Result<CmpOp> {
     match pair.as_str() {
         ">=" => Ok(CmpOp::Gte),
         "<=" => Ok(CmpOp::Lte),
-        ">"  => Ok(CmpOp::Gt),
-        "<"  => Ok(CmpOp::Lt),
-        "="  => Ok(CmpOp::Eq),
+        ">" => Ok(CmpOp::Gt),
+        "<" => Ok(CmpOp::Lt),
+        "=" => Ok(CmpOp::Eq),
         "!=" => Ok(CmpOp::Ne),
-        s    => bail!("cmp_op: unknown {:?}", s),
+        s => bail!("cmp_op: unknown {:?}", s),
     }
 }
 
 fn parse_time_unit(pair: Pair<Rule>) -> anyhow::Result<TimeUnit> {
     match pair.as_str() {
-        "Days"   => Ok(TimeUnit::Days),
-        "Weeks"  => Ok(TimeUnit::Weeks),
+        "Days" => Ok(TimeUnit::Days),
+        "Weeks" => Ok(TimeUnit::Weeks),
         "Months" => Ok(TimeUnit::Months),
-        "Years"  => Ok(TimeUnit::Years),
-        s        => bail!("time_unit: unknown {:?}", s),
+        "Years" => Ok(TimeUnit::Years),
+        s => bail!("time_unit: unknown {:?}", s),
     }
 }
 
@@ -317,10 +336,10 @@ fn cmp_op_sql(op: CmpOp) -> &'static str {
     match op {
         CmpOp::Gte => ">=",
         CmpOp::Lte => "<=",
-        CmpOp::Gt  => ">",
-        CmpOp::Lt  => "<",
-        CmpOp::Eq  => "=",
-        CmpOp::Ne  => "!=",
+        CmpOp::Gt => ">",
+        CmpOp::Lt => "<",
+        CmpOp::Eq => "=",
+        CmpOp::Ne => "!=",
     }
 }
 
@@ -362,10 +381,10 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
         }
         Predicate::LastPlayed(dir, n, unit) => {
             let sql_unit = match unit {
-                TimeUnit::Days   => "days",
-                TimeUnit::Weeks  => "days", // SQLite uses days
+                TimeUnit::Days => "days",
+                TimeUnit::Weeks => "days", // SQLite uses days
                 TimeUnit::Months => "months",
-                TimeUnit::Years  => "years",
+                TimeUnit::Years => "years",
             };
             // For Weeks, multiply n by 7
             let n_adjusted = match unit {
@@ -378,14 +397,16 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
                         out,
                         "(last_played IS NOT NULL AND last_played >= datetime('now', '-{} {}'))",
                         n_adjusted, sql_unit
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
                 LastPlayedDir::NotInLast => {
                     write!(
                         out,
                         "(last_played IS NULL OR last_played < datetime('now', '-{} {}'))",
                         n_adjusted, sql_unit
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -398,7 +419,8 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
                 "id IN (SELECT pt.recording_id FROM playlist_track pt \
                  JOIN playlist p ON p.id = pt.playlist_id WHERE p.name = '{}')",
                 sql_esc(name)
-            ).unwrap();
+            )
+            .unwrap();
         }
         Predicate::NotInPlaylist(name) => {
             write!(
@@ -406,21 +428,24 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
                 "id NOT IN (SELECT pt.recording_id FROM playlist_track pt \
                  JOIN playlist p ON p.id = pt.playlist_id WHERE p.name = '{}')",
                 sql_esc(name)
-            ).unwrap();
+            )
+            .unwrap();
         }
         Predicate::HasTag(tag) => {
             write!(
                 out,
                 "id IN (SELECT recording_id FROM recording_tag WHERE tag = '{}')",
                 sql_esc(tag)
-            ).unwrap();
+            )
+            .unwrap();
         }
         Predicate::Title(op, s) => match op {
             StrOp::Contains => write!(
                 out,
                 "lower(title) LIKE '%{}%' ESCAPE '\\'",
                 sql_like_esc(&s.to_lowercase())
-            ).unwrap(),
+            )
+            .unwrap(),
             StrOp::Is => write!(out, "lower(title) = '{}'", sql_esc(&s.to_lowercase())).unwrap(),
         },
         Predicate::Genre(op, s) => match op {
@@ -428,17 +453,16 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
                 out,
                 "(genre IS NOT NULL AND lower(genre) LIKE '%{}%' ESCAPE '\\')",
                 sql_like_esc(&s.to_lowercase())
-            ).unwrap(),
-            StrOp::Is => write!(
-                out,
-                "lower(genre) = '{}'",
-                sql_esc(&s.to_lowercase())
-            ).unwrap(),
+            )
+            .unwrap(),
+            StrOp::Is => write!(out, "lower(genre) = '{}'", sql_esc(&s.to_lowercase())).unwrap(),
         },
         Predicate::Artist(op, s) => {
             // smart_playlist_view doesn't include artist name — use a subquery
             let pattern = match op {
-                StrOp::Contains => format!("LIKE '%{}%' ESCAPE '\\'", sql_like_esc(&s.to_lowercase())),
+                StrOp::Contains => {
+                    format!("LIKE '%{}%' ESCAPE '\\'", sql_like_esc(&s.to_lowercase()))
+                }
                 StrOp::Is => format!("= '{}'", sql_esc(&s.to_lowercase())),
             };
             write!(
@@ -447,7 +471,8 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
                  JOIN artist a ON a.id = ra.artist_id \
                  WHERE lower(COALESCE(ra.credited_as, a.name)) {})",
                 pattern
-            ).unwrap();
+            )
+            .unwrap();
         }
         Predicate::Year(op, n) => {
             // smart_playlist_view doesn't include year — use a subquery
@@ -458,8 +483,10 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
                  JOIN release rel ON rel.id = m.release_id \
                  WHERE rel.release_date IS NOT NULL \
                  AND CAST(substr(rel.release_date, 1, 4) AS INTEGER) {} {})",
-                cmp_op_sql(*op), n
-            ).unwrap();
+                cmp_op_sql(*op),
+                n
+            )
+            .unwrap();
         }
     }
 }
@@ -467,9 +494,9 @@ fn compile_predicate(pred: &Predicate, out: &mut String) {
 /// Escape special LIKE pattern characters %, _, \.
 fn sql_like_esc(s: &str) -> String {
     s.replace('\\', "\\\\")
-     .replace('%', "\\%")
-     .replace('_', "\\_")
-     .replace('\'', "''")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        .replace('\'', "''")
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -518,7 +545,10 @@ mod tests {
     #[test]
     fn test_has_tag() {
         let q = parse_and_compile("HasTag chill");
-        assert_eq!(q, "id IN (SELECT recording_id FROM recording_tag WHERE tag = 'chill')");
+        assert_eq!(
+            q,
+            "id IN (SELECT recording_id FROM recording_tag WHERE tag = 'chill')"
+        );
     }
 
     #[test]

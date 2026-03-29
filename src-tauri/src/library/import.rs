@@ -131,9 +131,7 @@ pub(crate) async fn prepare_import(
 
     let p = path.to_path_buf();
     let blocking = tokio::task::spawn_blocking(move || {
-        let _ = thread_priority::set_current_thread_priority(
-            thread_priority::ThreadPriority::Min,
-        );
+        let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
         set_io_priority_idle();
         let hash = file_sha256(&p).context("Failed to hash file")?;
         let meta = read_metadata(&p).context("Failed to read metadata")?;
@@ -584,13 +582,11 @@ async fn sync_tags_from_comment(
         .unwrap_or_default();
 
     for tag in tags {
-        sqlx::query(
-            "INSERT OR IGNORE INTO recording_tag (recording_id, tag) VALUES (?, ?)",
-        )
-        .bind(recording_id)
-        .bind(&tag)
-        .execute(&mut **tx)
-        .await?;
+        sqlx::query("INSERT OR IGNORE INTO recording_tag (recording_id, tag) VALUES (?, ?)")
+            .bind(recording_id)
+            .bind(&tag)
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }

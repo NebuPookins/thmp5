@@ -51,8 +51,14 @@ impl ImportManager {
         let progress = Arc::clone(&self.progress);
         let file_issues = self.file_issues.clone();
         tauri::async_runtime::spawn(async move {
-            let result =
-                run_scan(&db, &root_path, acoustid_key.as_deref(), &progress, &file_issues).await;
+            let result = run_scan(
+                &db,
+                &root_path,
+                acoustid_key.as_deref(),
+                &progress,
+                &file_issues,
+            )
+            .await;
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.is_running = false;
             state.finished_at = Some(now_iso());
