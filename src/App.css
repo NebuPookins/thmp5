@@ -211,7 +211,7 @@ button {
 
 .browser-grid {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(0, 2.2fr);
+  grid-template-columns: 200px 1fr;
   grid-template-rows: 100%;
   gap: 14px;
   flex: 1;
@@ -271,8 +271,10 @@ button {
   display: grid;
   gap: 10px;
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow: auto;
+  overflow-x: hidden;
   padding-right: 2px;
 }
 
@@ -285,16 +287,25 @@ button {
 
 .browser-item {
   width: 100%;
+  max-width: 100%;
   text-align: left;
   border-radius: 18px;
-  padding: 14px;
+  padding: 0px 8px;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
   transition:
     border-color 150ms ease,
     background 150ms ease,
     transform 150ms ease;
+}
+
+.browser-item strong,
+.browser-item span {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .browser-item span,
@@ -1016,18 +1027,18 @@ thead th {
 .tab-bar {
   display: flex;
   gap: 2px;
-  padding: 6px 8px 0;
+  padding: 0;
   border-bottom: 1px solid rgba(149, 173, 198, 0.12);
   background: rgba(11, 18, 28, 0.6);
 }
 
 .tab-btn {
-  padding: 6px 16px;
+  padding: 0px 4px;
   border: none;
   background: transparent;
   color: #8fa5be;
   border-radius: 4px 4px 0 0;
-  font-size: 0.85rem;
+  font-size: 0.7rem;
   font-weight: 500;
   cursor: pointer;
   transition: color 0.15s;
