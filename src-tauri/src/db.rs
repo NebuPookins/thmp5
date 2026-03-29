@@ -20,8 +20,10 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true);
 
+    // Reserve extra connections beyond import workers so UI commands
+    // (e.g. list_recordings) can always acquire one during a scan.
     let pool = SqlitePoolOptions::new()
-        .max_connections(worker_count())
+        .max_connections(worker_count() + 2)
         .connect_with(opts)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
