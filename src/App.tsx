@@ -557,8 +557,10 @@ function App() {
     }
 
     let wasRunning = bootstrap.import_progress.is_running;
+    let cancelled = false;
+    let timeoutId: number | null = null;
 
-    const interval = window.setInterval(async () => {
+    async function poll() {
       try {
         const progress = await invoke<ImportProgress>("get_import_progress");
         const summary = await invoke<LibrarySummary>("get_library_summary");
@@ -572,17 +574,33 @@ function App() {
             : current,
         );
 
-        if (wasRunning && !progress.is_running) {
+        const shouldReloadLibrary = wasRunning && !progress.is_running;
+        wasRunning = progress.is_running;
+        if (shouldReloadLibrary) {
           await loadLibraryData(selectedArtistId, search);
         }
-        wasRunning = progress.is_running;
       } catch (pollError) {
         await reportPoolTimeout("import progress poll", pollError);
         setError(pollError instanceof Error ? pollError.message : String(pollError));
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(() => {
+            void poll();
+          }, 60000);
+        }
       }
+    }
+
+    timeoutId = window.setTimeout(() => {
+      void poll();
     }, 60000);
 
-    return () => window.clearInterval(interval);
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
   }, [bootstrap?.needs_setup, search, selectedArtistId]);
 
   useEffect(() => {
