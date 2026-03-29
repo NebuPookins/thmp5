@@ -237,7 +237,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [_allTags, setAllTags] = useState<string[]>([]);
-  const [activeTab, setActiveTab] = useState<"library" | "smartplaylist">("library");
+  const [browserLeftTab, setBrowserLeftTab] = useState<"artists" | "albums" | "smartplaylists">("artists");
   const [smartQuery, setSmartQuery] = useState("");
   const [smartResult, setSmartResult] = useState<SmartPlaylistResult | null>(null);
   const [smartError, setSmartError] = useState<string | null>(null);
@@ -979,108 +979,223 @@ function App() {
 
       <section className="layout-grid">
         <section className="table-panel">
-          <div className="tab-bar">
-            <button
-              className={`tab-btn ${activeTab === "library" ? "tab-btn-active" : ""}`}
-              onClick={() => setActiveTab("library")}
-              type="button"
-            >Library</button>
-            <button
-              className={`tab-btn ${activeTab === "smartplaylist" ? "tab-btn-active" : ""}`}
-              onClick={() => setActiveTab("smartplaylist")}
-              type="button"
-            >Smart Playlist</button>
-          </div>
+          {browserLeftTab !== "smartplaylists" ? (
+            <div className="table-toolbar browser-toolbar">
+              <input
+                className="search-input"
+                onChange={(event) => setSearch(event.currentTarget.value)}
+                placeholder="Filter artists, albums, tracks, genre"
+                value={search}
+              />
+              <span className="panel-meta">
+                {filteredRecordings.length} tracks · {releaseGroups.length} albums
+              </span>
+            </div>
+          ) : null}
 
-          {activeTab === "smartplaylist" ? (
-            <div className="smart-playlist-panel">
-              <div className="smart-pl-layout">
-                <aside className="smart-pl-sidebar">
-                  <p className="panel-label">Saved playlists</p>
-                  {playlists.filter((p) => p.kind === "smart").length === 0 ? (
-                    <p className="empty-browser-state">No saved playlists yet.</p>
-                  ) : (
-                    <ul className="saved-playlist-list">
-                      {playlists
-                        .filter((p) => p.kind === "smart")
-                        .map((pl) => (
-                          <li className="saved-playlist-item" key={pl.id}>
-                            <button
-                              className="saved-playlist-name"
-                              onClick={() => {
-                                setSmartQuery(pl.query ?? "");
-                                setSavePlaylistName(pl.name);
-                              }}
-                              type="button"
-                              title={pl.query ?? ""}
-                            >{pl.name}</button>
-                            <button
-                              className="saved-playlist-delete"
-                              onClick={() => { void deletePlaylist(pl.id); }}
-                              title="Delete"
-                              type="button"
-                            >✕</button>
-                          </li>
-                        ))}
-                    </ul>
-                  )}
-                </aside>
+          <div className="browser-grid">
+            <section className="browser-left-panel">
+              <div className="tab-bar">
+                <button
+                  className={`tab-btn ${browserLeftTab === "artists" ? "tab-btn-active" : ""}`}
+                  onClick={() => setBrowserLeftTab("artists")}
+                  type="button"
+                >Artists</button>
+                <button
+                  className={`tab-btn ${browserLeftTab === "albums" ? "tab-btn-active" : ""}`}
+                  onClick={() => setBrowserLeftTab("albums")}
+                  type="button"
+                >Albums</button>
+                <button
+                  className={`tab-btn ${browserLeftTab === "smartplaylists" ? "tab-btn-active" : ""}`}
+                  onClick={() => setBrowserLeftTab("smartplaylists")}
+                  type="button"
+                >Smart Playlists</button>
+              </div>
 
-                <div className="smart-pl-editor">
-                  <div className="smart-pl-query-area">
-                    <textarea
-                      className="smart-pl-textarea"
-                      onChange={(e) => setSmartQuery(e.currentTarget.value)}
-                      onKeyDown={(e) => {
-                        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-                          e.preventDefault();
-                          void runSmartQuery();
-                        }
-                      }}
-                      placeholder={
-                        "Rating >= 4 AND LastPlayed NotInLast 8 Months\n" +
-                        "HasTag chill AND PlayCount >= 3\n" +
-                        "Artist contains \"Radiohead\" LIMIT 30 minutes"
-                      }
-                      rows={4}
-                      spellCheck={false}
-                      value={smartQuery}
-                    />
-                    <div className="smart-pl-actions">
-                      <button
-                        className="primary-button"
-                        disabled={isRunningQuery || !smartQuery.trim()}
-                        onClick={() => { void runSmartQuery(); }}
-                        type="button"
-                      >
-                        {isRunningQuery ? "Running…" : "Run (Ctrl+Enter)"}
-                      </button>
-                      <div className="smart-pl-save-row">
-                        <input
-                          className="small-input"
-                          onChange={(e) => setSavePlaylistName(e.currentTarget.value)}
-                          placeholder="Playlist name"
-                          value={savePlaylistName}
-                        />
+              {browserLeftTab === "artists" ? (
+                <div className="browser-left-content">
+                  <div className="browser-column-header">
+                    <div>
+                      <p className="panel-label">Artists</p>
+                      <strong>{visibleArtists.length}</strong>
+                    </div>
+                    <button
+                      className={`filter-chip ${selectedArtistId ? "" : "filter-chip-active"}`}
+                      onClick={() => setSelectedArtistId(null)}
+                      type="button"
+                    >
+                      All
+                    </button>
+                  </div>
+                  <div className="browser-list">
+                    {visibleArtists.length === 0 ? (
+                      <p className="empty-browser-state">No artists match this filter.</p>
+                    ) : (
+                      visibleArtists.map((artist) => (
                         <button
-                          className="secondary-button"
-                          disabled={isSavingPlaylist || !savePlaylistName.trim() || !smartQuery.trim()}
-                          onClick={() => { void saveSmartPlaylist(); }}
+                          className={`browser-item ${artist.id === selectedArtistId ? "browser-item-active" : ""}`}
+                          key={artist.id}
+                          onClick={() =>
+                            setSelectedArtistId((current) => (current === artist.id ? null : artist.id))
+                          }
                           type="button"
                         >
-                          {isSavingPlaylist ? "Saving…" : "Save"}
+                          <strong>{artist.name}</strong>
+                          <span>
+                            {artist.release_group_count} albums · {artist.recording_count} tracks
+                          </span>
+                          <span className="rating-summary">{formatAlbumRating(artist.rating)}</span>
                         </button>
-                      </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              ) : browserLeftTab === "albums" ? (
+                <div className="browser-left-content">
+                  <div className="browser-column-header">
+                    <div>
+                      <p className="panel-label">Albums</p>
+                      <strong>{selectedArtist?.name ?? "All artists"}</strong>
                     </div>
+                    <button
+                      className={`filter-chip ${selectedReleaseGroupId ? "" : "filter-chip-active"}`}
+                      onClick={() => setSelectedReleaseGroupId(null)}
+                      type="button"
+                    >
+                      All
+                    </button>
+                  </div>
+                  <div className="browser-list">
+                    {releaseGroups.length === 0 ? (
+                      <p className="empty-browser-state">No albums available for this view.</p>
+                    ) : (
+                      releaseGroups.map((releaseGroup) => (
+                        <div
+                          className={`browser-item ${releaseGroup.id === selectedReleaseGroupId ? "browser-item-active" : ""}`}
+                          key={releaseGroup.id}
+                          onClick={() =>
+                            setSelectedReleaseGroupId((current) =>
+                              current === releaseGroup.id ? null : releaseGroup.id,
+                            )
+                          }
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              setSelectedReleaseGroupId((current) =>
+                                current === releaseGroup.id ? null : releaseGroup.id,
+                              );
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                        >
+                          <strong>{releaseGroup.title}</strong>
+                          <span>
+                            {releaseGroup.artist_credit_name ?? "Unknown Artist"} ·{" "}
+                            {formatYear(releaseGroup.release_date)}
+                          </span>
+                          <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="browser-left-content smart-pl-left">
+                  <div className="smart-pl-saved-section">
+                    <p className="panel-label">Saved playlists</p>
+                    {playlists.filter((p) => p.kind === "smart").length === 0 ? (
+                      <p className="empty-browser-state">No saved playlists yet.</p>
+                    ) : (
+                      <ul className="saved-playlist-list">
+                        {playlists
+                          .filter((p) => p.kind === "smart")
+                          .map((pl) => (
+                            <li className="saved-playlist-item" key={pl.id}>
+                              <button
+                                className="saved-playlist-name"
+                                onClick={() => {
+                                  setSmartQuery(pl.query ?? "");
+                                  setSavePlaylistName(pl.name);
+                                }}
+                                type="button"
+                                title={pl.query ?? ""}
+                              >{pl.name}</button>
+                              <button
+                                className="saved-playlist-delete"
+                                onClick={() => { void deletePlaylist(pl.id); }}
+                                title="Delete"
+                                type="button"
+                              >✕</button>
+                            </li>
+                          ))}
+                      </ul>
+                    )}
                   </div>
 
-                  {smartError ? (
-                    <div className="error-banner smart-pl-error">{smartError}</div>
-                  ) : null}
+                  <div className="smart-pl-editor">
+                    <div className="smart-pl-query-area">
+                      <textarea
+                        className="smart-pl-textarea"
+                        onChange={(e) => setSmartQuery(e.currentTarget.value)}
+                        onKeyDown={(e) => {
+                          if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                            e.preventDefault();
+                            void runSmartQuery();
+                          }
+                        }}
+                        placeholder={
+                          "Rating >= 4 AND LastPlayed NotInLast 8 Months\n" +
+                          "HasTag chill AND PlayCount >= 3\n" +
+                          "Artist contains \"Radiohead\" LIMIT 30 minutes"
+                        }
+                        rows={4}
+                        spellCheck={false}
+                        value={smartQuery}
+                      />
+                      <div className="smart-pl-actions">
+                        <button
+                          className="primary-button"
+                          disabled={isRunningQuery || !smartQuery.trim()}
+                          onClick={() => { void runSmartQuery(); }}
+                          type="button"
+                        >
+                          {isRunningQuery ? "Running…" : "Run (Ctrl+Enter)"}
+                        </button>
+                        <div className="smart-pl-save-row">
+                          <input
+                            className="small-input"
+                            onChange={(e) => setSavePlaylistName(e.currentTarget.value)}
+                            placeholder="Playlist name"
+                            value={savePlaylistName}
+                          />
+                          <button
+                            className="secondary-button"
+                            disabled={isSavingPlaylist || !savePlaylistName.trim() || !smartQuery.trim()}
+                            onClick={() => { void saveSmartPlaylist(); }}
+                            type="button"
+                          >
+                            {isSavingPlaylist ? "Saving…" : "Save"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
 
+                    {smartError ? (
+                      <div className="error-banner smart-pl-error">{smartError}</div>
+                    ) : null}
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <section className="track-column">
+              {browserLeftTab === "smartplaylists" ? (
+                <div className="smart-pl-results-panel">
                   {smartResult ? (
-                    <div className="smart-pl-results">
-                      <div className="smart-pl-results-header">
+                    <>
+                      <div className="browser-column-header">
                         <span className="panel-meta">
                           {smartResult.recordings.length} tracks · {formatDuration(smartResult.total_duration_ms)}
                         </span>
@@ -1138,239 +1253,137 @@ function App() {
                           </tbody>
                         </table>
                       </div>
+                    </>
+                  ) : (
+                    <p className="empty-browser-state">Run a query to see results here.</p>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <div className="browser-column-header">
+                    <div>
+                      <p className="panel-label">Tracks</p>
+                      <strong>{selectedReleaseGroup?.title ?? "Library view"}</strong>
+                    </div>
+                    <span className="panel-meta">
+                      {selectedArtist?.name ?? "All artists"}
+                    </span>
+                  </div>
+                  {selectedTag ? (
+                    <div className="active-tag-filter">
+                      Filtered by tag: <strong>{selectedTag}</strong>
+                      <button onClick={() => setSelectedTag(null)} type="button" className="modal-close-btn">×</button>
                     </div>
                   ) : null}
-                </div>
-              </div>
-            </div>
-          ) : (
-          <>
-          <div className="table-toolbar browser-toolbar">
-            <input
-              className="search-input"
-              onChange={(event) => setSearch(event.currentTarget.value)}
-              placeholder="Filter artists, albums, tracks, genre"
-              value={search}
-            />
-            <span className="panel-meta">
-              {filteredRecordings.length} tracks · {releaseGroups.length} albums
-            </span>
-          </div>
-
-          <div className="browser-grid">
-            <section className="browser-column">
-              <div className="browser-column-header">
-                <div>
-                  <p className="panel-label">Artists</p>
-                  <strong>{visibleArtists.length}</strong>
-                </div>
-                <button
-                  className={`filter-chip ${selectedArtistId ? "" : "filter-chip-active"}`}
-                  onClick={() => setSelectedArtistId(null)}
-                  type="button"
-                >
-                  All
-                </button>
-              </div>
-              <div className="browser-list">
-                {visibleArtists.length === 0 ? (
-                  <p className="empty-browser-state">No artists match this filter.</p>
-                ) : (
-                  visibleArtists.map((artist) => (
-                    <button
-                      className={`browser-item ${artist.id === selectedArtistId ? "browser-item-active" : ""}`}
-                      key={artist.id}
-                      onClick={() =>
-                        setSelectedArtistId((current) => (current === artist.id ? null : artist.id))
-                      }
-                      type="button"
-                    >
-                      <strong>{artist.name}</strong>
-                      <span>
-                        {artist.release_group_count} albums · {artist.recording_count} tracks
-                      </span>
-                      <span className="rating-summary">{formatAlbumRating(artist.rating)}</span>
-                    </button>
-                  ))
-                )}
-              </div>
-            </section>
-
-            <section className="browser-column">
-              <div className="browser-column-header">
-                <div>
-                  <p className="panel-label">Albums</p>
-                  <strong>{selectedArtist?.name ?? "All artists"}</strong>
-                </div>
-                <button
-                  className={`filter-chip ${selectedReleaseGroupId ? "" : "filter-chip-active"}`}
-                  onClick={() => setSelectedReleaseGroupId(null)}
-                  type="button"
-                >
-                  All
-                </button>
-              </div>
-              <div className="browser-list">
-                {releaseGroups.length === 0 ? (
-                  <p className="empty-browser-state">No albums available for this view.</p>
-                ) : (
-                  releaseGroups.map((releaseGroup) => (
-                    <div
-                      className={`browser-item ${releaseGroup.id === selectedReleaseGroupId ? "browser-item-active" : ""}`}
-                      key={releaseGroup.id}
-                      onClick={() =>
-                        setSelectedReleaseGroupId((current) =>
-                          current === releaseGroup.id ? null : releaseGroup.id,
-                        )
-                      }
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          setSelectedReleaseGroupId((current) =>
-                            current === releaseGroup.id ? null : releaseGroup.id,
-                          );
-                        }
-                      }}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <strong>{releaseGroup.title}</strong>
-                      <span>
-                        {releaseGroup.artist_credit_name ?? "Unknown Artist"} ·{" "}
-                        {formatYear(releaseGroup.release_date)}
-                      </span>
-                      <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </section>
-
-            <section className="track-column">
-              <div className="browser-column-header">
-                <div>
-                  <p className="panel-label">Tracks</p>
-                  <strong>{selectedReleaseGroup?.title ?? "Library view"}</strong>
-                </div>
-                <span className="panel-meta">
-                  {selectedArtist?.name ?? "All artists"}
-                </span>
-              </div>
-              {selectedTag ? (
-                <div className="active-tag-filter">
-                  Filtered by tag: <strong>{selectedTag}</strong>
-                  <button onClick={() => setSelectedTag(null)} type="button" className="modal-close-btn">×</button>
-                </div>
-              ) : null}
-              <div className="table-wrap track-table-wrap" ref={trackTableScrollRef}>
-                <table className="recordings-table">
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Title</th>
-                      <th>Artist</th>
-                      <th>Album</th>
-                      <th>Genre</th>
-                      <th>Tags</th>
-                      <th>Rating</th>
-                      <th>Duration</th>
-                      <th>Plays</th>
-                      <th>Last played</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredRecordings.length === 0 ? (
-                      <tr>
-                        <td className="empty-table-state" colSpan={10}>
-                          No tracks match the current artist, album, and search filters.
-                        </td>
-                      </tr>
-                    ) : (
-                      <>
-                        {rowVirtualizer.getVirtualItems()[0]?.start > 0 && (
-                          <tr style={{ height: rowVirtualizer.getVirtualItems()[0].start }}>
-                            <td colSpan={10} />
+                  <div className="table-wrap track-table-wrap" ref={trackTableScrollRef}>
+                    <table className="recordings-table">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Title</th>
+                          <th>Artist</th>
+                          <th>Album</th>
+                          <th>Genre</th>
+                          <th>Tags</th>
+                          <th>Rating</th>
+                          <th>Duration</th>
+                          <th>Plays</th>
+                          <th>Last played</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredRecordings.length === 0 ? (
+                          <tr>
+                            <td className="empty-table-state" colSpan={10}>
+                              No tracks match the current artist, album, and search filters.
+                            </td>
                           </tr>
+                        ) : (
+                          <>
+                            {rowVirtualizer.getVirtualItems()[0]?.start > 0 && (
+                              <tr style={{ height: rowVirtualizer.getVirtualItems()[0].start }}>
+                                <td colSpan={10} />
+                              </tr>
+                            )}
+                            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                              const recording = filteredRecordings[virtualRow.index];
+                              return (
+                                <tr
+                                  className={recording.primary_source_id ? "playable-row" : "muted-row"}
+                                  key={recording.id}
+                                  data-index={virtualRow.index}
+                                  ref={rowVirtualizer.measureElement}
+                                  onDoubleClick={() => enqueueRecording(recording)}
+                                  title={
+                                    recording.primary_source_id
+                                      ? "Double click to play or queue"
+                                      : "No playable local file"
+                                  }
+                                >
+                                  <td>
+                                    {recording.disc_position && recording.disc_position > 1
+                                      ? `${recording.disc_position}.${recording.track_position ?? "—"}`
+                                      : recording.track_position ?? "—"}
+                                  </td>
+                                  <td>{recording.title}</td>
+                                  <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
+                                  <td>{recording.release_group_title ?? "Unknown Album"}</td>
+                                  <td>{recording.genre ?? "—"}</td>
+                                  <td
+                                    onClick={(e) => e.stopPropagation()}
+                                    onDoubleClick={(e) => e.stopPropagation()}
+                                  >
+                                    <div className="tag-chips">
+                                      {recording.tags.map((tag) => (
+                                        <span
+                                          className="tag-chip"
+                                          key={tag}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setSelectedTag(tag);
+                                          }}
+                                          title={`Filter by tag "${tag}"`}
+                                        >
+                                          {tag}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </td>
+                                  <td>
+                                    <RatingStars
+                                      disabled={ratingKeyInFlight === `recording:${recording.id}`}
+                                      onRate={handleRate}
+                                      recordingId={recording.id}
+                                      value={recording.rating}
+                                    />
+                                  </td>
+                                  <td>{formatDuration(recording.duration_ms)}</td>
+                                  <td>{recording.play_count}</td>
+                                  <td>{formatLastPlayed(recording.last_played)}</td>
+                                </tr>
+                              );
+                            })}
+                            {(() => {
+                              const items = rowVirtualizer.getVirtualItems();
+                              const last = items[items.length - 1];
+                              const remaining = last
+                                ? rowVirtualizer.getTotalSize() - last.end
+                                : 0;
+                              return remaining > 0 ? (
+                                <tr style={{ height: remaining }}>
+                                  <td colSpan={10} />
+                                </tr>
+                              ) : null;
+                            })()}
+                          </>
                         )}
-                        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                          const recording = filteredRecordings[virtualRow.index];
-                          return (
-                            <tr
-                              className={recording.primary_source_id ? "playable-row" : "muted-row"}
-                              key={recording.id}
-                              data-index={virtualRow.index}
-                              ref={rowVirtualizer.measureElement}
-                              onDoubleClick={() => enqueueRecording(recording)}
-                              title={
-                                recording.primary_source_id
-                                  ? "Double click to play or queue"
-                                  : "No playable local file"
-                              }
-                            >
-                              <td>
-                                {recording.disc_position && recording.disc_position > 1
-                                  ? `${recording.disc_position}.${recording.track_position ?? "—"}`
-                                  : recording.track_position ?? "—"}
-                              </td>
-                              <td>{recording.title}</td>
-                              <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
-                              <td>{recording.release_group_title ?? "Unknown Album"}</td>
-                              <td>{recording.genre ?? "—"}</td>
-                              <td
-                                onClick={(e) => e.stopPropagation()}
-                                onDoubleClick={(e) => e.stopPropagation()}
-                              >
-                                <div className="tag-chips">
-                                  {recording.tags.map((tag) => (
-                                    <span
-                                      className="tag-chip"
-                                      key={tag}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setSelectedTag(tag);
-                                      }}
-                                      title={`Filter by tag "${tag}"`}
-                                    >
-                                      {tag}
-                                    </span>
-                                  ))}
-                                </div>
-                              </td>
-                              <td>
-                                <RatingStars
-                                  disabled={ratingKeyInFlight === `recording:${recording.id}`}
-                                  onRate={handleRate}
-                                  recordingId={recording.id}
-                                  value={recording.rating}
-                                />
-                              </td>
-                              <td>{formatDuration(recording.duration_ms)}</td>
-                              <td>{recording.play_count}</td>
-                              <td>{formatLastPlayed(recording.last_played)}</td>
-                            </tr>
-                          );
-                        })}
-                        {(() => {
-                          const items = rowVirtualizer.getVirtualItems();
-                          const last = items[items.length - 1];
-                          const remaining = last
-                            ? rowVirtualizer.getTotalSize() - last.end
-                            : 0;
-                          return remaining > 0 ? (
-                            <tr style={{ height: remaining }}>
-                              <td colSpan={10} />
-                            </tr>
-                          ) : null;
-                        })()}
-                      </>
-                    )}
-                  </tbody>
-                </table>
-              </div>
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
             </section>
           </div>
-          </>
-          )}
         </section>
 
         <aside className="queue-panel">

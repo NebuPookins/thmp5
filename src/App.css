@@ -211,7 +211,7 @@ button {
 
 .browser-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 0.8fr) minmax(240px, 1fr) minmax(0, 2.2fr);
+  grid-template-columns: minmax(260px, 1fr) minmax(0, 2.2fr);
   grid-template-rows: 100%;
   gap: 14px;
   flex: 1;
@@ -220,12 +220,43 @@ button {
 }
 
 .browser-column,
+.browser-left-panel,
 .track-column {
   min-width: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+
+.browser-left-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding-top: 12px;
+}
+
+.smart-pl-left {
+  overflow: auto;
+  gap: 14px;
+}
+
+.smart-pl-saved-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.smart-pl-results-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  gap: 6px;
 }
 
 .browser-column-header {
@@ -1014,24 +1045,7 @@ thead th {
 
 /* ── Smart Playlist editor ───────────────────────────────────────────────── */
 
-.smart-playlist-panel {
-  overflow: auto;
-  flex: 1;
-  padding: 12px;
-}
 
-.smart-pl-layout {
-  display: grid;
-  grid-template-columns: 180px 1fr;
-  gap: 12px;
-  min-height: 100%;
-}
-
-.smart-pl-sidebar {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
 
 .saved-playlist-list {
   list-style: none;
