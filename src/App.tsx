@@ -246,6 +246,10 @@ async function reportPoolTimeout(context: string, value: unknown) {
   }
 }
 
+function applyRatingToRecording(recording: RecordingRow, recordingId: string, stars: number | null): RecordingRow {
+  return recording.id === recordingId ? { ...recording, rating: stars } : recording;
+}
+
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
@@ -885,14 +889,32 @@ function App() {
   async function updateRecordingRating(recordingId: string, stars: number | null) {
     const ratingKey = `recording:${recordingId}`;
     const previousRecordings = recordings;
+    const previousHistory = history;
+    const previousQueue = queue;
+    const previousCurrentTrack = currentTrack;
+    const previousSmartResult = smartResult;
     setRatingKeyInFlight(ratingKey);
     setRecordings((current) =>
-      current.map((recording) =>
-        recording.id === recordingId ? { ...recording, rating: stars } : recording,
-      ),
+      current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
+    );
+    setHistory((current) =>
+      current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
+    );
+    setQueue((current) =>
+      current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
     );
     setCurrentTrack((current) =>
-      current?.id === recordingId ? { ...current, rating: stars } : current,
+      current ? applyRatingToRecording(current, recordingId, stars) : current,
+    );
+    setSmartResult((current) =>
+      current
+        ? {
+            ...current,
+            recordings: current.recordings.map((recording) =>
+              applyRatingToRecording(recording, recordingId, stars),
+            ),
+          }
+        : current,
     );
 
     try {
@@ -901,9 +923,10 @@ function App() {
       });
     } catch (ratingError) {
       setRecordings(previousRecordings);
-      setCurrentTrack((current) =>
-        current?.id === recordingId ? { ...current, rating: recordings.find((r) => r.id === recordingId)?.rating ?? null } : current,
-      );
+      setHistory(previousHistory);
+      setQueue(previousQueue);
+      setCurrentTrack(previousCurrentTrack);
+      setSmartResult(previousSmartResult);
       setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
     } finally {
       setRatingKeyInFlight((current) => (current === ratingKey ? null : current));
