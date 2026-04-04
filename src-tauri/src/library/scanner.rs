@@ -5,6 +5,121 @@ use lofty::probe::Probe;
 use lofty::tag::ItemKey;
 use std::path::Path;
 
+/// Decode a 4-byte synchsafe integer (used in ID3v2.3+ tag/frame sizes).
+fn synchsafe_to_u32(b: &[u8]) -> u32 {
+    ((b[0] as u32) << 21) | ((b[1] as u32) << 14) | ((b[2] as u32) << 7) | (b[3] as u32)
+}
+
+/// Map a common ID3 frame ID to a human-readable field name.
+fn frame_id_to_field_name(id: &str) -> &'static str {
+    match id {
+        "TIT2" | "TT2" => "title",
+        "TPE1" | "TP1" => "artist",
+        "TPE2" | "TP2" => "album artist",
+        "TALB" | "TAL" => "album",
+        "TRCK" | "TRK" => "track number",
+        "TPOS" | "TPA" => "disc number",
+        "TYER" | "TYE" | "TDRC" => "year",
+        "TCON" | "TCO" => "genre",
+        "TXXX" | "TXX" => "user-defined text",
+        "TBPM" | "TBP" => "BPM",
+        "TCOM" | "TCM" => "composer",
+        "TPUB" | "TPB" => "publisher",
+        "TIT1" | "TT1" => "content group",
+        "TIT3" | "TT3" => "subtitle",
+        "TOPE" | "TOA" => "original artist",
+        "COMM" | "COM" => "comment",
+        _ => "unknown field",
+    }
+}
+
+/// Scan raw ID3v2 bytes to find the first text frame whose UTF-16 content has an odd byte
+/// length (which is what triggers lofty's "UTF-16 string has an odd length" error).
+/// Returns the frame ID string (e.g. "TIT2") if one is found.
+///
+/// TODO: If https://github.com/Serial-ATA/lofty-rs/issues/639 is resolved, remove this
+/// function and the surrounding error-enrichment code and rely on lofty's own frame ID
+/// reporting instead.
+fn find_problematic_id3_frame(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 10 || &data[0..3] != b"ID3" {
+        return None;
+    }
+
+    let version = data[3]; // 2, 3, or 4
+    let flags = data[5];
+    let tag_size = synchsafe_to_u32(&data[6..10]) as usize;
+    let end = (10 + tag_size).min(data.len());
+
+    let mut pos = 10;
+
+    // Skip extended header (ID3v2.3+, flag bit 6).
+    if version >= 3 && (flags & 0x40) != 0 && pos + 4 <= end {
+        let ext_size = if version == 4 {
+            synchsafe_to_u32(&data[pos..pos + 4]) as usize
+        } else {
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize
+        };
+        pos += ext_size;
+    }
+
+    while pos < end {
+        let (frame_id, frame_size) = if version == 2 {
+            // ID3v2.2: 3-byte frame ID, 3-byte size.
+            if pos + 6 > end {
+                break;
+            }
+            if data[pos] == 0 {
+                break; // padding
+            }
+            let id = std::str::from_utf8(&data[pos..pos + 3]).ok()?.to_string();
+            let size = (data[pos + 3] as usize) << 16
+                | (data[pos + 4] as usize) << 8
+                | data[pos + 5] as usize;
+            pos += 6;
+            (id, size)
+        } else {
+            // ID3v2.3/v2.4: 4-byte frame ID, 4-byte size, 2-byte flags.
+            if pos + 10 > end {
+                break;
+            }
+            if data[pos] == 0 {
+                break; // padding
+            }
+            let id = std::str::from_utf8(&data[pos..pos + 4]).ok()?.to_string();
+            let size = if version == 4 {
+                synchsafe_to_u32(&data[pos + 4..pos + 8]) as usize
+            } else {
+                u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize
+            };
+            pos += 10;
+            (id, size)
+        };
+
+        if frame_size == 0 {
+            continue;
+        }
+
+        let content_end = (pos + frame_size).min(end);
+        let content = &data[pos..content_end];
+
+        // Text frames start with an encoding byte. Encoding 1 = UTF-16 with BOM.
+        // UTF-16 content (everything after the encoding byte) must have even byte length.
+        let is_text_frame = frame_id.starts_with('T') || frame_id == "COMM" || frame_id == "COM";
+        if is_text_frame && content.len() > 1 && content[0] == 1 {
+            let text_bytes = &content[1..];
+            if text_bytes.len() % 2 != 0 {
+                return Some(frame_id);
+            }
+        }
+
+        pos += frame_size;
+    }
+
+    None
+}
+
 /// Supported audio extensions.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "ogg", "flac", "wav", "m4a", "aac", "opus", "wma", "ape",
@@ -24,7 +139,15 @@ pub fn read_metadata(path: &Path) -> Result<TrackMetadata> {
         .guess_file_type()
         .context("Failed to detect file type")?
         .read()
-        .context("Failed to read tags")?;
+        .map_err(|e| {
+            let frame_note = find_problematic_id3_frame(path)
+                .map(|id| {
+                    let field = frame_id_to_field_name(&id);
+                    format!(" (frame {id} / {field})")
+                })
+                .unwrap_or_default();
+            anyhow::anyhow!("Failed to read tags{frame_note}: {e}")
+        })?;
 
     let properties = tagged_file.properties();
     let duration_ms = properties.duration().as_millis() as u64;
