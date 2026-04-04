@@ -131,6 +131,7 @@ pub struct RecordingRow {
     pub primary_source_id: Option<String>,
     pub primary_source_path: Option<String>,
     pub tags: Vec<String>,
+    pub source_paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

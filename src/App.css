@@ -102,6 +102,10 @@ button {
   width: 92px;
 }
 
+.music-root-input {
+  width: 320px;
+}
+
 .path-input:focus,
 .search-input:focus,
 .small-input:focus {
@@ -954,6 +958,19 @@ thead th {
 
 .tag-chip:hover {
   border-color: #888;
+}
+
+.source-paths-cell {
+  max-width: 300px;
+}
+
+.source-path {
+  font-size: 0.75em;
+  font-family: monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #8a9ab0;
 }
 
 

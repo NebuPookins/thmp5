@@ -78,6 +78,7 @@ type RecordingRow = {
   primary_source_id: string | null;
   primary_source_path: string | null;
   tags: string[];
+  source_paths: string[];
 };
 
 type ArtistRow = {
@@ -266,6 +267,8 @@ function App() {
   const [selectedReleaseGroupId, setSelectedReleaseGroupId] = useState<string | null>(null);
   const [wizardPath, setWizardPath] = useState("");
   const [queueHistoryLimitInput, setQueueHistoryLimitInput] = useState("5");
+  const [musicRootInput, setMusicRootInput] = useState("");
+  const [isSavingMusicRoot, setIsSavingMusicRoot] = useState(false);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [isSubmittingWizard, setIsSubmittingWizard] = useState(false);
   const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false);
@@ -339,9 +342,12 @@ function App() {
           return true;
         }
 
-        return [recording.artist_credit_name, recording.title, recording.release_group_title, recording.genre]
-          .filter(Boolean)
-          .some((value) => value!.toLowerCase().includes(needle));
+        return (
+          [recording.artist_credit_name, recording.title, recording.release_group_title, recording.genre]
+            .filter(Boolean)
+            .some((value) => value!.toLowerCase().includes(needle)) ||
+          (recording.source_paths ?? []).some((p) => p.toLowerCase().includes(needle))
+        );
       })
       .sort(trackSort);
   }, [recordings, search, selectedArtist, selectedReleaseGroup, selectedTag]);
@@ -499,6 +505,7 @@ function App() {
       ]);
       setBootstrap(bootstrapResult);
       setQueueHistoryLimitInput(String(bootstrapResult.config.queue_history_limit));
+      setMusicRootInput(bootstrapResult.config.music_root ?? "");
       setPlayerState(currentPlayerState);
     } catch (loadError) {
       await reportPoolTimeout("loadBootstrap", loadError);
@@ -804,6 +811,19 @@ function App() {
       setError(saveError instanceof Error ? saveError.message : String(saveError));
     } finally {
       setIsSavingQueueSettings(false);
+    }
+  }
+
+  async function saveMusicRoot() {
+    setIsSavingMusicRoot(true);
+    setError(null);
+    try {
+      const config = await invoke<AppConfig>("set_music_root", { path: musicRootInput });
+      setBootstrap((current) => current ? { ...current, config } : current);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
+    } finally {
+      setIsSavingMusicRoot(false);
     }
   }
 
@@ -1400,12 +1420,13 @@ function App() {
                           <th>Duration</th>
                           <th>Plays</th>
                           <th>Last played</th>
+                          <th>Sources</th>
                         </tr>
                       </thead>
                       <tbody>
                         {filteredRecordings.length === 0 ? (
                           <tr>
-                            <td className="empty-table-state" colSpan={10}>
+                            <td className="empty-table-state" colSpan={11}>
                               No tracks match the current artist, album, and search filters.
                             </td>
                           </tr>
@@ -1413,7 +1434,7 @@ function App() {
                           <>
                             {rowVirtualizer.getVirtualItems()[0]?.start > 0 && (
                               <tr style={{ height: rowVirtualizer.getVirtualItems()[0].start }}>
-                                <td colSpan={10} />
+                                <td colSpan={11} />
                               </tr>
                             )}
                             {rowVirtualizer.getVirtualItems().map((virtualRow) => {
@@ -1471,6 +1492,13 @@ function App() {
                                   <td>{formatDuration(recording.duration_ms)}</td>
                                   <td>{recording.play_count}</td>
                                   <td>{formatLastPlayed(recording.last_played)}</td>
+                                  <td className="source-paths-cell">
+                                    {recording.source_paths.map((p) => (
+                                      <div key={p} title={p} className="source-path">
+                                        {p}
+                                      </div>
+                                    ))}
+                                  </td>
                                 </tr>
                               );
                             })}
@@ -1482,7 +1510,7 @@ function App() {
                                 : 0;
                               return remaining > 0 ? (
                                 <tr style={{ height: remaining }}>
-                                  <td colSpan={10} />
+                                  <td colSpan={11} />
                                 </tr>
                               ) : null;
                             })()}
@@ -1619,6 +1647,29 @@ function App() {
               <>
                 <div className="modal-section">
                   <p className="modal-section-label">Library</p>
+                  <div className="settings-row">
+                    <div>
+                      <label className="input-label" htmlFor="modal-music-root">
+                        Music root
+                      </label>
+                      <input
+                        id="modal-music-root"
+                        className="small-input music-root-input"
+                        type="text"
+                        onChange={(event) => setMusicRootInput(event.currentTarget.value)}
+                        value={musicRootInput}
+                        placeholder="/home/user/Music"
+                      />
+                    </div>
+                    <button
+                      className="secondary-button"
+                      disabled={isSavingMusicRoot}
+                      onClick={() => { void saveMusicRoot(); }}
+                      type="button"
+                    >
+                      {isSavingMusicRoot ? "Saving…" : "Save"}
+                    </button>
+                  </div>
                   <div className="modal-actions">
                     <button
                       className="secondary-button"

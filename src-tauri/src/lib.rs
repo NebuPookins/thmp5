@@ -81,6 +81,7 @@ pub fn run() {
             commands::complete_initial_setup,
             commands::get_import_progress,
             commands::trigger_library_scan,
+            commands::set_music_root,
             commands::update_queue_settings,
             commands::get_library_summary,
             commands::list_recordings,

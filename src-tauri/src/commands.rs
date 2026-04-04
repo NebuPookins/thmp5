@@ -96,6 +96,30 @@ pub async fn trigger_library_scan(
 }
 
 #[tauri::command]
+pub async fn set_music_root(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<AppConfig, String> {
+    let root = path.trim();
+    if root.is_empty() {
+        return Err("Music root cannot be empty.".to_string());
+    }
+    let p = std::path::Path::new(root);
+    if !p.is_dir() {
+        return Err(format!("Not a directory: {}", p.display()));
+    }
+    set_config_value(&state.db, "music_root", root)
+        .await
+        .map_err(|e| e.to_string())?;
+    state.importer.spawn_scan(
+        state.db.clone(),
+        root.to_string(),
+        state.acoustid_api_key.clone(),
+    );
+    load_app_config(&state.db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn update_queue_settings(
     state: tauri::State<'_, AppState>,
     update: QueueSettingsUpdate,
@@ -378,7 +402,15 @@ pub async fn list_recordings(
                 FROM recording_tag rt
                 WHERE rt.recording_id = r.id
                 ORDER BY rt.tag
-            ) AS tags_raw
+            ) AS tags_raw,
+            (
+                SELECT GROUP_CONCAT(s.file_path, char(0))
+                FROM source s
+                WHERE s.recording_id = r.id
+                  AND s.source_type = 'local_file'
+                  AND s.file_path IS NOT NULL
+                ORDER BY s.file_path
+            ) AS source_paths_raw
          FROM recording r
          LEFT JOIN recording_artist ra         ON ra.recording_id = r.id AND ra.position = 0
          LEFT JOIN artist a                    ON a.id = ra.artist_id
@@ -419,6 +451,16 @@ pub async fn list_recordings(
             primary_source_path: row.get("primary_source_path"),
             tags: {
                 let raw: Option<String> = row.get("tags_raw");
+                raw.map(|r| {
+                    r.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+            },
+            source_paths: {
+                let raw: Option<String> = row.get("source_paths_raw");
                 raw.map(|r| {
                     r.split('\0')
                         .filter(|s| !s.is_empty())
@@ -654,7 +696,15 @@ pub async fn evaluate_smart_playlist(
             (
                 SELECT GROUP_CONCAT(rt.tag, char(0))
                 FROM recording_tag rt WHERE rt.recording_id = r.id ORDER BY rt.tag
-            ) AS tags_raw
+            ) AS tags_raw,
+            (
+                SELECT GROUP_CONCAT(s.file_path, char(0))
+                FROM source s
+                WHERE s.recording_id = r.id
+                  AND s.source_type = 'local_file'
+                  AND s.file_path IS NOT NULL
+                ORDER BY s.file_path
+            ) AS source_paths_raw
          FROM recording r
          LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
          LEFT JOIN artist a             ON a.id = ra.artist_id
@@ -705,6 +755,16 @@ pub async fn evaluate_smart_playlist(
             primary_source_path: row.get("primary_source_path"),
             tags: {
                 let raw: Option<String> = row.get("tags_raw");
+                raw.map(|r| {
+                    r.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+            },
+            source_paths: {
+                let raw: Option<String> = row.get("source_paths_raw");
                 raw.map(|r| {
                     r.split('\0')
                         .filter(|s| !s.is_empty())
