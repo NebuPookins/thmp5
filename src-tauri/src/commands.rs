@@ -2,9 +2,9 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::file_issues::FileIssue;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
-    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, Id3FrameDebugInfo,
-    Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest, LibrarySummary,
-    PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
+    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, FixMergedRecordingsStats,
+    Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest,
+    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
     RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
     SmartPlaylistResult, VolumeRequest,
 };
@@ -78,6 +78,15 @@ pub async fn get_import_progress(
     state: tauri::State<'_, AppState>,
 ) -> Result<ImportProgress, String> {
     Ok(state.importer.snapshot())
+}
+
+#[tauri::command]
+pub async fn fix_merged_recordings(
+    state: tauri::State<'_, AppState>,
+) -> Result<FixMergedRecordingsStats, String> {
+    crate::library::fix_merges::fix_merged_recordings(&state.db, state.acoustid_api_key.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -274,11 +283,67 @@ pub async fn play(
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "Playable local source not found.".to_string())?;
 
-    let source_id: String = row.get("source_id");
-    let file_path: String = row.get("file_path");
+    let mut source_id: String = row.get("source_id");
+    let mut file_path: String = row.get("file_path");
     let recording_id: String = row.get("recording_id");
     let title: Option<String> = row.get("title");
     let artist: Option<String> = row.get("artist");
+
+    // If the file is missing, try to fall back to another source for the same recording.
+    if !std::path::Path::new(&file_path).exists() {
+        tracing::warn!(
+            source_id = %source_id,
+            path = %file_path,
+            "Source file missing; searching for alternatives"
+        );
+
+        let alts = sqlx::query(
+            "SELECT s.id, s.file_path FROM source s
+             WHERE s.recording_id = ?
+               AND s.id != ?
+               AND s.source_type = 'local_file'
+               AND s.file_path IS NOT NULL
+             ORDER BY s.file_path",
+        )
+        .bind(&recording_id)
+        .bind(&source_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut found_alt: Option<(String, String)> = None;
+        for alt in &alts {
+            let alt_id: String = alt.get("id");
+            let alt_path: String = alt.get("file_path");
+            if std::path::Path::new(&alt_path).exists() {
+                found_alt = Some((alt_id, alt_path));
+                break;
+            }
+        }
+
+        if let Some((alt_id, alt_path)) = found_alt {
+            // Remove the stale source row silently.
+            sqlx::query("DELETE FROM source WHERE id = ?")
+                .bind(&source_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            tracing::info!(
+                removed_source_id = %source_id,
+                removed_path = %file_path,
+                using_source_id = %alt_id,
+                using_path = %alt_path,
+                "Removed missing source, using alternative"
+            );
+            source_id = alt_id;
+            file_path = alt_path;
+        } else {
+            return Err(format!(
+                "File not found and no working alternative source exists: {}",
+                file_path
+            ));
+        }
+    }
 
     tracing::info!(
         source_id = %source_id,

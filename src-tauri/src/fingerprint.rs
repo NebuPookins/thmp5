@@ -26,6 +26,51 @@ pub struct FingerprintResult {
 ///
 /// CPU-bound — call via `tokio::task::spawn_blocking` from async code.
 pub fn generate_fingerprint(path: &Path) -> Result<FingerprintResult> {
+    let config = Configuration::preset_test2();
+    let (raw, duration_ms) = decode_chromaprint(path, &config)?;
+    let compressed = FingerprintCompressor::from(&config).compress(&raw);
+    Ok(FingerprintResult {
+        fingerprint: BASE64.encode(&compressed),
+        duration_ms,
+    })
+}
+
+/// Return `true` if two audio files appear to be the same recording.
+///
+/// Compares raw Chromaprint fingerprints using bit error rate (BER).
+/// A BER below 0.4 indicates the same song; above 0.4 indicates different content.
+///
+/// CPU-bound — call via `tokio::task::spawn_blocking` from async code.
+pub fn same_recording(path_a: &Path, path_b: &Path) -> Result<bool> {
+    let config = Configuration::preset_test2();
+    let (a, _) = decode_chromaprint(path_a, &config)?;
+    let (b, _) = decode_chromaprint(path_b, &config)?;
+    Ok(fingerprint_ber(&a, &b) < 0.4)
+}
+
+// ── Public helpers for local comparison ──────────────────────────────────────
+
+/// Generate raw Chromaprint fingerprint integers for `path`.
+///
+/// Use [`ber`] to compare two results.  CPU-bound — call via
+/// `tokio::task::spawn_blocking` from async code.
+pub fn raw_fingerprint(path: &Path) -> Result<Vec<u32>> {
+    let config = Configuration::preset_test2();
+    let (raw, _) = decode_chromaprint(path, &config)?;
+    Ok(raw)
+}
+
+/// Bit error rate between two raw Chromaprint fingerprints.
+/// Returns a value in `[0.0, 1.0]`; below ~0.4 means the same recording.
+pub fn ber(a: &[u32], b: &[u32]) -> f32 {
+    fingerprint_ber(a, b)
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Decode up to `MAX_FINGERPRINT_MS` of audio and run the Chromaprint algorithm.
+/// Returns the raw fingerprint integers and the duration of audio decoded.
+fn decode_chromaprint(path: &Path, config: &Configuration) -> Result<(Vec<u32>, u64)> {
     let file =
         std::fs::File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -60,8 +105,7 @@ pub fn generate_fingerprint(path: &Path) -> Result<FingerprintResult> {
         .context("Failed to create audio decoder")?;
 
     // rusty-chromaprint internally resamples to 11025 Hz; we feed the native rate.
-    let config = Configuration::preset_test2();
-    let mut fingerprinter = Fingerprinter::new(&config);
+    let mut fingerprinter = Fingerprinter::new(config);
     fingerprinter
         .start(sample_rate, n_channels)
         .map_err(|e| anyhow!("Chromaprint start: {e:?}"))?;
@@ -124,19 +168,28 @@ pub fn generate_fingerprint(path: &Path) -> Result<FingerprintResult> {
         return Err(anyhow!("Chromaprint produced an empty fingerprint"));
     }
 
-    let compressed = FingerprintCompressor::from(&config).compress(raw);
-    let fingerprint = BASE64.encode(&compressed);
-
     let duration_ms = if n_channels > 0 && sample_rate > 0 {
         total_samples * 1000 / (sample_rate as u64 * n_channels as u64)
     } else {
         0
     };
 
-    Ok(FingerprintResult {
-        fingerprint,
-        duration_ms,
-    })
+    Ok((raw.to_vec(), duration_ms))
+}
+
+/// Bit error rate between two raw Chromaprint fingerprints.
+/// Compares only the overlapping prefix; returns 1.0 if either is too short.
+fn fingerprint_ber(a: &[u32], b: &[u32]) -> f32 {
+    let len = a.len().min(b.len());
+    if len < 10 {
+        return 1.0;
+    }
+    let differing_bits: u32 = a[..len]
+        .iter()
+        .zip(b[..len].iter())
+        .map(|(&x, &y)| (x ^ y).count_ones())
+        .sum();
+    differing_bits as f32 / (len as f32 * 32.0)
 }
 
 // ── AcoustID HTTP lookup ──────────────────────────────────────────────────────

@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::fmt::writer::{MakeWriter, MakeWriterExt};
 
 #[derive(Clone)]
 struct SharedFileWriter {
@@ -56,7 +56,7 @@ pub fn init(log_path: &Path) -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with_writer(writer)
+        .with_writer(writer.and(std::io::stdout))
         .with_ansi(false)
         .init();
 

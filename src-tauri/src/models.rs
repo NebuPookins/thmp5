@@ -48,6 +48,14 @@ pub struct ImportStats {
     pub error_messages: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct FixMergedRecordingsStats {
+    pub recordings_checked: u32,
+    pub recordings_split: u32,
+    pub sources_reimported: u32,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ImportProgress {
     pub is_running: bool,

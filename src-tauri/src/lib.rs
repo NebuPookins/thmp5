@@ -77,6 +77,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::import_paths,
+            commands::fix_merged_recordings,
             commands::get_app_bootstrap,
             commands::complete_initial_setup,
             commands::get_import_progress,

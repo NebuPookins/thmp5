@@ -214,20 +214,78 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         .acquire(format!("import.store.check_duplicate_hash path={path_str}"))
         .await
         .context("Failed to acquire DB connection for duplicate hash check")?;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM source
+    let existing_with_hash = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, recording_id FROM source
          WHERE file_hash = ?
-           AND (? IS NULL OR id != ?)",
+           AND (? IS NULL OR id != ?)
+         LIMIT 1",
     )
     .bind(&hash)
     .bind(existing_source_id.as_deref())
     .bind(existing_source_id.as_deref())
-    .fetch_one(&mut *dup_conn)
+    .fetch_optional(&mut *dup_conn)
     .await
     .context("DB error checking hash")?;
     drop(dup_conn);
-    if count > 0 {
-        return Ok(false);
+
+    if let Some((_matched_source_id, matched_recording_id)) = existing_with_hash {
+        // This file's content already exists at a different path (e.g. the file was moved or
+        // copied). Register the current path as an alternate source for the same recording
+        // rather than creating a duplicate recording.
+        let source_id = existing_source_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let fingerprint_str = fp.as_ref().map(|f| f.fingerprint.as_str());
+        let mut alt_conn = db
+            .acquire(format!("import.store.add_alternate_source path={path_str}"))
+            .await
+            .context("Failed to acquire DB connection for alternate source")?;
+        sqlx::query(
+            "INSERT INTO source (
+                id, recording_id, source_type, file_path, file_hash, format, duration_ms,
+                fingerprint, file_size, file_mtime_ms,
+                replay_gain_track_db, replay_gain_track_peak,
+                replay_gain_album_db, replay_gain_album_peak
+             ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(file_path) DO UPDATE SET
+                recording_id = excluded.recording_id,
+                file_hash = excluded.file_hash,
+                format = excluded.format,
+                duration_ms = excluded.duration_ms,
+                fingerprint = excluded.fingerprint,
+                file_size = excluded.file_size,
+                file_mtime_ms = excluded.file_mtime_ms,
+                replay_gain_track_db = excluded.replay_gain_track_db,
+                replay_gain_track_peak = excluded.replay_gain_track_peak,
+                replay_gain_album_db = excluded.replay_gain_album_db,
+                replay_gain_album_peak = excluded.replay_gain_album_peak",
+        )
+        .bind(&source_id)
+        .bind(&matched_recording_id)
+        .bind(&path_str)
+        .bind(&hash)
+        .bind(&meta.format)
+        .bind(meta.duration_ms as i64)
+        .bind(fingerprint_str)
+        .bind(file_size)
+        .bind(file_mtime_ms)
+        .bind(meta.replay_gain_track_db)
+        .bind(meta.replay_gain_track_peak)
+        .bind(meta.replay_gain_album_db)
+        .bind(meta.replay_gain_album_peak)
+        .execute(&mut *alt_conn)
+        .await
+        .context("Failed to insert alternate source")?;
+
+        tracing::debug!(
+            path = %path.display(),
+            recording_id = %matched_recording_id,
+            "Added as alternate source for existing recording (same file hash)"
+        );
+        for warning in warnings {
+            println!("[importer] import warning: {}: {}", path.display(), warning);
+        }
+        return Ok(true);
     }
 
     let mut conn = db
@@ -337,9 +395,11 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
 /// Find an existing recording or create a new one.
 ///
 /// Deduplication order:
-/// 1. AcoustID match — same fingerprint → same recording.
-/// 2. Tag-based match — same title + artist + duration (±5 s).
-/// 3. Create new.
+/// 1. AcoustID match — same acoustic fingerprint → same recording.
+/// 2. Create new.
+///
+/// SHA-256 deduplication (byte-for-byte identical files) is handled upstream
+/// in `store_prepared_import` before this function is called.
 async fn find_or_create_recording(
     tx: &mut Transaction<'_, Sqlite>,
     meta: &crate::models::TrackMetadata,
@@ -362,43 +422,7 @@ async fn find_or_create_recording(
         }
     }
 
-    // ── Level 2: tags ────────────────────────────────────────────────────────
-    let title_lower = title.to_lowercase();
-    let dur_min = duration - 5000;
-    let dur_max = duration + 5000;
-
-    if let Some(id) = sqlx::query_scalar::<_, String>(
-        "SELECT r.id FROM recording r
-         JOIN recording_artist ra ON ra.recording_id = r.id
-         WHERE lower(r.title) = ?
-           AND ra.artist_id = ?
-           AND ra.position = 0
-           AND r.duration_ms BETWEEN ? AND ?
-         LIMIT 1",
-    )
-    .bind(&title_lower)
-    .bind(artist_id)
-    .bind(dur_min)
-    .bind(dur_max)
-    .fetch_optional(&mut **tx)
-    .await?
-    {
-        // Backfill acoustid/mbid if we have them and the recording doesn't yet.
-        if let Some(aid) = acoustid_match {
-            sqlx::query(
-                "UPDATE recording SET acoustid = ?, mbid = ?
-                 WHERE id = ? AND acoustid IS NULL",
-            )
-            .bind(&aid.acoustid)
-            .bind(aid.recording_mbid.as_deref())
-            .bind(&id)
-            .execute(&mut **tx)
-            .await?;
-        }
-        return Ok(id);
-    }
-
-    // ── Level 3: create new ──────────────────────────────────────────────────
+    // ── Level 2: create new ──────────────────────────────────────────────────
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO recording (id, title, duration_ms, genre, bpm, comment, acoustid, mbid)
