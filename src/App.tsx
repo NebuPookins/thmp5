@@ -81,6 +81,8 @@ type RecordingRow = {
   source_paths: string[];
 };
 
+const RECORDINGS_PAGE_SIZE = 5_000;
+
 type ArtistRow = {
   id: string;
   name: string;
@@ -361,10 +363,23 @@ function App() {
   });
 
   async function loadRecordings() {
-    const rows = await invoke<RecordingRow[]>("list_recordings", {
-      limit: 10000,
-      offset: 0,
-    });
+    const rows: RecordingRow[] = [];
+    let offset = 0;
+
+    while (true) {
+      const page = await invoke<RecordingRow[]>("list_recordings", {
+        limit: RECORDINGS_PAGE_SIZE,
+        offset,
+      });
+      rows.push(...page);
+
+      if (page.length < RECORDINGS_PAGE_SIZE) {
+        break;
+      }
+
+      offset += page.length;
+    }
+
     setRecordings(rows);
   }
 
