@@ -33,14 +33,19 @@ fn frame_id_to_field_name(id: &str) -> &'static str {
     }
 }
 
-/// Scan raw ID3v2 bytes to find the first text frame whose UTF-16 content has an odd byte
-/// length (which is what triggers lofty's "UTF-16 string has an odd length" error).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagDecodeErrorKind {
+    Utf16OddLength,
+    InvalidUtf8,
+}
+
+/// Scan raw ID3v2 bytes to find the first text frame that matches the given decode failure mode.
 /// Returns the frame ID string (e.g. "TIT2") if one is found.
 ///
 /// TODO: If https://github.com/Serial-ATA/lofty-rs/issues/639 is resolved, remove this
 /// function and the surrounding error-enrichment code and rely on lofty's own frame ID
 /// reporting instead.
-fn find_problematic_id3_frame(path: &Path) -> Option<String> {
+fn find_problematic_id3_frame(path: &Path, error_kind: TagDecodeErrorKind) -> Option<String> {
     let data = std::fs::read(path).ok()?;
     if data.len() < 10 || &data[0..3] != b"ID3" {
         return None;
@@ -104,12 +109,20 @@ fn find_problematic_id3_frame(path: &Path) -> Option<String> {
         let content_end = (pos + frame_size).min(end);
         let content = &data[pos..content_end];
 
-        // Text frames start with an encoding byte. Encoding 1 = UTF-16 with BOM.
-        // UTF-16 content (everything after the encoding byte) must have even byte length.
         let is_text_frame = frame_id.starts_with('T') || frame_id == "COMM" || frame_id == "COM";
-        if is_text_frame && content.len() > 1 && content[0] == 1 {
+        if is_text_frame && content.len() > 1 {
+            let encoding = content[0];
             let text_bytes = &content[1..];
-            if text_bytes.len() % 2 != 0 {
+            let is_problematic = match error_kind {
+                // Encoding 1 = UTF-16 with BOM. UTF-16 content must have even byte length.
+                TagDecodeErrorKind::Utf16OddLength => encoding == 1 && text_bytes.len() % 2 != 0,
+                // Encoding 3 = UTF-8. Invalid byte sequences are what trigger lofty's
+                // "Expected a UTF-8 string" decode failures.
+                TagDecodeErrorKind::InvalidUtf8 => {
+                    encoding == 3 && std::str::from_utf8(text_bytes).is_err()
+                }
+            };
+            if is_problematic {
                 return Some(frame_id);
             }
         }
@@ -140,7 +153,16 @@ pub fn read_metadata(path: &Path) -> Result<TrackMetadata> {
         .context("Failed to detect file type")?
         .read()
         .map_err(|e| {
-            let frame_note = find_problematic_id3_frame(path)
+            let error_text = e.to_string();
+            let error_kind = if error_text.contains("UTF-16 string has an odd length") {
+                Some(TagDecodeErrorKind::Utf16OddLength)
+            } else if error_text.contains("Expected a UTF-8 string") {
+                Some(TagDecodeErrorKind::InvalidUtf8)
+            } else {
+                None
+            };
+            let frame_note = error_kind
+                .and_then(|kind| find_problematic_id3_frame(path, kind))
                 .map(|id| {
                     let field = frame_id_to_field_name(&id);
                     format!(" (frame {id} / {field})")
