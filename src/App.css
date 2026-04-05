@@ -960,6 +960,18 @@ thead th {
   border-color: #888;
 }
 
+.releases-cell {
+  padding: 0 !important;
+}
+
+.release-entry {
+  padding: 4px 8px;
+}
+
+.release-entry + .release-entry {
+  border-top: 1px solid #2a3040;
+}
+
 .source-paths-cell {
   max-width: 300px;
 }

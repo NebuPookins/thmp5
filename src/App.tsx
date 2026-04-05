@@ -60,18 +60,20 @@ type AppBootstrap = {
   library_summary: LibrarySummary;
 };
 
+type ReleaseInfo = {
+  release_group_id: string;
+  release_group_title: string;
+  track_position: number | null;
+  disc_position: number | null;
+};
+
 type RecordingRow = {
   id: string;
   title: string;
   duration_ms: number | null;
   primary_artist_id: string | null;
-  release_group_id: string | null;
   artist_credit_name: string | null;
-  release_group_title: string | null;
   genre: string | null;
-  release_date: string | null;
-  track_position: number | null;
-  disc_position: number | null;
   rating: number | null;
   play_count: number;
   last_played: string | null;
@@ -79,6 +81,7 @@ type RecordingRow = {
   primary_source_path: string | null;
   tags: string[];
   source_paths: string[];
+  releases: ReleaseInfo[];
 };
 
 const RECORDINGS_PAGE_SIZE = 5_000;
@@ -188,17 +191,8 @@ function formatAlbumRating(value: number | null): string {
 }
 
 function trackSort(a: RecordingRow, b: RecordingRow): number {
-  const discDelta = (a.disc_position ?? Number.MAX_SAFE_INTEGER) - (b.disc_position ?? Number.MAX_SAFE_INTEGER);
-  if (discDelta !== 0) {
-    return discDelta;
-  }
-
-  const trackDelta =
-    (a.track_position ?? Number.MAX_SAFE_INTEGER) - (b.track_position ?? Number.MAX_SAFE_INTEGER);
-  if (trackDelta !== 0) {
-    return trackDelta;
-  }
-
+  const artistDelta = (a.artist_credit_name ?? "").localeCompare(b.artist_credit_name ?? "");
+  if (artistDelta !== 0) return artistDelta;
   return a.title.localeCompare(b.title);
 }
 
@@ -329,7 +323,7 @@ function App() {
         }
 
         if (selectedReleaseGroup) {
-          if (recording.release_group_id !== selectedReleaseGroup.id) {
+          if (!recording.releases.some(r => r.release_group_id === selectedReleaseGroup.id)) {
             return false;
           }
         }
@@ -345,9 +339,10 @@ function App() {
         }
 
         return (
-          [recording.artist_credit_name, recording.title, recording.release_group_title, recording.genre]
+          [recording.artist_credit_name, recording.title, recording.genre]
             .filter(Boolean)
             .some((value) => value!.toLowerCase().includes(needle)) ||
+          recording.releases.some(r => r.release_group_title.toLowerCase().includes(needle)) ||
           (recording.source_paths ?? []).some((p) => p.toLowerCase().includes(needle))
         );
       })
@@ -1077,7 +1072,7 @@ function App() {
               </div>
               <div className="now-playing-sub">
                 {currentTrack
-                  ? [currentTrack.artist_credit_name, currentTrack.release_group_title]
+                  ? [currentTrack.artist_credit_name, currentTrack.releases[0]?.release_group_title ?? null]
                       .filter(Boolean)
                       .join(" · ")
                   : "Queue a track from the library"}
@@ -1366,7 +1361,7 @@ function App() {
                             <tr>
                               <th>Title</th>
                               <th>Artist</th>
-                              <th>Album</th>
+                              <th>Releases</th>
                               <th>Rating</th>
                               <th>Duration</th>
                               <th>Plays</th>
@@ -1383,7 +1378,14 @@ function App() {
                               >
                                 <td>{recording.title}</td>
                                 <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
-                                <td>{recording.release_group_title ?? "Unknown Album"}</td>
+                                <td>
+                                  {recording.releases.length === 0
+                                    ? "—"
+                                    : recording.releases.map((rel, i) => (
+                                        <div key={i}>{rel.release_group_title}</div>
+                                      ))
+                                  }
+                                </td>
                                 <td>
                                   <RatingStars
                                     disabled={ratingKeyInFlight === `recording:${recording.id}`}
@@ -1433,10 +1435,9 @@ function App() {
                     <table className="recordings-table">
                       <thead>
                         <tr>
-                          <th>#</th>
                           <th>Title</th>
                           <th>Artist</th>
-                          <th>Album</th>
+                          <th>Releases</th>
                           <th>Genre</th>
                           <th>Tags</th>
                           <th>Rating</th>
@@ -1449,7 +1450,7 @@ function App() {
                       <tbody>
                         {filteredRecordings.length === 0 ? (
                           <tr>
-                            <td className="empty-table-state" colSpan={11}>
+                            <td className="empty-table-state" colSpan={10}>
                               No tracks match the current artist, album, and search filters.
                             </td>
                           </tr>
@@ -1457,7 +1458,7 @@ function App() {
                           <>
                             {rowVirtualizer.getVirtualItems()[0]?.start > 0 && (
                               <tr style={{ height: rowVirtualizer.getVirtualItems()[0].start }}>
-                                <td colSpan={11} />
+                                <td colSpan={10} />
                               </tr>
                             )}
                             {rowVirtualizer.getVirtualItems().map((virtualRow) => {
@@ -1475,14 +1476,25 @@ function App() {
                                       : "No playable local file"
                                   }
                                 >
-                                  <td>
-                                    {recording.disc_position && recording.disc_position > 1
-                                      ? `${recording.disc_position}.${recording.track_position ?? "—"}`
-                                      : recording.track_position ?? "—"}
-                                  </td>
                                   <td>{recording.title}</td>
                                   <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
-                                  <td>{recording.release_group_title ?? "Unknown Album"}</td>
+                                  <td className="releases-cell">
+                                    {recording.releases.length === 0
+                                      ? "—"
+                                      : recording.releases.map((rel, i) => {
+                                          const pos = rel.disc_position && rel.disc_position > 1
+                                            ? `${rel.disc_position}.${rel.track_position ?? "—"}`
+                                            : rel.track_position != null
+                                              ? String(rel.track_position)
+                                              : null;
+                                          return (
+                                            <div key={i} className="release-entry">
+                                              {rel.release_group_title}{pos !== null ? ` (#${pos})` : ""}
+                                            </div>
+                                          );
+                                        })
+                                    }
+                                  </td>
                                   <td>{recording.genre ?? "—"}</td>
                                   <td
                                     onClick={(e) => e.stopPropagation()}
@@ -1533,7 +1545,7 @@ function App() {
                                 : 0;
                               return remaining > 0 ? (
                                 <tr style={{ height: remaining }}>
-                                  <td colSpan={11} />
+                                  <td colSpan={10} />
                                 </tr>
                               ) : null;
                             })()}

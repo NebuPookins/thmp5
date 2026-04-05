@@ -5,8 +5,8 @@ use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, FixMergedRecordingsStats,
     Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest,
     LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
-    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
-    SmartPlaylistResult, VolumeRequest,
+    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, ReleaseInfo, SaveSmartPlaylistRequest,
+    SeekRequest, SmartPlaylistResult, VolumeRequest,
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
@@ -444,13 +444,8 @@ pub async fn list_recordings(
             r.title,
             r.duration_ms,
             a.id                  AS primary_artist_id,
-            rg.id                 AS release_group_id,
             COALESCE(ra.credited_as, a.name) AS artist_credit_name,
-            rg.title             AS release_group_title,
             r.genre,
-            rel.release_date,
-            t.position           AS track_position,
-            m.position           AS disc_position,
             ur.stars             AS rating,
             COUNT(ph.id)         AS play_count,
             MAX(ph.played_at)    AS last_played,
@@ -485,18 +480,29 @@ pub async fn list_recordings(
                   AND s.source_type = 'local_file'
                   AND s.file_path IS NOT NULL
                 ORDER BY s.file_path
-            ) AS source_paths_raw
+            ) AS source_paths_raw,
+            (
+                SELECT GROUP_CONCAT(
+                    rg2.id || char(1) ||
+                    rg2.title || char(1) ||
+                    COALESCE(CAST(t2.position AS TEXT), '') || char(1) ||
+                    COALESCE(CAST(m2.position AS TEXT), ''),
+                    char(0)
+                )
+                FROM track t2
+                JOIN medium m2         ON m2.id = t2.medium_id
+                JOIN release rel2      ON rel2.id = m2.release_id
+                JOIN release_group rg2 ON rg2.id = rel2.release_group_id
+                WHERE t2.recording_id = r.id
+                ORDER BY rg2.title, m2.position, t2.position
+            ) AS releases_raw
          FROM recording r
          LEFT JOIN recording_artist ra         ON ra.recording_id = r.id AND ra.position = 0
          LEFT JOIN artist a                    ON a.id = ra.artist_id
-         LEFT JOIN track t                     ON t.recording_id = r.id
-         LEFT JOIN medium m                    ON m.id = t.medium_id
-         LEFT JOIN release rel                 ON rel.id = m.release_id
-         LEFT JOIN release_group rg            ON rg.id = rel.release_group_id
          LEFT JOIN user_rating ur              ON ur.recording_id = r.id
          LEFT JOIN play_history ph             ON ph.recording_id = r.id
          GROUP BY r.id
-         ORDER BY lower(a.name), lower(rg.title), m.position, t.position
+         ORDER BY lower(a.sort_name), lower(r.title)
          LIMIT ? OFFSET ?",
     )
     .bind(limit)
@@ -512,13 +518,8 @@ pub async fn list_recordings(
             title: row.get("title"),
             duration_ms: row.get("duration_ms"),
             primary_artist_id: row.get("primary_artist_id"),
-            release_group_id: row.get("release_group_id"),
             artist_credit_name: row.get("artist_credit_name"),
-            release_group_title: row.get("release_group_title"),
             genre: row.get("genre"),
-            release_date: row.get("release_date"),
-            track_position: row.get("track_position"),
-            disc_position: row.get("disc_position"),
             rating: row.get("rating"),
             play_count: row.get::<Option<i64>, _>("play_count").unwrap_or(0),
             last_played: row.get("last_played"),
@@ -540,6 +541,40 @@ pub async fn list_recordings(
                     r.split('\0')
                         .filter(|s| !s.is_empty())
                         .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+            },
+            releases: {
+                let raw: Option<String> = row.get("releases_raw");
+                raw.map(|r| {
+                    r.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(|entry| {
+                            let mut parts = entry.splitn(4, '\x01');
+                            let release_group_id = parts.next().unwrap_or("").to_string();
+                            let release_group_title = parts.next().unwrap_or("").to_string();
+                            let track_position = parts.next().and_then(|s| {
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    s.parse().ok()
+                                }
+                            });
+                            let disc_position = parts.next().and_then(|s| {
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    s.parse().ok()
+                                }
+                            });
+                            ReleaseInfo {
+                                release_group_id,
+                                release_group_title,
+                                track_position,
+                                disc_position,
+                            }
+                        })
                         .collect()
                 })
                 .unwrap_or_default()
@@ -746,13 +781,8 @@ pub async fn evaluate_smart_playlist(
             r.title,
             r.duration_ms,
             a.id                  AS primary_artist_id,
-            rg.id                 AS release_group_id,
             COALESCE(ra.credited_as, a.name) AS artist_credit_name,
-            rg.title             AS release_group_title,
             r.genre,
-            rel.release_date,
-            t.position           AS track_position,
-            m.position           AS disc_position,
             ur.stars             AS rating,
             COUNT(ph.id)         AS play_count,
             MAX(ph.played_at)    AS last_played,
@@ -779,14 +809,25 @@ pub async fn evaluate_smart_playlist(
                   AND s.source_type = 'local_file'
                   AND s.file_path IS NOT NULL
                 ORDER BY s.file_path
-            ) AS source_paths_raw
+            ) AS source_paths_raw,
+            (
+                SELECT GROUP_CONCAT(
+                    rg2.id || char(1) ||
+                    rg2.title || char(1) ||
+                    COALESCE(CAST(t2.position AS TEXT), '') || char(1) ||
+                    COALESCE(CAST(m2.position AS TEXT), ''),
+                    char(0)
+                )
+                FROM track t2
+                JOIN medium m2         ON m2.id = t2.medium_id
+                JOIN release rel2      ON rel2.id = m2.release_id
+                JOIN release_group rg2 ON rg2.id = rel2.release_group_id
+                WHERE t2.recording_id = r.id
+                ORDER BY rg2.title, m2.position, t2.position
+            ) AS releases_raw
          FROM recording r
          LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
          LEFT JOIN artist a             ON a.id = ra.artist_id
-         LEFT JOIN track t              ON t.recording_id = r.id
-         LEFT JOIN medium m             ON m.id = t.medium_id
-         LEFT JOIN release rel          ON rel.id = m.release_id
-         LEFT JOIN release_group rg     ON rg.id = rel.release_group_id
          LEFT JOIN user_rating ur       ON ur.recording_id = r.id
          LEFT JOIN play_history ph      ON ph.recording_id = r.id
          WHERE r.id IN (
@@ -816,13 +857,8 @@ pub async fn evaluate_smart_playlist(
             title: row.get("title"),
             duration_ms: row.get("duration_ms"),
             primary_artist_id: row.get("primary_artist_id"),
-            release_group_id: row.get("release_group_id"),
             artist_credit_name: row.get("artist_credit_name"),
-            release_group_title: row.get("release_group_title"),
             genre: row.get("genre"),
-            release_date: row.get("release_date"),
-            track_position: row.get("track_position"),
-            disc_position: row.get("disc_position"),
             rating: row.get("rating"),
             play_count: row.get::<Option<i64>, _>("play_count").unwrap_or(0),
             last_played: row.get("last_played"),
@@ -844,6 +880,40 @@ pub async fn evaluate_smart_playlist(
                     r.split('\0')
                         .filter(|s| !s.is_empty())
                         .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+            },
+            releases: {
+                let raw: Option<String> = row.get("releases_raw");
+                raw.map(|r| {
+                    r.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(|entry| {
+                            let mut parts = entry.splitn(4, '\x01');
+                            let release_group_id = parts.next().unwrap_or("").to_string();
+                            let release_group_title = parts.next().unwrap_or("").to_string();
+                            let track_position = parts.next().and_then(|s| {
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    s.parse().ok()
+                                }
+                            });
+                            let disc_position = parts.next().and_then(|s| {
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    s.parse().ok()
+                                }
+                            });
+                            ReleaseInfo {
+                                release_group_id,
+                                release_group_title,
+                                track_position,
+                                disc_position,
+                            }
+                        })
                         .collect()
                 })
                 .unwrap_or_default()

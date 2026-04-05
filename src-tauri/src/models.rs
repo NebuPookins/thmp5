@@ -120,19 +120,22 @@ pub struct DbPoolDebugSnapshot {
     pub waiting_requests: Vec<DbPoolWaiterInfo>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseInfo {
+    pub release_group_id: String,
+    pub release_group_title: String,
+    pub track_position: Option<i64>,
+    pub disc_position: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecordingRow {
     pub id: String,
     pub title: String,
     pub duration_ms: Option<i64>,
     pub primary_artist_id: Option<String>,
-    pub release_group_id: Option<String>,
     pub artist_credit_name: Option<String>,
-    pub release_group_title: Option<String>,
     pub genre: Option<String>,
-    pub release_date: Option<String>,
-    pub track_position: Option<i64>,
-    pub disc_position: Option<i64>,
     pub rating: Option<i64>,
     pub play_count: i64,
     pub last_played: Option<String>,
@@ -140,6 +143,7 @@ pub struct RecordingRow {
     pub primary_source_path: Option<String>,
     pub tags: Vec<String>,
     pub source_paths: Vec<String>,
+    pub releases: Vec<ReleaseInfo>,
 }
 
 #[derive(Debug, Serialize)]
