@@ -179,9 +179,31 @@ pub struct RatingUpdateRequest {
     pub stars: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct Id3FrameDebugRequest {
+    pub path: String,
+    pub frame_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Id3FrameDebugInfo {
+    pub frame_id: String,
+    pub field_name: String,
+    pub version_major: u8,
+    pub declared_encoding_byte: u8,
+    pub declared_encoding_name: String,
+    pub payload_len: usize,
+    pub raw_payload_hex_preview: String,
+    pub utf8: Option<String>,
+    pub latin1: Option<String>,
+    pub utf16_with_bom: Option<String>,
+    pub utf16be_without_bom: Option<String>,
+    pub utf16le_without_bom: Option<String>,
+}
+
 // ── Internal scanner metadata ─────────────────────────────────────────────────
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TrackMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -200,6 +222,18 @@ pub struct TrackMetadata {
     pub replay_gain_track_peak: Option<f64>,
     pub replay_gain_album_db: Option<f64>,
     pub replay_gain_album_peak: Option<f64>,
+}
+
+#[derive(Debug)]
+pub struct MetadataReadResult {
+    pub meta: TrackMetadata,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaglibHelperResponse {
+    pub meta: TrackMetadata,
+    pub warning: Option<String>,
 }
 
 // ── Query engine ──────────────────────────────────────────────────────────────

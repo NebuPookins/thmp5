@@ -39,15 +39,66 @@ Migrations run automatically on startup.
 - [Rust](https://rustup.rs/) (stable toolchain)
 - [Node.js](https://nodejs.org/) 18+
 - A C compiler and system libraries for your platform — see [Tauri prerequisites](https://tauri.app/start/prerequisites/)
+- `cmake`
+- `TagLib`
+- `pkg-config` or equivalent metadata discovery tooling
+
+thmp5 now builds a small `taglib-helper` sidecar automatically as part of the normal Rust/Tauri build. That helper is used only as a fallback when Lofty rejects malformed tags, so broken real-world files can still import with a warning instead of failing outright.
 
 On Arch/Manjaro:
 ```sh
-sudo pacman -S webkit2gtk base-devel
+sudo pacman -S webkit2gtk base-devel cmake pkgconf taglib
 ```
 
 On Ubuntu/Debian:
 ```sh
-sudo apt install libwebkit2gtk-4.1-dev build-essential
+sudo apt install libwebkit2gtk-4.1-dev build-essential cmake pkg-config libtag1-dev
+```
+
+On macOS with Homebrew:
+```sh
+brew install cmake pkgconf taglib
+```
+
+On Windows:
+1. Install Rust and Node.js.
+2. Install the normal Tauri prerequisites for WebView2 and MSVC build tools.
+3. Install `vcpkg`.
+4. Install TagLib with `vcpkg install taglib`.
+5. Set `VCPKG_ROOT` to your `vcpkg` checkout path.
+
+The Rust build script will automatically look for the vcpkg CMake toolchain on Windows when building the `taglib-helper` sidecar. If you are not using vcpkg, set one of:
+
+- `CMAKE_TOOLCHAIN_FILE`
+- `TAGLIB_ROOT`
+
+`TAGLIB_ROOT` should point at a TagLib install prefix containing the headers under `include/` and the corresponding library files under `lib/` or `bin/`.
+
+### TagLib fallback helper
+
+The metadata import path works like this:
+
+1. Try Lofty first.
+2. If Lofty rejects malformed tags, run the bundled `taglib-helper` sidecar.
+3. If TagLib can recover metadata, continue the import and log a warning to stdout.
+4. If both fail, the import still fails as before.
+
+For normal development you do not need to build the helper manually. `npm run tauri dev` and `npm run tauri build` will build it automatically through `src-tauri/build.rs`.
+
+Manual helper build is still available if you want to debug it directly:
+
+```sh
+cd src-tauri/taglib-helper
+cmake -S . -B build
+cmake --build build --config Release
+```
+
+The automatic build used by `npm run tauri dev` now compiles the helper under Cargo's build output directory, not inside `src-tauri/`, to avoid Tauri file-watch rebuild loops.
+
+If you want to override helper discovery during development, set:
+
+```sh
+THMP5_TAGLIB_HELPER=/absolute/path/to/taglib-helper npm run tauri dev
 ```
 
 ### Running in development
@@ -58,6 +109,7 @@ npm run tauri dev    # start with hot reload
 ```
 
 The app window opens automatically. The React frontend hot-reloads on save; Rust changes trigger a full recompile.
+If `cmake` and TagLib are installed, the `taglib-helper` sidecar is rebuilt automatically as part of the backend build.
 
 ### Building for production
 

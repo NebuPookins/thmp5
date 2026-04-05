@@ -92,6 +92,7 @@ pub fn run() {
             commands::get_player_state,
             commands::get_log_file_path,
             commands::get_db_pool_debug_snapshot,
+            commands::debug_id3_text_frame,
             commands::play,
             commands::pause,
             commands::resume,

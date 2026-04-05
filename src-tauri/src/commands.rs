@@ -2,10 +2,11 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::file_issues::FileIssue;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
-    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, ImportProgress, ImportStats,
-    InitialSetupRequest, LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow,
-    QueueSettingsUpdate, RatingUpdateRequest, RecordingRow, ReleaseGroupRow,
-    SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult, VolumeRequest,
+    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, Id3FrameDebugInfo,
+    Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest, LibrarySummary,
+    PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
+    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
+    SmartPlaylistResult, VolumeRequest,
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
@@ -227,6 +228,15 @@ pub fn get_db_pool_debug_snapshot(
 #[tauri::command]
 pub fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssue>, String> {
     Ok(state.file_issues.all())
+}
+
+#[tauri::command]
+pub fn debug_id3_text_frame(request: Id3FrameDebugRequest) -> Result<Id3FrameDebugInfo, String> {
+    crate::library::scanner::debug_id3_text_frame(
+        std::path::Path::new(&request.path),
+        &request.frame_id,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

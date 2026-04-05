@@ -26,6 +26,7 @@ pub(crate) struct PreparedImport {
     existing_source_id: Option<String>,
     hash: String,
     meta: TrackMetadata,
+    warnings: Vec<String>,
     file_size: i64,
     file_mtime_ms: i64,
     fp: Option<fingerprint::FingerprintResult>,
@@ -56,6 +57,7 @@ pub async fn import_paths(
                             Ok(true) => stats.imported += 1,
                             Ok(false) => stats.skipped += 1,
                             Err(e) => {
+                                println!("[importer] import error: {:#}", e);
                                 stats.errors += 1;
                                 stats.error_messages.push(format!("{:#}", e));
                             }
@@ -66,6 +68,7 @@ pub async fn import_paths(
                             Some(p) => format!("{}: {}", p.display(), e),
                             None => e.to_string(),
                         };
+                        println!("[importer] import error: {msg}");
                         stats.errors += 1;
                         stats.error_messages.push(msg);
                     }
@@ -78,6 +81,7 @@ pub async fn import_paths(
                 Ok(true) => stats.imported += 1,
                 Ok(false) => stats.skipped += 1,
                 Err(e) => {
+                    println!("[importer] import error: {:#}", e);
                     stats.errors += 1;
                     stats.error_messages.push(format!("{:#}", e));
                 }
@@ -133,6 +137,7 @@ pub(crate) async fn prepare_import(
     struct BlockingResult {
         hash: String,
         meta: TrackMetadata,
+        warnings: Vec<String>,
         fp: Option<fingerprint::FingerprintResult>,
     }
 
@@ -141,7 +146,7 @@ pub(crate) async fn prepare_import(
         let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
         set_io_priority_idle();
         let hash = file_sha256(&p).context("Failed to hash file")?;
-        let meta = read_metadata(&p).context("Failed to read metadata")?;
+        let metadata_read = read_metadata(&p).context("Failed to read metadata")?;
         let fp = match fingerprint::generate_fingerprint(&p) {
             Ok(fp) => Some(fp),
             Err(e) => {
@@ -149,7 +154,12 @@ pub(crate) async fn prepare_import(
                 None
             }
         };
-        Ok::<_, anyhow::Error>(BlockingResult { hash, meta, fp })
+        Ok::<_, anyhow::Error>(BlockingResult {
+            hash,
+            meta: metadata_read.meta,
+            warnings: metadata_read.warning.into_iter().collect(),
+            fp,
+        })
     })
     .await;
 
@@ -159,7 +169,7 @@ pub(crate) async fn prepare_import(
         Err(e) => anyhow::bail!("Blocking import task panicked: {e}"),
     };
 
-    let (hash, meta, fp) = (blocking.hash, blocking.meta, blocking.fp);
+    let (hash, meta, warnings, fp) = (blocking.hash, blocking.meta, blocking.warnings, blocking.fp);
 
     let acoustid_match: Option<AcoustIdMatch> = match (acoustid_key, fp.as_ref()) {
         (Some(key), Some(fp_result)) => match fingerprint::lookup_acoustid(key, fp_result).await {
@@ -178,6 +188,7 @@ pub(crate) async fn prepare_import(
         existing_source_id: existing_source_id.map(ToOwned::to_owned),
         hash,
         meta,
+        warnings,
         file_size,
         file_mtime_ms,
         fp,
@@ -192,6 +203,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         existing_source_id,
         hash,
         meta,
+        warnings,
         file_size,
         file_mtime_ms,
         fp,
@@ -312,6 +324,9 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         acoustid = acoustid_match.as_ref().map(|a| a.acoustid.as_str()).unwrap_or("none"),
         "Imported file"
     );
+    for warning in warnings {
+        println!("[importer] import warning: {}: {}", path.display(), warning);
+    }
     Ok(true)
 }
 

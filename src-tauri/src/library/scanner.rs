@@ -1,9 +1,10 @@
-use crate::models::TrackMetadata;
+use crate::models::{Id3FrameDebugInfo, MetadataReadResult, TaglibHelperResponse, TrackMetadata};
 use anyhow::{Context, Result};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::ItemKey;
 use std::path::Path;
+use std::process::Command;
 
 /// Decode a 4-byte synchsafe integer (used in ID3v2.3+ tag/frame sizes).
 fn synchsafe_to_u32(b: &[u8]) -> u32 {
@@ -31,6 +32,160 @@ fn frame_id_to_field_name(id: &str) -> &'static str {
         "COMM" | "COM" => "comment",
         _ => "unknown field",
     }
+}
+
+fn id3_text_encoding_name(byte: u8) -> &'static str {
+    match byte {
+        0 => "ISO-8859-1 / Latin-1",
+        1 => "UTF-16 with BOM",
+        2 => "UTF-16BE without BOM",
+        3 => "UTF-8",
+        _ => "unknown",
+    }
+}
+
+fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+fn decode_utf16_units<I>(units: I) -> Option<String>
+where
+    I: IntoIterator<Item = u16>,
+{
+    std::char::decode_utf16(units)
+        .map(|r| r.ok())
+        .collect::<Option<String>>()
+}
+
+fn decode_utf16be(bytes: &[u8]) -> Option<String> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    decode_utf16_units(chunks.map(|c| u16::from_be_bytes([c[0], c[1]])))
+}
+
+fn decode_utf16le(bytes: &[u8]) -> Option<String> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    decode_utf16_units(chunks.map(|c| u16::from_le_bytes([c[0], c[1]])))
+}
+
+fn decode_utf16_with_bom(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    match &bytes[..2] {
+        [0xFE, 0xFF] => decode_utf16be(&bytes[2..]),
+        [0xFF, 0xFE] => decode_utf16le(&bytes[2..]),
+        _ => None,
+    }
+}
+
+fn hex_preview(bytes: &[u8], max_len: usize) -> String {
+    bytes
+        .iter()
+        .take(max_len)
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summarize_debug_info(info: &Id3FrameDebugInfo) -> String {
+    let latin1_preview = info.latin1.as_deref().unwrap_or("<unavailable>");
+    let utf8_status = if info.utf8.is_some() { "ok" } else { "invalid" };
+    format!(
+        "ID3 debug: frame {} / {} declared encoding={} ({}) payload_len={} utf8={} latin1={:?} hex={}",
+        info.frame_id,
+        info.field_name,
+        info.declared_encoding_byte,
+        info.declared_encoding_name,
+        info.payload_len,
+        utf8_status,
+        latin1_preview,
+        info.raw_payload_hex_preview
+    )
+}
+
+#[derive(Debug)]
+struct Id3FrameRef {
+    version_major: u8,
+    frame_id: String,
+    content: Vec<u8>,
+}
+
+fn find_id3_text_frame(path: &Path, target_frame_id: &str) -> Option<Id3FrameRef> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 10 || &data[0..3] != b"ID3" {
+        return None;
+    }
+
+    let version = data[3];
+    let flags = data[5];
+    let tag_size = synchsafe_to_u32(&data[6..10]) as usize;
+    let end = (10 + tag_size).min(data.len());
+
+    let mut pos = 10;
+    if version >= 3 && (flags & 0x40) != 0 && pos + 4 <= end {
+        let ext_size = if version == 4 {
+            synchsafe_to_u32(&data[pos..pos + 4]) as usize
+        } else {
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize
+        };
+        pos += ext_size;
+    }
+
+    while pos < end {
+        let (frame_id, frame_size) = if version == 2 {
+            if pos + 6 > end {
+                break;
+            }
+            if data[pos] == 0 {
+                break;
+            }
+            let id = std::str::from_utf8(&data[pos..pos + 3]).ok()?.to_string();
+            let size = (data[pos + 3] as usize) << 16
+                | (data[pos + 4] as usize) << 8
+                | data[pos + 5] as usize;
+            pos += 6;
+            (id, size)
+        } else {
+            if pos + 10 > end {
+                break;
+            }
+            if data[pos] == 0 {
+                break;
+            }
+            let id = std::str::from_utf8(&data[pos..pos + 4]).ok()?.to_string();
+            let size = if version == 4 {
+                synchsafe_to_u32(&data[pos + 4..pos + 8]) as usize
+            } else {
+                u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize
+            };
+            pos += 10;
+            (id, size)
+        };
+
+        if frame_size == 0 {
+            continue;
+        }
+
+        let content_end = (pos + frame_size).min(end);
+        if frame_id == target_frame_id {
+            let content = &data[pos..content_end];
+            return Some(Id3FrameRef {
+                version_major: version,
+                frame_id,
+                content: content.to_vec(),
+            });
+        }
+        pos += frame_size;
+    }
+
+    None
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +288,115 @@ fn find_problematic_id3_frame(path: &Path, error_kind: TagDecodeErrorKind) -> Op
     None
 }
 
+pub fn debug_id3_text_frame(path: &Path, frame_id: &str) -> Result<Id3FrameDebugInfo> {
+    let frame = find_id3_text_frame(path, frame_id)
+        .ok_or_else(|| anyhow::anyhow!("Frame {frame_id} not found in {}", path.display()))?;
+    let declared_encoding_byte = *frame
+        .content
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Frame {frame_id} has no payload"))?;
+    let text_bytes = &frame.content[1..];
+
+    Ok(Id3FrameDebugInfo {
+        frame_id: frame.frame_id.clone(),
+        field_name: frame_id_to_field_name(&frame.frame_id).to_string(),
+        version_major: frame.version_major,
+        declared_encoding_byte,
+        declared_encoding_name: id3_text_encoding_name(declared_encoding_byte).to_string(),
+        payload_len: text_bytes.len(),
+        raw_payload_hex_preview: hex_preview(text_bytes, 64),
+        utf8: std::str::from_utf8(text_bytes).ok().map(str::to_string),
+        latin1: Some(latin1_to_string(text_bytes)),
+        utf16_with_bom: decode_utf16_with_bom(text_bytes),
+        utf16be_without_bom: decode_utf16be(text_bytes),
+        utf16le_without_bom: decode_utf16le(text_bytes),
+    })
+}
+
+fn utf8_decode_debug_summary(path: &Path) -> Option<String> {
+    let frame_id = find_problematic_id3_frame(path, TagDecodeErrorKind::InvalidUtf8)?;
+    let info = debug_id3_text_frame(path, &frame_id).ok()?;
+    Some(summarize_debug_info(&info))
+}
+
+fn taglib_helper_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("THMP5_TAGLIB_HELPER") {
+        candidates.push(path.into());
+    }
+    if let Some(path) = option_env!("THMP5_TAGLIB_HELPER_BUILT") {
+        candidates.push(path.into());
+    }
+
+    let exe_name = if cfg!(target_os = "windows") {
+        "taglib-helper.exe"
+    } else {
+        "taglib-helper"
+    };
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            candidates.push(dir.join(exe_name));
+            candidates.push(dir.join("../Resources").join(exe_name));
+        }
+    }
+
+    candidates.push(exe_name.into());
+    candidates
+}
+
+fn try_taglib_helper(path: &Path, primary_error: &str) -> Result<Option<MetadataReadResult>> {
+    let path_str = path.to_string_lossy().to_string();
+    let request = serde_json::json!({ "path": path_str });
+    let mut last_error = None;
+
+    for helper in taglib_helper_candidates() {
+        let output = match Command::new(&helper).arg(request.to_string()).output() {
+            Ok(output) => output,
+            Err(error) => {
+                last_error = Some(format!("{}: {error}", helper.display()));
+                continue;
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let reason = if stderr.is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr
+            };
+            last_error = Some(format!("{}: {reason}", helper.display()));
+            continue;
+        }
+
+        let response: TaglibHelperResponse =
+            serde_json::from_slice(&output.stdout).with_context(|| {
+                format!(
+                    "Failed to decode taglib-helper output from {}",
+                    helper.display()
+                )
+            })?;
+        let warning = Some(match response.warning {
+            Some(warning) if !warning.is_empty() => {
+                format!("Metadata fallback via TagLib helper after Lofty failure: {primary_error}. {warning}")
+            }
+            _ => {
+                format!("Metadata fallback via TagLib helper after Lofty failure: {primary_error}")
+            }
+        });
+        return Ok(Some(MetadataReadResult {
+            meta: response.meta,
+            warning,
+        }));
+    }
+
+    if let Some(last_error) = last_error {
+        tracing::warn!(path = %path.display(), "TagLib fallback unavailable: {last_error}");
+    }
+    Ok(None)
+}
+
 /// Supported audio extensions.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "ogg", "flac", "wav", "m4a", "aac", "opus", "wma", "ape",
@@ -145,8 +409,8 @@ pub fn is_audio_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Read audio metadata from a file using lofty.
-pub fn read_metadata(path: &Path) -> Result<TrackMetadata> {
+/// Read audio metadata from a file using Lofty.
+fn read_metadata_with_lofty(path: &Path) -> Result<TrackMetadata> {
     let tagged_file = Probe::open(path)
         .context("Failed to open file for metadata reading")?
         .guess_file_type()
@@ -168,7 +432,14 @@ pub fn read_metadata(path: &Path) -> Result<TrackMetadata> {
                     format!(" (frame {id} / {field})")
                 })
                 .unwrap_or_default();
-            anyhow::anyhow!("Failed to read tags{frame_note}: {e}")
+            let utf8_debug = if error_text.contains("Expected a UTF-8 string") {
+                utf8_decode_debug_summary(path)
+                    .map(|summary| format!(" [{summary}]"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            anyhow::anyhow!("Failed to read tags{frame_note}: {e}{utf8_debug}")
         })?;
 
     let properties = tagged_file.properties();
@@ -232,6 +503,23 @@ pub fn read_metadata(path: &Path) -> Result<TrackMetadata> {
     }
 
     Ok(meta)
+}
+
+/// Read audio metadata, falling back to the TagLib helper when Lofty rejects malformed tags.
+pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
+    match read_metadata_with_lofty(path) {
+        Ok(meta) => Ok(MetadataReadResult {
+            meta,
+            warning: None,
+        }),
+        Err(error) => {
+            let primary_error = format!("{error:#}");
+            if let Some(fallback) = try_taglib_helper(path, &primary_error)? {
+                return Ok(fallback);
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Parse a comment field into tags.

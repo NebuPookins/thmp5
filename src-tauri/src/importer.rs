@@ -136,6 +136,7 @@ async fn run_scan(
                 let mut state = progress.lock().expect("import progress mutex poisoned");
                 state.errors += 1;
                 let msg = error.to_string();
+                println!("[importer] import error: {msg}");
                 if let Some(p) = error.path() {
                     file_issues.push_import_error(p.to_string_lossy(), msg.clone());
                 }
@@ -178,6 +179,7 @@ async fn handle_task_result(
             Err(error) => {
                 let detail = format!("{:#}", error);
                 let msg = format!("{}: {}", path.display(), detail);
+                println!("[importer] import error: {msg}");
                 file_issues.push_import_error(path.to_string_lossy(), detail);
                 let mut state = progress.lock().expect("import progress mutex poisoned");
                 state.errors += 1;
@@ -191,12 +193,14 @@ async fn handle_task_result(
         Ok((path, Err(error))) => {
             let detail = format!("{:#}", error);
             let msg = format!("{}: {}", path.display(), detail);
+            println!("[importer] import error: {msg}");
             file_issues.push_import_error(path.to_string_lossy(), detail);
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.errors += 1;
             state.error_messages.push(msg);
         }
         Err(error) => {
+            println!("[importer] importer task failed: {error}");
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.errors += 1;
             state
