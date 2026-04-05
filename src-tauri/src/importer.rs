@@ -51,6 +51,7 @@ impl ImportManager {
         let progress = Arc::clone(&self.progress);
         let file_issues = self.file_issues.clone();
         tauri::async_runtime::spawn(async move {
+            println!("[importer] scan started: {root_path}");
             let result = run_scan(
                 &db,
                 &root_path,
@@ -63,8 +64,14 @@ impl ImportManager {
             state.is_running = false;
             state.finished_at = Some(now_iso());
             if let Err(error) = result {
+                eprintln!("[importer] scan error: {error:#}");
                 state.errors += 1;
                 state.error_messages.push(error.to_string());
+            } else {
+                println!(
+                    "[importer] scan finished: scanned={} imported={} skipped={} errors={}",
+                    state.scanned, state.imported, state.skipped, state.errors
+                );
             }
         });
     }
@@ -78,12 +85,14 @@ async fn run_scan(
     file_issues: &FileIssueLog,
 ) -> Result<()> {
     let concurrency = import_concurrency();
+    println!("[importer] concurrency={concurrency}, root={root_path}");
     let path = Path::new(root_path);
     if !path.exists() {
         anyhow::bail!("Import root does not exist: {}", path.display());
     }
 
     let mut tasks = JoinSet::new();
+    let mut last_log = std::time::Instant::now();
     for entry in WalkDir::new(path).follow_links(true) {
         match entry {
             Ok(entry) if entry.file_type().is_file() && is_audio_file(entry.path()) => {
@@ -91,6 +100,14 @@ async fn run_scan(
                     let mut state = progress.lock().expect("import progress mutex poisoned");
                     state.scanned += 1;
                     state.current_path = Some(entry.path().display().to_string());
+                }
+                if last_log.elapsed() >= std::time::Duration::from_secs(5) {
+                    let state = progress.lock().expect("import progress mutex poisoned");
+                    println!(
+                        "[importer] scanned={} imported={} skipped={} errors={}",
+                        state.scanned, state.imported, state.skipped, state.errors
+                    );
+                    last_log = std::time::Instant::now();
                 }
 
                 if tasks.len() >= concurrency {

@@ -563,7 +563,8 @@ function App() {
       return;
     }
 
-    let wasRunning = bootstrap.import_progress.is_running;
+    const isRunning = bootstrap.import_progress.is_running;
+    let wasRunning = isRunning;
     let cancelled = false;
     let timeoutId: number | null = null;
 
@@ -586,10 +587,16 @@ function App() {
         if (shouldReloadLibrary) {
           await loadLibraryData(selectedArtistId, search);
         }
+
+        if (!cancelled) {
+          const interval = progress.is_running ? 2000 : 60000;
+          timeoutId = window.setTimeout(() => {
+            void poll();
+          }, interval);
+        }
       } catch (pollError) {
         await reportPoolTimeout("import progress poll", pollError);
         setError(pollError instanceof Error ? pollError.message : String(pollError));
-      } finally {
         if (!cancelled) {
           timeoutId = window.setTimeout(() => {
             void poll();
@@ -598,9 +605,10 @@ function App() {
       }
     }
 
+    const initialInterval = isRunning ? 2000 : 60000;
     timeoutId = window.setTimeout(() => {
       void poll();
-    }, 60000);
+    }, initialInterval);
 
     return () => {
       cancelled = true;
@@ -608,7 +616,7 @@ function App() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [bootstrap?.needs_setup, search, selectedArtistId]);
+  }, [bootstrap?.needs_setup, bootstrap?.import_progress.is_running, search, selectedArtistId]);
 
   useEffect(() => {
     let isMounted = true;
