@@ -13,7 +13,10 @@ use audio::AudioEngineHandle;
 use db::DbPool;
 use file_issues::FileIssueLog;
 use importer::ImportManager;
+use models::RecordingRow;
+use std::sync::Arc;
 use tauri::Manager;
+use tokio::sync::RwLock;
 
 pub struct AppState {
     pub db: DbPool,
@@ -24,6 +27,9 @@ pub struct AppState {
     pub player: AudioEngineHandle,
     pub log_file_path: String,
     pub file_issues: FileIssueLog,
+    /// In-memory cache of all recordings, sorted by (lower(artist.sort_name), lower(title)).
+    /// Populated on first `list_recordings` call; invalidated by any write that changes recording data.
+    pub recordings_cache: RwLock<Option<Arc<Vec<RecordingRow>>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -62,6 +68,7 @@ pub fn run() {
                 player,
                 log_file_path: log_path.display().to_string(),
                 file_issues,
+                recordings_cache: RwLock::new(None),
             };
 
             if let Ok(Some(root_path)) =

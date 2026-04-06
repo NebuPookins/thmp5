@@ -128,7 +128,7 @@ pub struct ReleaseInfo {
     pub disc_position: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecordingRow {
     pub id: String,
     pub title: String,

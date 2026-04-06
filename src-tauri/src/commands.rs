@@ -11,6 +11,56 @@ use crate::models::{
 use crate::query::{self, LimitUnit};
 use crate::AppState;
 use sqlx::Row;
+use std::sync::Arc;
+
+/// CTEs shared by list_recordings and evaluate_smart_playlist.
+/// Aggregating in CTEs replaces three correlated subqueries (one per row) with three
+/// single-pass aggregations, eliminating the N×3 per-row execution cost.
+const RECORDING_CTES: &str = "
+  ph_agg AS (
+    SELECT recording_id,
+           COUNT(*)       AS play_count,
+           MAX(played_at) AS last_played
+    FROM play_history
+    GROUP BY recording_id
+  ),
+  src_primary AS (
+    SELECT recording_id, MIN(file_path) AS file_path
+    FROM source
+    WHERE source_type = 'local_file' AND file_path IS NOT NULL
+    GROUP BY recording_id
+  ),
+  tags_agg AS (
+    SELECT recording_id, GROUP_CONCAT(tag, char(0)) AS tags_raw
+    FROM (SELECT recording_id, tag FROM recording_tag ORDER BY recording_id, tag)
+    GROUP BY recording_id
+  ),
+  source_paths_agg AS (
+    SELECT recording_id, GROUP_CONCAT(file_path, char(0)) AS source_paths_raw
+    FROM (
+      SELECT recording_id, file_path FROM source
+      WHERE source_type = 'local_file' AND file_path IS NOT NULL
+      ORDER BY recording_id, file_path
+    )
+    GROUP BY recording_id
+  ),
+  releases_agg AS (
+    SELECT recording_id, GROUP_CONCAT(entry, char(0)) AS releases_raw
+    FROM (
+      SELECT t2.recording_id,
+             rg2.id || char(1) ||
+             rg2.title || char(1) ||
+             COALESCE(CAST(t2.position AS TEXT), '') || char(1) ||
+             COALESCE(CAST(m2.position AS TEXT), '') AS entry
+      FROM track t2
+      JOIN medium m2         ON m2.id = t2.medium_id
+      JOIN release rel2      ON rel2.id = m2.release_id
+      JOIN release_group rg2 ON rg2.id = rel2.release_group_id
+      ORDER BY t2.recording_id, rg2.title, m2.position, t2.position
+    )
+    GROUP BY recording_id
+  )
+";
 
 // ── Import ────────────────────────────────────────────────────────────────────
 
@@ -19,9 +69,11 @@ pub async fn import_paths(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<ImportStats, String> {
-    do_import(&state.db, paths, state.acoustid_api_key.as_deref())
+    let result = do_import(&state.db, paths, state.acoustid_api_key.as_deref())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    *state.recordings_cache.write().await = None;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -84,9 +136,14 @@ pub async fn get_import_progress(
 pub async fn fix_merged_recordings(
     state: tauri::State<'_, AppState>,
 ) -> Result<FixMergedRecordingsStats, String> {
-    crate::library::fix_merges::fix_merged_recordings(&state.db, state.acoustid_api_key.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+    let result = crate::library::fix_merges::fix_merged_recordings(
+        &state.db,
+        state.acoustid_api_key.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    *state.recordings_cache.write().await = None;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -165,6 +222,7 @@ pub async fn record_play_history(
     .await
     .map_err(|e| e.to_string())?;
 
+    *state.recordings_cache.write().await = None;
     Ok(())
 }
 
@@ -212,6 +270,7 @@ pub async fn set_recording_rating(
             .map_err(|e| e.to_string())?;
     }
 
+    *state.recordings_cache.write().await = None;
     Ok(())
 }
 
@@ -422,37 +481,90 @@ pub async fn get_library_summary(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn list_recordings(
-    state: tauri::State<'_, AppState>,
-    limit: Option<i64>,
-    offset: Option<i64>,
-) -> Result<Vec<RecordingRow>, String> {
-    let limit = limit.unwrap_or(200);
-    let offset = offset.unwrap_or(0);
-    let mut conn = state
-        .db
-        .acquire(format!(
-            "command.list_recordings limit={limit} offset={offset}"
-        ))
+fn parse_recording_row(row: &sqlx::sqlite::SqliteRow) -> RecordingRow {
+    RecordingRow {
+        id: row.get("id"),
+        title: row.get("title"),
+        duration_ms: row.get("duration_ms"),
+        primary_artist_id: row.get("primary_artist_id"),
+        artist_credit_name: row.get("artist_credit_name"),
+        genre: row.get("genre"),
+        rating: row.get("rating"),
+        play_count: row.get::<Option<i64>, _>("play_count").unwrap_or(0),
+        last_played: row.get("last_played"),
+        primary_source_id: row.get("primary_source_id"),
+        primary_source_path: row.get("primary_source_path"),
+        tags: {
+            let raw: Option<String> = row.get("tags_raw");
+            raw.map(|r| {
+                r.split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+        },
+        source_paths: {
+            let raw: Option<String> = row.get("source_paths_raw");
+            raw.map(|r| {
+                r.split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+        },
+        releases: {
+            let raw: Option<String> = row.get("releases_raw");
+            raw.map(|r| {
+                r.split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(|entry| {
+                        let mut parts = entry.splitn(4, '\x01');
+                        let release_group_id = parts.next().unwrap_or("").to_string();
+                        let release_group_title = parts.next().unwrap_or("").to_string();
+                        let track_position =
+                            parts.next().and_then(
+                                |s| {
+                                    if s.is_empty() {
+                                        None
+                                    } else {
+                                        s.parse().ok()
+                                    }
+                                },
+                            );
+                        let disc_position =
+                            parts.next().and_then(
+                                |s| {
+                                    if s.is_empty() {
+                                        None
+                                    } else {
+                                        s.parse().ok()
+                                    }
+                                },
+                            );
+                        ReleaseInfo {
+                            release_group_id,
+                            release_group_title,
+                            track_position,
+                            disc_position,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        },
+    }
+}
+
+async fn fetch_all_recordings_from_db(db: &crate::db::DbPool) -> Result<Vec<RecordingRow>, String> {
+    let mut conn = db
+        .acquire("command.list_recordings populate_cache")
         .await
         .map_err(|e| e.to_string())?;
 
-    let rows = sqlx::query(
-        "WITH
-          ph_agg AS (
-            SELECT recording_id,
-                   COUNT(*)       AS play_count,
-                   MAX(played_at) AS last_played
-            FROM play_history
-            GROUP BY recording_id
-          ),
-          src_primary AS (
-            SELECT recording_id, MIN(file_path) AS file_path
-            FROM source
-            WHERE source_type = 'local_file' AND file_path IS NOT NULL
-            GROUP BY recording_id
-          )
+    let rows = sqlx::query(&format!(
+        "WITH {RECORDING_CTES}
          SELECT
             r.id,
             r.title,
@@ -465,123 +577,50 @@ pub async fn list_recordings(
             ph.last_played,
             ps.id                            AS primary_source_id,
             sp.file_path                     AS primary_source_path,
-            (
-                SELECT GROUP_CONCAT(rt.tag, char(0))
-                FROM recording_tag rt
-                WHERE rt.recording_id = r.id
-                ORDER BY rt.tag
-            ) AS tags_raw,
-            (
-                SELECT GROUP_CONCAT(s.file_path, char(0))
-                FROM source s
-                WHERE s.recording_id = r.id
-                  AND s.source_type = 'local_file'
-                  AND s.file_path IS NOT NULL
-                ORDER BY s.file_path
-            ) AS source_paths_raw,
-            (
-                SELECT GROUP_CONCAT(
-                    rg2.id || char(1) ||
-                    rg2.title || char(1) ||
-                    COALESCE(CAST(t2.position AS TEXT), '') || char(1) ||
-                    COALESCE(CAST(m2.position AS TEXT), ''),
-                    char(0)
-                )
-                FROM track t2
-                JOIN medium m2         ON m2.id = t2.medium_id
-                JOIN release rel2      ON rel2.id = m2.release_id
-                JOIN release_group rg2 ON rg2.id = rel2.release_group_id
-                WHERE t2.recording_id = r.id
-                ORDER BY rg2.title, m2.position, t2.position
-            ) AS releases_raw
+            ta.tags_raw,
+            spa.source_paths_raw,
+            ragg.releases_raw
          FROM recording r
-         LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
-         LEFT JOIN artist a             ON a.id = ra.artist_id
-         LEFT JOIN user_rating ur       ON ur.recording_id = r.id
-         LEFT JOIN ph_agg ph            ON ph.recording_id = r.id
-         LEFT JOIN src_primary sp       ON sp.recording_id = r.id
-         LEFT JOIN source ps            ON ps.file_path = sp.file_path
-         ORDER BY lower(a.sort_name), lower(r.title)
-         LIMIT ? OFFSET ?",
-    )
-    .bind(limit)
-    .bind(offset)
+         LEFT JOIN recording_artist ra  ON ra.recording_id = r.id AND ra.position = 0
+         LEFT JOIN artist a              ON a.id = ra.artist_id
+         LEFT JOIN user_rating ur        ON ur.recording_id = r.id
+         LEFT JOIN ph_agg ph             ON ph.recording_id = r.id
+         LEFT JOIN src_primary sp        ON sp.recording_id = r.id
+         LEFT JOIN source ps             ON ps.file_path = sp.file_path
+         LEFT JOIN tags_agg ta           ON ta.recording_id = r.id
+         LEFT JOIN source_paths_agg spa  ON spa.recording_id = r.id
+         LEFT JOIN releases_agg ragg     ON ragg.recording_id = r.id
+         ORDER BY lower(a.sort_name), lower(r.title)"
+    ))
     .fetch_all(&mut *conn)
     .await
     .map_err(|e| e.to_string())?;
 
-    let recordings = rows
-        .into_iter()
-        .map(|row| RecordingRow {
-            id: row.get("id"),
-            title: row.get("title"),
-            duration_ms: row.get("duration_ms"),
-            primary_artist_id: row.get("primary_artist_id"),
-            artist_credit_name: row.get("artist_credit_name"),
-            genre: row.get("genre"),
-            rating: row.get("rating"),
-            play_count: row.get::<Option<i64>, _>("play_count").unwrap_or(0),
-            last_played: row.get("last_played"),
-            primary_source_id: row.get("primary_source_id"),
-            primary_source_path: row.get("primary_source_path"),
-            tags: {
-                let raw: Option<String> = row.get("tags_raw");
-                raw.map(|r| {
-                    r.split('\0')
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default()
-            },
-            source_paths: {
-                let raw: Option<String> = row.get("source_paths_raw");
-                raw.map(|r| {
-                    r.split('\0')
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect()
-                })
-                .unwrap_or_default()
-            },
-            releases: {
-                let raw: Option<String> = row.get("releases_raw");
-                raw.map(|r| {
-                    r.split('\0')
-                        .filter(|s| !s.is_empty())
-                        .map(|entry| {
-                            let mut parts = entry.splitn(4, '\x01');
-                            let release_group_id = parts.next().unwrap_or("").to_string();
-                            let release_group_title = parts.next().unwrap_or("").to_string();
-                            let track_position = parts.next().and_then(|s| {
-                                if s.is_empty() {
-                                    None
-                                } else {
-                                    s.parse().ok()
-                                }
-                            });
-                            let disc_position = parts.next().and_then(|s| {
-                                if s.is_empty() {
-                                    None
-                                } else {
-                                    s.parse().ok()
-                                }
-                            });
-                            ReleaseInfo {
-                                release_group_id,
-                                release_group_title,
-                                track_position,
-                                disc_position,
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-            },
-        })
-        .collect();
+    Ok(rows.iter().map(parse_recording_row).collect())
+}
 
-    Ok(recordings)
+#[tauri::command]
+pub async fn list_recordings(
+    state: tauri::State<'_, AppState>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<RecordingRow>, String> {
+    let limit = limit.unwrap_or(200) as usize;
+    let offset = offset.unwrap_or(0) as usize;
+
+    // Fast path: serve from in-memory cache.
+    {
+        let guard = state.recordings_cache.read().await;
+        if let Some(all) = guard.as_ref() {
+            return Ok(all.iter().skip(offset).take(limit).cloned().collect());
+        }
+    }
+
+    // Cache miss: fetch all recordings once and populate the cache.
+    let all = Arc::new(fetch_all_recordings_from_db(&state.db).await?);
+    let result = all.iter().skip(offset).take(limit).cloned().collect();
+    *state.recordings_cache.write().await = Some(Arc::clone(&all));
+    Ok(result)
 }
 
 #[tauri::command]
@@ -775,20 +814,7 @@ pub async fn evaluate_smart_playlist(
     // Build the full query: fetch matching recording IDs from smart_playlist_view,
     // then JOIN to get the full RecordingRow data.
     let full_sql = format!(
-        "WITH
-          ph_agg AS (
-            SELECT recording_id,
-                   COUNT(*)       AS play_count,
-                   MAX(played_at) AS last_played
-            FROM play_history
-            GROUP BY recording_id
-          ),
-          src_primary AS (
-            SELECT recording_id, MIN(file_path) AS file_path
-            FROM source
-            WHERE source_type = 'local_file' AND file_path IS NOT NULL
-            GROUP BY recording_id
-          )
+        "WITH {RECORDING_CTES}
          SELECT
             r.id,
             r.title,
@@ -801,40 +827,19 @@ pub async fn evaluate_smart_playlist(
             ph.last_played,
             ps.id                            AS primary_source_id,
             sp.file_path                     AS primary_source_path,
-            (
-                SELECT GROUP_CONCAT(rt.tag, char(0))
-                FROM recording_tag rt WHERE rt.recording_id = r.id ORDER BY rt.tag
-            ) AS tags_raw,
-            (
-                SELECT GROUP_CONCAT(s.file_path, char(0))
-                FROM source s
-                WHERE s.recording_id = r.id
-                  AND s.source_type = 'local_file'
-                  AND s.file_path IS NOT NULL
-                ORDER BY s.file_path
-            ) AS source_paths_raw,
-            (
-                SELECT GROUP_CONCAT(
-                    rg2.id || char(1) ||
-                    rg2.title || char(1) ||
-                    COALESCE(CAST(t2.position AS TEXT), '') || char(1) ||
-                    COALESCE(CAST(m2.position AS TEXT), ''),
-                    char(0)
-                )
-                FROM track t2
-                JOIN medium m2         ON m2.id = t2.medium_id
-                JOIN release rel2      ON rel2.id = m2.release_id
-                JOIN release_group rg2 ON rg2.id = rel2.release_group_id
-                WHERE t2.recording_id = r.id
-                ORDER BY rg2.title, m2.position, t2.position
-            ) AS releases_raw
+            ta.tags_raw,
+            spa.source_paths_raw,
+            ragg.releases_raw
          FROM recording r
-         LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
-         LEFT JOIN artist a             ON a.id = ra.artist_id
-         LEFT JOIN user_rating ur       ON ur.recording_id = r.id
-         LEFT JOIN ph_agg ph            ON ph.recording_id = r.id
-         LEFT JOIN src_primary sp       ON sp.recording_id = r.id
-         LEFT JOIN source ps            ON ps.file_path = sp.file_path
+         LEFT JOIN recording_artist ra  ON ra.recording_id = r.id AND ra.position = 0
+         LEFT JOIN artist a              ON a.id = ra.artist_id
+         LEFT JOIN user_rating ur        ON ur.recording_id = r.id
+         LEFT JOIN ph_agg ph             ON ph.recording_id = r.id
+         LEFT JOIN src_primary sp        ON sp.recording_id = r.id
+         LEFT JOIN source ps             ON ps.file_path = sp.file_path
+         LEFT JOIN tags_agg ta           ON ta.recording_id = r.id
+         LEFT JOIN source_paths_agg spa  ON spa.recording_id = r.id
+         LEFT JOIN releases_agg ragg     ON ragg.recording_id = r.id
          WHERE r.id IN (
              SELECT spv.id FROM smart_playlist_view spv WHERE {}
          )
