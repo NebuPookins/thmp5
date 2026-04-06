@@ -439,34 +439,32 @@ pub async fn list_recordings(
         .map_err(|e| e.to_string())?;
 
     let rows = sqlx::query(
-        "SELECT
+        "WITH
+          ph_agg AS (
+            SELECT recording_id,
+                   COUNT(*)       AS play_count,
+                   MAX(played_at) AS last_played
+            FROM play_history
+            GROUP BY recording_id
+          ),
+          src_primary AS (
+            SELECT recording_id, MIN(file_path) AS file_path
+            FROM source
+            WHERE source_type = 'local_file' AND file_path IS NOT NULL
+            GROUP BY recording_id
+          )
+         SELECT
             r.id,
             r.title,
             r.duration_ms,
-            a.id                  AS primary_artist_id,
+            a.id                             AS primary_artist_id,
             COALESCE(ra.credited_as, a.name) AS artist_credit_name,
             r.genre,
-            ur.stars             AS rating,
-            COUNT(ph.id)         AS play_count,
-            MAX(ph.played_at)    AS last_played,
-            (
-                SELECT s.id
-                FROM source s
-                WHERE s.recording_id = r.id
-                  AND s.source_type = 'local_file'
-                  AND s.file_path IS NOT NULL
-                ORDER BY s.file_path
-                LIMIT 1
-            ) AS primary_source_id,
-            (
-                SELECT s.file_path
-                FROM source s
-                WHERE s.recording_id = r.id
-                  AND s.source_type = 'local_file'
-                  AND s.file_path IS NOT NULL
-                ORDER BY s.file_path
-                LIMIT 1
-            ) AS primary_source_path,
+            ur.stars                         AS rating,
+            COALESCE(ph.play_count, 0)       AS play_count,
+            ph.last_played,
+            ps.id                            AS primary_source_id,
+            sp.file_path                     AS primary_source_path,
             (
                 SELECT GROUP_CONCAT(rt.tag, char(0))
                 FROM recording_tag rt
@@ -497,11 +495,12 @@ pub async fn list_recordings(
                 ORDER BY rg2.title, m2.position, t2.position
             ) AS releases_raw
          FROM recording r
-         LEFT JOIN recording_artist ra         ON ra.recording_id = r.id AND ra.position = 0
-         LEFT JOIN artist a                    ON a.id = ra.artist_id
-         LEFT JOIN user_rating ur              ON ur.recording_id = r.id
-         LEFT JOIN play_history ph             ON ph.recording_id = r.id
-         GROUP BY r.id
+         LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
+         LEFT JOIN artist a             ON a.id = ra.artist_id
+         LEFT JOIN user_rating ur       ON ur.recording_id = r.id
+         LEFT JOIN ph_agg ph            ON ph.recording_id = r.id
+         LEFT JOIN src_primary sp       ON sp.recording_id = r.id
+         LEFT JOIN source ps            ON ps.file_path = sp.file_path
          ORDER BY lower(a.sort_name), lower(r.title)
          LIMIT ? OFFSET ?",
     )
@@ -776,28 +775,32 @@ pub async fn evaluate_smart_playlist(
     // Build the full query: fetch matching recording IDs from smart_playlist_view,
     // then JOIN to get the full RecordingRow data.
     let full_sql = format!(
-        "SELECT
+        "WITH
+          ph_agg AS (
+            SELECT recording_id,
+                   COUNT(*)       AS play_count,
+                   MAX(played_at) AS last_played
+            FROM play_history
+            GROUP BY recording_id
+          ),
+          src_primary AS (
+            SELECT recording_id, MIN(file_path) AS file_path
+            FROM source
+            WHERE source_type = 'local_file' AND file_path IS NOT NULL
+            GROUP BY recording_id
+          )
+         SELECT
             r.id,
             r.title,
             r.duration_ms,
-            a.id                  AS primary_artist_id,
+            a.id                             AS primary_artist_id,
             COALESCE(ra.credited_as, a.name) AS artist_credit_name,
             r.genre,
-            ur.stars             AS rating,
-            COUNT(ph.id)         AS play_count,
-            MAX(ph.played_at)    AS last_played,
-            (
-                SELECT s.id FROM source s
-                WHERE s.recording_id = r.id AND s.source_type = 'local_file'
-                  AND s.file_path IS NOT NULL
-                ORDER BY s.file_path LIMIT 1
-            ) AS primary_source_id,
-            (
-                SELECT s.file_path FROM source s
-                WHERE s.recording_id = r.id AND s.source_type = 'local_file'
-                  AND s.file_path IS NOT NULL
-                ORDER BY s.file_path LIMIT 1
-            ) AS primary_source_path,
+            ur.stars                         AS rating,
+            COALESCE(ph.play_count, 0)       AS play_count,
+            ph.last_played,
+            ps.id                            AS primary_source_id,
+            sp.file_path                     AS primary_source_path,
             (
                 SELECT GROUP_CONCAT(rt.tag, char(0))
                 FROM recording_tag rt WHERE rt.recording_id = r.id ORDER BY rt.tag
@@ -829,11 +832,12 @@ pub async fn evaluate_smart_playlist(
          LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
          LEFT JOIN artist a             ON a.id = ra.artist_id
          LEFT JOIN user_rating ur       ON ur.recording_id = r.id
-         LEFT JOIN play_history ph      ON ph.recording_id = r.id
+         LEFT JOIN ph_agg ph            ON ph.recording_id = r.id
+         LEFT JOIN src_primary sp       ON sp.recording_id = r.id
+         LEFT JOIN source ps            ON ps.file_path = sp.file_path
          WHERE r.id IN (
              SELECT spv.id FROM smart_playlist_view spv WHERE {}
          )
-         GROUP BY r.id
          ORDER BY RANDOM()",
         where_sql
     );
