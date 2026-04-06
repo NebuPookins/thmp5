@@ -41,23 +41,24 @@ Migrations run automatically on startup.
 - A C compiler and system libraries for your platform — see [Tauri prerequisites](https://tauri.app/start/prerequisites/)
 - `cmake`
 - `TagLib`
+- `libopus` (for Opus/`.opus` file support — optional, see below)
 - `pkg-config` or equivalent metadata discovery tooling
 
 thmp5 now builds a small `taglib-helper` sidecar automatically as part of the normal Rust/Tauri build. That helper is used only as a fallback when Lofty rejects malformed tags, so broken real-world files can still import with a warning instead of failing outright.
 
 On Arch/Manjaro:
 ```sh
-sudo pacman -S webkit2gtk base-devel cmake pkgconf taglib
+sudo pacman -S webkit2gtk base-devel cmake pkgconf taglib opus
 ```
 
 On Ubuntu/Debian:
 ```sh
-sudo apt install libwebkit2gtk-4.1-dev build-essential cmake pkg-config libtag1-dev
+sudo apt install libwebkit2gtk-4.1-dev build-essential cmake pkg-config libtag1-dev libopus-dev
 ```
 
 On macOS with Homebrew:
 ```sh
-brew install cmake pkgconf taglib
+brew install cmake pkgconf taglib opus
 ```
 
 On Windows:
@@ -66,6 +67,18 @@ On Windows:
 3. Install `vcpkg`.
 4. Install TagLib with `vcpkg install taglib`.
 5. Set `VCPKG_ROOT` to your `vcpkg` checkout path.
+
+#### Opus support (optional)
+
+thmp5 supports `.opus` files via libopus, enabled by default (the `opus` Cargo feature). If libopus is not found via `pkg-config`, the build will compile it from source using `cmake` — so no pre-installation is strictly required as long as cmake and a C compiler are available.
+
+To build without Opus support entirely (e.g. for a fully static/pure-Rust binary):
+
+```sh
+cargo build --no-default-features
+```
+
+Attempting to play an `.opus` file in a build without Opus support will produce a clear error rather than a crash.
 
 The Rust build script will automatically look for the vcpkg CMake toolchain on Windows when building the `taglib-helper` sidecar. If you are not using vcpkg, set one of:
 

@@ -1,13 +1,20 @@
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+#[cfg(feature = "opus")]
+use opus::Decoder as OpusDecoder;
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::OnceLock;
 use symphonia::core::{
-    audio::SampleBuffer, codecs::DecoderOptions, errors::Error as SymphoniaError,
-    formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint,
+    audio::SampleBuffer,
+    codecs::{DecoderOptions, CODEC_TYPE_OPUS},
+    errors::Error as SymphoniaError,
+    formats::FormatOptions,
+    io::MediaSourceStream,
+    meta::MetadataOptions,
+    probe::Hint,
 };
 
 /// Decode only the first 30 seconds of audio for the initial fingerprint pass.
@@ -97,12 +104,80 @@ fn decode_chromaprint(path: &Path, config: &Configuration) -> Result<(Vec<u32>, 
 
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
-    let sample_rate = codec_params.sample_rate.unwrap_or(44100);
     let n_channels = codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
 
+    // Symphonia has no Opus codec; use libopus directly for OGG/Opus files.
+    #[cfg(feature = "opus")]
+    if codec_params.codec == CODEC_TYPE_OPUS {
+        let opus_channels = if n_channels == 1 {
+            opus::Channels::Mono
+        } else {
+            opus::Channels::Stereo
+        };
+        let mut opus_dec = OpusDecoder::new(48_000, opus_channels)
+            .map_err(|e| anyhow!("Failed to create Opus decoder: {e}"))?;
+        const OPUS_RATE: u32 = 48_000;
+        let mut fingerprinter = Fingerprinter::new(config);
+        fingerprinter
+            .start(OPUS_RATE, n_channels)
+            .map_err(|e| anyhow!("Chromaprint start: {e:?}"))?;
+        let max_samples = MAX_FINGERPRINT_MS * OPUS_RATE as u64 * n_channels as u64 / 1000;
+        let mut total_samples: u64 = 0;
+        let mut f32_buf = vec![0.0f32; 5760 * n_channels as usize];
+        loop {
+            if total_samples >= max_samples {
+                break;
+            }
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(SymphoniaError::IoError(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("Packet read stopped during fingerprinting: {e}");
+                    break;
+                }
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            let n_frames = match opus_dec.decode_float(&packet.data, &mut f32_buf, false) {
+                Ok(n) => n,
+                Err(_) => continue, // skip header / corrupt packets
+            };
+            let n_interleaved = n_frames * n_channels as usize;
+            let i16_samples: Vec<i16> = f32_buf[..n_interleaved]
+                .iter()
+                .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                .collect();
+            fingerprinter.consume(&i16_samples);
+            total_samples += i16_samples.len() as u64;
+        }
+        fingerprinter.finish();
+        let raw = fingerprinter.fingerprint();
+        if raw.is_empty() {
+            return Err(anyhow!("Chromaprint produced an empty fingerprint"));
+        }
+        let duration_ms = if n_channels > 0 {
+            total_samples * 1000 / (OPUS_RATE as u64 * n_channels as u64)
+        } else {
+            0
+        };
+        return Ok((raw.to_vec(), duration_ms));
+    }
+
+    let sample_rate = codec_params.sample_rate.unwrap_or(44100);
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
-        .context("Failed to create audio decoder")?;
+        .map_err(|_| {
+            if codec_params.codec == CODEC_TYPE_OPUS {
+                anyhow!("Opus codec not supported (rebuild with the 'opus' feature and libopus)")
+            } else {
+                anyhow!("Unsupported audio codec: {:?}", codec_params.codec)
+            }
+        })?;
 
     // rusty-chromaprint internally resamples to 11025 Hz; we feed the native rate.
     let mut fingerprinter = Fingerprinter::new(config);

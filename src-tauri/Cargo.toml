@@ -9,6 +9,12 @@ edition = "2021"
 name = "thmp5_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Enables Opus codec support via libopus (built from source if not found on the system).
+# Disable with --no-default-features if you cannot build libopus or do not need Opus support.
+default = ["opus"]
+opus = ["dep:opus"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -40,6 +46,7 @@ lofty = "0.22"
 
 # Audio decoding (fingerprinting: decode to PCM for chromaprint)
 symphonia = { version = "0.5", features = ["all"] }
+opus = { version = "0.3", optional = true }
 
 # Fingerprinting
 rusty-chromaprint = "0.3"

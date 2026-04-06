@@ -2,6 +2,8 @@ use crate::file_issues::FileIssueLog;
 use crate::models::{PlaybackStatus, PlayerState};
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(feature = "opus")]
+use opus::Decoder as OpusDecoder;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -11,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::{CodecType, DecoderOptions, CODEC_TYPE_OPUS};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
@@ -787,9 +789,19 @@ fn id3v2_end_offset(file: &mut File) -> Option<u64> {
     Some(10 + size)
 }
 
+enum AudioDecoder {
+    Symphonia(Box<dyn symphonia::core::codecs::Decoder>),
+    /// Direct libopus decoder used for OGG/Opus files, which symphonia has no codec support for.
+    #[cfg(feature = "opus")]
+    Opus {
+        decoder: OpusDecoder,
+        channels: usize,
+    },
+}
+
 struct LocalFileSource {
     format: Box<dyn symphonia::core::formats::FormatReader>,
-    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    decoder: AudioDecoder,
     track_id: u32,
     sample_rate: u32,
     channels: u16,
@@ -854,16 +866,61 @@ impl LocalFileSource {
             }
             _ => 0,
         };
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())?;
+        let codec = track.codec_params.codec;
+
+        // Symphonia has no Opus codec; when the feature is enabled, use libopus directly for
+        // packet decoding.  The OGG format reader above still handles container/packet extraction.
+        #[cfg(feature = "opus")]
+        let decoder = if codec == CODEC_TYPE_OPUS {
+            let n_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+            let opus_channels = if n_channels == 1 {
+                opus::Channels::Mono
+            } else {
+                opus::Channels::Stereo
+            };
+            AudioDecoder::Opus {
+                decoder: OpusDecoder::new(48_000, opus_channels)
+                    .map_err(|e| anyhow!("Failed to create Opus decoder: {e}"))?,
+                channels: n_channels,
+            }
+        } else {
+            AudioDecoder::Symphonia(
+                symphonia::default::get_codecs()
+                    .make(&track.codec_params, &DecoderOptions::default())
+                    .map_err(|_| anyhow!("Unsupported audio codec: {}", codec_type_name(codec)))?,
+            )
+        };
+
+        #[cfg(not(feature = "opus"))]
+        let decoder = AudioDecoder::Symphonia(
+            symphonia::default::get_codecs()
+                .make(&track.codec_params, &DecoderOptions::default())
+                .map_err(|_| {
+                    if codec == CODEC_TYPE_OPUS {
+                        anyhow!(
+                            "Opus codec not supported (rebuild with the 'opus' feature and libopus)"
+                        )
+                    } else {
+                        anyhow!("Unsupported audio codec: {}", codec_type_name(codec))
+                    }
+                })?,
+        );
         // track borrow of format ends here (NLL)
+
+        // Opus always decodes at 48 kHz; use the libopus channel count rather than whatever
+        // the container header says (which is the *input* sample rate, not the output rate).
+        let (effective_sample_rate, effective_channels) = match &decoder {
+            #[cfg(feature = "opus")]
+            AudioDecoder::Opus { channels, .. } => (48_000u32, *channels as u16),
+            AudioDecoder::Symphonia(_) => (sample_rate.unwrap_or(0), channels.unwrap_or(0)),
+        };
 
         let mut source = Self {
             format,
             decoder,
             track_id,
-            sample_rate: sample_rate.unwrap_or(0),
-            channels: channels.unwrap_or(0),
+            sample_rate: effective_sample_rate,
+            channels: effective_channels,
             duration_ms,
             pending: Vec::new(),
         };
@@ -887,20 +944,36 @@ impl LocalFileSource {
             if packet.track_id() != self.track_id {
                 continue;
             }
-            match self.decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let spec = *decoded.spec();
-                    if self.sample_rate == 0 {
-                        self.sample_rate = spec.rate;
+            match &mut self.decoder {
+                AudioDecoder::Symphonia(dec) => match dec.decode(&packet) {
+                    Ok(decoded) => {
+                        let spec = *decoded.spec();
+                        if self.sample_rate == 0 {
+                            self.sample_rate = spec.rate;
+                        }
+                        if self.channels == 0 {
+                            self.channels = spec.channels.count() as u16;
+                        }
+                        append_audio_buffer(decoded, &mut self.pending);
+                        return Ok(());
                     }
-                    if self.channels == 0 {
-                        self.channels = spec.channels.count() as u16;
+                    Err(SymphoniaError::DecodeError(_)) => continue,
+                    Err(e) => return Err(e.into()),
+                },
+                #[cfg(feature = "opus")]
+                AudioDecoder::Opus { decoder, channels } => {
+                    let n_ch = *channels;
+                    let mut buf = vec![0.0f32; 5760 * n_ch];
+                    match decoder.decode_float(&packet.data, &mut buf, false) {
+                        Ok(n_frames) => {
+                            buf.truncate(n_frames * n_ch);
+                            // sample_rate and channels are already set for Opus; just save samples.
+                            self.pending.append(&mut buf);
+                            return Ok(());
+                        }
+                        Err(_) => continue,
                     }
-                    append_audio_buffer(decoded, &mut self.pending);
-                    return Ok(());
                 }
-                Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -928,19 +1001,33 @@ impl LocalFileSource {
             if packet.track_id() != self.track_id {
                 continue;
             }
-            match self.decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let mut samples = Vec::new();
-                    append_audio_buffer(decoded, &mut samples);
-                    return Ok(Some(samples));
+            match &mut self.decoder {
+                AudioDecoder::Symphonia(dec) => match dec.decode(&packet) {
+                    Ok(decoded) => {
+                        let mut samples = Vec::new();
+                        append_audio_buffer(decoded, &mut samples);
+                        return Ok(Some(samples));
+                    }
+                    Err(SymphoniaError::DecodeError(_)) => continue,
+                    Err(SymphoniaError::IoError(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e.into()),
+                },
+                #[cfg(feature = "opus")]
+                AudioDecoder::Opus { decoder, channels } => {
+                    let n_ch = *channels;
+                    let mut buf = vec![0.0f32; 5760 * n_ch];
+                    match decoder.decode_float(&packet.data, &mut buf, false) {
+                        Ok(n_frames) => {
+                            buf.truncate(n_frames * n_ch);
+                            return Ok(Some(buf));
+                        }
+                        Err(_) => continue, // skip header / corrupt packets
+                    }
                 }
-                Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(SymphoniaError::IoError(e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    return Ok(None);
-                }
-                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -1047,6 +1134,22 @@ impl StreamResampler {
         self.next_output_frame
             .saturating_mul(u64::from(self.source_rate))
             / u64::from(self.output_rate)
+    }
+}
+
+fn codec_type_name(codec: CodecType) -> &'static str {
+    use symphonia::core::codecs::*;
+    match codec {
+        CODEC_TYPE_OPUS => "Opus",
+        CODEC_TYPE_VORBIS => "Vorbis",
+        CODEC_TYPE_FLAC => "FLAC",
+        CODEC_TYPE_MP3 => "MP3",
+        CODEC_TYPE_AAC => "AAC",
+        CODEC_TYPE_ALAC => "ALAC",
+        CODEC_TYPE_PCM_S16LE | CODEC_TYPE_PCM_S24LE | CODEC_TYPE_PCM_S32LE
+        | CODEC_TYPE_PCM_S16BE | CODEC_TYPE_PCM_S24BE | CODEC_TYPE_PCM_S32BE
+        | CODEC_TYPE_PCM_F32LE | CODEC_TYPE_PCM_F64LE => "PCM",
+        _ => "unknown",
     }
 }
 
