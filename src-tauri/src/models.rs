@@ -72,10 +72,17 @@ pub struct ImportProgress {
     pub fingerprinting_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalCommand {
+    pub name: String,
+    pub template: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AppConfig {
     pub music_root: Option<String>,
     pub queue_history_limit: i64,
+    pub external_commands: Vec<ExternalCommand>,
 }
 
 #[derive(Debug, Serialize)]

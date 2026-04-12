@@ -48,9 +48,15 @@ type ImportProgress = {
   finished_at: string | null;
 };
 
+type ExternalCommand = {
+  name: string;
+  template: string;
+};
+
 type AppConfig = {
   music_root: string | null;
   queue_history_limit: number;
+  external_commands: ExternalCommand[];
 };
 
 type AppBootstrap = {
@@ -285,6 +291,10 @@ function App() {
   const [playlists, setPlaylists] = useState<PlaylistRow[]>([]);
   const [savePlaylistName, setSavePlaylistName] = useState("");
   const [isSavingPlaylist, setIsSavingPlaylist] = useState(false);
+  const [externalCommands, setExternalCommands] = useState<ExternalCommand[]>([]);
+  const [newCmdName, setNewCmdName] = useState("");
+  const [newCmdTemplate, setNewCmdTemplate] = useState("");
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string } | null>(null);
   const releaseGroupSearchInFlightRef = useRef(false);
   const queuedReleaseGroupSearchRef = useRef<{ artistId: string | null; search: string } | null>(null);
 
@@ -516,6 +526,7 @@ function App() {
       setBootstrap(bootstrapResult);
       setQueueHistoryLimitInput(String(bootstrapResult.config.queue_history_limit));
       setMusicRootInput(bootstrapResult.config.music_root ?? "");
+      setExternalCommands(bootstrapResult.config.external_commands ?? []);
       setPlayerState(currentPlayerState);
     } catch (loadError) {
       await reportPoolTimeout("loadBootstrap", loadError);
@@ -842,6 +853,24 @@ function App() {
       setError(saveError instanceof Error ? saveError.message : String(saveError));
     } finally {
       setIsSavingMusicRoot(false);
+    }
+  }
+
+  async function saveExternalCommands(cmds: ExternalCommand[]) {
+    try {
+      const config = await invoke<AppConfig>("save_external_commands", { commands: cmds });
+      setExternalCommands(config.external_commands ?? []);
+      setBootstrap((current) => current ? { ...current, config } : current);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
+    }
+  }
+
+  async function handleSpawnExternalCommand(template: string, filePath: string) {
+    try {
+      await invoke("spawn_external_command", { template, filePath });
+    } catch (spawnError) {
+      setError(spawnError instanceof Error ? spawnError.message : String(spawnError));
     }
   }
 
@@ -1470,6 +1499,12 @@ function App() {
                                   data-index={virtualRow.index}
                                   ref={rowVirtualizer.measureElement}
                                   onDoubleClick={() => enqueueRecording(recording)}
+                                  onContextMenu={(e) => {
+                                    e.preventDefault();
+                                    const path = recording.primary_source_path ?? recording.source_paths[0];
+                                    if (externalCommands.length === 0 || !path) return;
+                                    setContextMenu({ x: e.clientX, y: e.clientY, path });
+                                  }}
                                   title={
                                     recording.primary_source_id
                                       ? "Double click to play or queue"
@@ -1749,6 +1784,56 @@ function App() {
                     </button>
                   </div>
                 </div>
+
+                <div className="modal-section">
+                  <p className="modal-section-label">External Commands</p>
+                  <p className="ext-cmd-hint">Use <code>%%</code> as a placeholder for the file path.</p>
+                  {externalCommands.map((cmd, i) => (
+                    <div key={i} className="settings-row ext-cmd-row">
+                      <span className="ext-cmd-name">{cmd.name}</span>
+                      <span className="ext-cmd-template">{cmd.template}</span>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => {
+                          const updated = externalCommands.filter((_, j) => j !== i);
+                          void saveExternalCommands(updated);
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                  <div className="settings-row ext-cmd-row">
+                    <input
+                      className="small-input ext-cmd-name-input"
+                      type="text"
+                      placeholder="Name"
+                      value={newCmdName}
+                      onChange={(e) => setNewCmdName(e.currentTarget.value)}
+                    />
+                    <input
+                      className="small-input ext-cmd-template-input"
+                      type="text"
+                      placeholder="Command (e.g. picard %%)"
+                      value={newCmdTemplate}
+                      onChange={(e) => setNewCmdTemplate(e.currentTarget.value)}
+                    />
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={!newCmdName.trim() || !newCmdTemplate.trim()}
+                      onClick={() => {
+                        const updated = [...externalCommands, { name: newCmdName.trim(), template: newCmdTemplate.trim() }];
+                        void saveExternalCommands(updated);
+                        setNewCmdName("");
+                        setNewCmdTemplate("");
+                      }}
+                    >
+                      Add
+                    </button>
+                  </div>
+                </div>
               </>
             ) : (
               <div className="modal-section">
@@ -1776,6 +1861,35 @@ function App() {
           </div>
         </div>
       ) : null}
+
+      {contextMenu && (
+        <>
+          <div
+            className="ctx-menu-backdrop"
+            onClick={() => setContextMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setContextMenu(null); }}
+          />
+          <ul
+            className="ctx-menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            {externalCommands.map((cmd) => (
+              <li key={cmd.name}>
+                <button
+                  className="ctx-menu-item"
+                  type="button"
+                  onClick={() => {
+                    void handleSpawnExternalCommand(cmd.template, contextMenu.path);
+                    setContextMenu(null);
+                  }}
+                >
+                  {cmd.name}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
 
       <footer className="status-bar">
         <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running ? "status-bar-indicator-active" : ""}`} />

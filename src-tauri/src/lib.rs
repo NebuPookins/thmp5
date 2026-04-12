@@ -91,6 +91,8 @@ pub fn run() {
             commands::trigger_library_scan,
             commands::set_music_root,
             commands::update_queue_settings,
+            commands::save_external_commands,
+            commands::spawn_external_command,
             commands::get_library_summary,
             commands::list_recordings,
             commands::list_artists,

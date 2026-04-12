@@ -1198,3 +1198,82 @@ thead th {
   justify-content: space-between;
   padding: 2px 0;
 }
+
+/* ── Context menu ──────────────────────────────────────────────────────────── */
+
+.ctx-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+}
+
+.ctx-menu {
+  position: fixed;
+  z-index: 201;
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  background: #0e1624;
+  border: 1px solid rgba(149, 173, 198, 0.18);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  min-width: 160px;
+}
+
+.ctx-menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 14px;
+  text-align: left;
+  background: none;
+  border: none;
+  color: #d4e4f5;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.ctx-menu-item:hover {
+  background: rgba(101, 125, 154, 0.22);
+}
+
+/* ── External commands settings ──────────────────────────────────────────── */
+
+.ext-cmd-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #7a93b0;
+}
+
+.ext-cmd-hint code {
+  background: rgba(101, 125, 154, 0.18);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.ext-cmd-row {
+  align-items: center;
+}
+
+.ext-cmd-name {
+  font-weight: 600;
+  color: #d4e4f5;
+  min-width: 80px;
+}
+
+.ext-cmd-template {
+  flex: 1;
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: #8a9ab0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ext-cmd-name-input {
+  width: 100px !important;
+}
+
+.ext-cmd-template-input {
+  width: 220px !important;
+}

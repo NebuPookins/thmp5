@@ -2,11 +2,11 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::file_issues::FileIssue;
 use crate::library::import::import_paths as do_import;
 use crate::models::{
-    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, FixMergedRecordingsStats,
-    Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest,
-    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
-    RatingUpdateRequest, RecordingRow, ReleaseGroupRow, ReleaseInfo, SaveSmartPlaylistRequest,
-    SeekRequest, SmartPlaylistResult, VolumeRequest,
+    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
+    FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats,
+    InitialSetupRequest, LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow,
+    QueueSettingsUpdate, RatingUpdateRequest, RecordingRow, ReleaseGroupRow, ReleaseInfo,
+    SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult, VolumeRequest,
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
@@ -196,6 +196,65 @@ pub async fn update_queue_settings(
         .await
         .map_err(|e| e.to_string())?;
     load_app_config(&state.db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn save_external_commands(
+    state: tauri::State<'_, AppState>,
+    commands: Vec<ExternalCommand>,
+) -> Result<AppConfig, String> {
+    let json = serde_json::to_string(&commands).map_err(|e| e.to_string())?;
+    set_config_value(&state.db, "external_commands", &json)
+        .await
+        .map_err(|e| e.to_string())?;
+    load_app_config(&state.db).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn spawn_external_command(template: String, file_path: String) -> Result<(), String> {
+    let mut parts: Vec<String> = shell_words(&template)
+        .into_iter()
+        .map(|w| w.replace("%%", &file_path))
+        .collect();
+    if parts.is_empty() {
+        return Err("Empty command".to_string());
+    }
+    let program = parts.remove(0);
+    std::process::Command::new(&program)
+        .args(&parts)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn '{}': {}", program, e))?;
+    Ok(())
+}
+
+fn shell_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = ' ';
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == quote_char {
+                in_quotes = false;
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' || c == '\'' {
+            in_quotes = true;
+            quote_char = c;
+        } else if c == ' ' || c == '\t' {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 #[tauri::command]
@@ -1076,9 +1135,18 @@ async fn load_app_config(db: &crate::db::DbPool) -> anyhow::Result<AppConfig> {
     .and_then(|value| value.parse::<i64>().ok())
     .unwrap_or(5);
 
+    let external_commands_json: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'external_commands'")
+            .fetch_optional(&mut *conn)
+            .await?;
+    let external_commands = external_commands_json
+        .and_then(|json| serde_json::from_str::<Vec<ExternalCommand>>(&json).ok())
+        .unwrap_or_default();
+
     Ok(AppConfig {
         music_root,
         queue_history_limit,
+        external_commands,
     })
 }
 
