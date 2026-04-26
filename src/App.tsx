@@ -196,10 +196,38 @@ function formatAlbumRating(value: number | null): string {
   return `Avg ${value.toFixed(1)}`;
 }
 
-function trackSort(a: RecordingRow, b: RecordingRow): number {
-  const artistDelta = (a.artist_credit_name ?? "").localeCompare(b.artist_credit_name ?? "");
-  if (artistDelta !== 0) return artistDelta;
-  return a.title.localeCompare(b.title);
+type SortColumn = "title" | "artist" | "releases" | "genre" | "rating" | "duration" | "plays" | "last_played";
+
+function compareRecordings(a: RecordingRow, b: RecordingRow, col: SortColumn, asc: boolean): number {
+  let delta = 0;
+  switch (col) {
+    case "title":
+      delta = a.title.localeCompare(b.title);
+      break;
+    case "artist":
+      delta = (a.artist_credit_name ?? "").localeCompare(b.artist_credit_name ?? "");
+      if (delta === 0) delta = a.title.localeCompare(b.title);
+      break;
+    case "releases":
+      delta = (a.releases[0]?.release_group_title ?? "").localeCompare(b.releases[0]?.release_group_title ?? "");
+      break;
+    case "genre":
+      delta = (a.genre ?? "").localeCompare(b.genre ?? "");
+      break;
+    case "rating":
+      delta = (a.rating ?? 0) - (b.rating ?? 0);
+      break;
+    case "duration":
+      delta = (a.duration_ms ?? 0) - (b.duration_ms ?? 0);
+      break;
+    case "plays":
+      delta = a.play_count - b.play_count;
+      break;
+    case "last_played":
+      delta = (a.last_played ?? "").localeCompare(b.last_played ?? "");
+      break;
+  }
+  return asc ? delta : -delta;
 }
 
 type RatingStarsProps = {
@@ -295,6 +323,8 @@ function App() {
   const [newCmdName, setNewCmdName] = useState("");
   const [newCmdTemplate, setNewCmdTemplate] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string } | null>(null);
+  const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
+  const [sortAsc, setSortAsc] = useState(true);
   const releaseGroupSearchInFlightRef = useRef(false);
   const queuedReleaseGroupSearchRef = useRef<{ artistId: string | null; search: string } | null>(null);
 
@@ -356,8 +386,8 @@ function App() {
           (recording.source_paths ?? []).some((p) => p.toLowerCase().includes(needle))
         );
       })
-      .sort(trackSort);
-  }, [recordings, search, selectedArtist, selectedReleaseGroup, selectedTag]);
+      .sort((a, b) => compareRecordings(a, b, sortColumn, sortAsc));
+  }, [recordings, search, selectedArtist, selectedReleaseGroup, selectedTag, sortColumn, sortAsc]);
 
   const trackTableScrollRef = useRef<HTMLDivElement>(null);
   const rowVirtualizer = useVirtualizer({
@@ -437,6 +467,15 @@ function App() {
       await loadPlaylists();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function handleColumnSort(col: SortColumn) {
+    if (sortColumn === col) {
+      setSortAsc((prev) => !prev);
+    } else {
+      setSortColumn(col);
+      setSortAsc(true);
     }
   }
 
@@ -1464,15 +1503,27 @@ function App() {
                     <table className="recordings-table">
                       <thead>
                         <tr>
-                          <th>Title</th>
-                          <th>Artist</th>
-                          <th>Releases</th>
-                          <th>Genre</th>
+                          {(["title", "artist", "releases", "genre"] as SortColumn[]).map((col) => (
+                            <th
+                              key={col}
+                              className="sortable-th"
+                              onClick={() => handleColumnSort(col)}
+                            >
+                              {col.charAt(0).toUpperCase() + col.slice(1)}
+                              {sortColumn === col ? (sortAsc ? " ↑" : " ↓") : ""}
+                            </th>
+                          ))}
                           <th>Tags</th>
-                          <th>Rating</th>
-                          <th>Duration</th>
-                          <th>Plays</th>
-                          <th>Last played</th>
+                          {(["rating", "duration", "plays", "last_played"] as SortColumn[]).map((col) => (
+                            <th
+                              key={col}
+                              className="sortable-th"
+                              onClick={() => handleColumnSort(col)}
+                            >
+                              {col === "last_played" ? "Last played" : col.charAt(0).toUpperCase() + col.slice(1)}
+                              {sortColumn === col ? (sortAsc ? " ↑" : " ↓") : ""}
+                            </th>
+                          ))}
                           <th>Sources</th>
                         </tr>
                       </thead>

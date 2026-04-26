@@ -406,6 +406,16 @@ thead th {
   letter-spacing: 0.08em;
 }
 
+.sortable-th {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.sortable-th:hover {
+  color: #edf3f8;
+}
+
 .playable-row {
   cursor: pointer;
 }
