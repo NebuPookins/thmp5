@@ -8,6 +8,7 @@ mod library;
 mod logging;
 mod models;
 pub mod query;
+mod sleep_inhibitor;
 
 use audio::AudioEngineHandle;
 use db::DbPool;

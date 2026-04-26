@@ -65,3 +65,5 @@ pest_derive = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cpal = "0.15"
+dbus = "0.9"
+x11rb = { version = "0.13", features = ["dpms"] }

@@ -1,5 +1,6 @@
 use crate::file_issues::FileIssueLog;
 use crate::models::{PlaybackStatus, PlayerState};
+use crate::sleep_inhibitor::SleepInhibitor;
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(feature = "opus")]
@@ -68,7 +69,8 @@ pub struct AudioEngineHandle {
 
 impl AudioEngineHandle {
     pub fn new(app: AppHandle, file_issues: FileIssueLog) -> Result<Self> {
-        let shared = Arc::new(Mutex::new(SharedState::new(48_000, 2)));
+        let sleep_inhibitor = Arc::new(SleepInhibitor::new("thmp5", "Music playback in progress"));
+        let shared = Arc::new(Mutex::new(SharedState::new(48_000, 2, sleep_inhibitor)));
         let (tx, rx) = mpsc::channel();
         let command_shared = Arc::clone(&shared);
 
@@ -144,6 +146,7 @@ impl AudioEngineHandle {
 }
 
 struct SharedState {
+    sleep_inhibitor: Arc<SleepInhibitor>,
     output_sample_rate: u32,
     output_channels: u16,
     status: PlaybackStatus,
@@ -160,8 +163,13 @@ struct SharedState {
 }
 
 impl SharedState {
-    fn new(output_sample_rate: u32, output_channels: u16) -> Self {
+    fn new(
+        output_sample_rate: u32,
+        output_channels: u16,
+        sleep_inhibitor: Arc<SleepInhibitor>,
+    ) -> Self {
         Self {
+            sleep_inhibitor,
             output_sample_rate,
             output_channels,
             status: PlaybackStatus::Stopped,
@@ -482,16 +490,35 @@ fn update_state<F>(shared: &Arc<Mutex<SharedState>>, app: &AppHandle, f: F)
 where
     F: FnOnce(&mut SharedState),
 {
-    let snapshot = {
+    let (snapshot, sleep_inhibitor, should_inhibit) = {
         let mut state = match shared.lock() {
             Ok(state) => state,
             Err(_) => return,
         };
         f(&mut state);
-        state.player_state()
+        (
+            state.player_state(),
+            Arc::clone(&state.sleep_inhibitor),
+            should_inhibit_for_status(&state.status),
+        )
     };
 
+    sync_sleep_inhibitor(&sleep_inhibitor, should_inhibit);
     let _ = app.emit(PLAYER_STATE_EVENT, snapshot);
+}
+
+fn should_inhibit_for_status(status: &PlaybackStatus) -> bool {
+    matches!(status, PlaybackStatus::Loading | PlaybackStatus::Playing)
+}
+
+fn sync_sleep_inhibitor(sleep_inhibitor: &SleepInhibitor, should_inhibit: bool) {
+    if let Err(error) = sleep_inhibitor.set_active(should_inhibit) {
+        tracing::warn!(
+            error = %error,
+            should_inhibit,
+            "Failed to update desktop sleep inhibitor"
+        );
+    }
 }
 
 fn emit_error(app: &AppHandle, message: String) {
@@ -655,6 +682,7 @@ fn write_output_data<T, F>(
     let mut ended_event = None;
     let mut snapshot = None;
     let mut position_event = None;
+    let mut inhibit_change = None;
 
     {
         let mut state = match shared.lock() {
@@ -703,6 +731,7 @@ fn write_output_data<T, F>(
             {
                 state.status = PlaybackStatus::Playing;
                 snapshot = Some(state.player_state());
+                inhibit_change = Some((Arc::clone(&state.sleep_inhibitor), true));
             }
 
             if state.status != PlaybackStatus::Playing {
@@ -732,6 +761,7 @@ fn write_output_data<T, F>(
                     drop(buffer);
                     state.clear_track();
                     snapshot = Some(state.player_state());
+                    inhibit_change = Some((Arc::clone(&state.sleep_inhibitor), false));
                     for sample in frame.iter_mut() {
                         *sample = convert(0.0);
                     }
@@ -740,6 +770,7 @@ fn write_output_data<T, F>(
 
                 state.status = PlaybackStatus::Loading;
                 snapshot = Some(state.player_state());
+                inhibit_change = Some((Arc::clone(&state.sleep_inhibitor), true));
                 for sample in frame.iter_mut() {
                     *sample = convert(0.0);
                 }
@@ -760,6 +791,9 @@ fn write_output_data<T, F>(
         }
     }
 
+    if let Some((sleep_inhibitor, should_inhibit)) = inhibit_change {
+        sync_sleep_inhibitor(&sleep_inhibitor, should_inhibit);
+    }
     if let Some(position_ms) = position_event {
         let _ = app.emit(PLAYER_POSITION_EVENT, position_ms);
     }
