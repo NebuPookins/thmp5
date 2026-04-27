@@ -198,6 +198,18 @@ pub struct RatingUpdateRequest {
     pub stars: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EntityRatingUpdate {
+    pub id: String,
+    pub rating: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingRatingUpdateResult {
+    pub release_groups: Vec<EntityRatingUpdate>,
+    pub artists: Vec<EntityRatingUpdate>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Id3FrameDebugRequest {
     pub path: String,

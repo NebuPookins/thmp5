@@ -5,8 +5,9 @@ use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
     FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats,
     InitialSetupRequest, LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow,
-    QueueSettingsUpdate, RatingUpdateRequest, RecordingRow, ReleaseGroupRow, ReleaseInfo,
-    SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult, VolumeRequest,
+    QueueSettingsUpdate, RatingUpdateRequest, RecordingRatingUpdateResult, RecordingRow,
+    ReleaseGroupRow, ReleaseInfo, SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult,
+    VolumeRequest,
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
@@ -289,18 +290,19 @@ pub async fn record_play_history(
 pub async fn set_recording_rating(
     state: tauri::State<'_, AppState>,
     request: RatingUpdateRequest,
-) -> Result<(), String> {
+) -> Result<RecordingRatingUpdateResult, String> {
     validate_rating(request.stars)?;
 
+    let mut conn = state
+        .db
+        .acquire(format!(
+            "command.set_recording_rating recording_id={}",
+            request.id
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+
     if let Some(stars) = request.stars {
-        let mut conn = state
-            .db
-            .acquire(format!(
-                "command.set_recording_rating upsert recording_id={}",
-                request.id
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
         sqlx::query(
             "INSERT INTO user_rating (recording_id, stars, updated_at)
              VALUES (?, ?, datetime('now'))
@@ -314,14 +316,6 @@ pub async fn set_recording_rating(
         .await
         .map_err(|e| e.to_string())?;
     } else {
-        let mut conn = state
-            .db
-            .acquire(format!(
-                "command.set_recording_rating delete recording_id={}",
-                request.id
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
         sqlx::query("DELETE FROM user_rating WHERE recording_id = ?")
             .bind(&request.id)
             .execute(&mut *conn)
@@ -329,8 +323,77 @@ pub async fn set_recording_rating(
             .map_err(|e| e.to_string())?;
     }
 
+    let release_groups = sqlx::query(
+        "WITH affected_release_groups AS (
+            SELECT DISTINCT rel.release_group_id AS id
+            FROM track t
+            JOIN medium m
+                ON m.id = t.medium_id
+            JOIN release rel
+                ON rel.id = m.release_id
+            WHERE t.recording_id = ?
+         )
+         SELECT
+            affected_release_groups.id AS id,
+            (
+                SELECT AVG(track_ratings.stars)
+                FROM (
+                    SELECT DISTINCT t2.recording_id, ur2.stars
+                    FROM release rel2
+                    JOIN medium m2
+                        ON m2.release_id = rel2.id
+                    JOIN track t2
+                        ON t2.medium_id = m2.id
+                    JOIN user_rating ur2
+                        ON ur2.recording_id = t2.recording_id
+                    WHERE rel2.release_group_id = affected_release_groups.id
+                ) AS track_ratings
+            ) AS rating
+         FROM affected_release_groups",
+    )
+    .bind(&request.id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|row| crate::models::EntityRatingUpdate {
+        id: row.get("id"),
+        rating: row.get("rating"),
+    })
+    .collect();
+
+    let artists = sqlx::query(
+        "WITH affected_artists AS (
+            SELECT DISTINCT artist_id AS id
+            FROM recording_artist
+            WHERE recording_id = ?
+         )
+         SELECT
+            affected_artists.id AS id,
+            AVG(ur.stars)       AS rating
+         FROM affected_artists
+         LEFT JOIN recording_artist ra
+             ON ra.artist_id = affected_artists.id
+         LEFT JOIN user_rating ur
+             ON ur.recording_id = ra.recording_id
+         GROUP BY affected_artists.id",
+    )
+    .bind(&request.id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .map(|row| crate::models::EntityRatingUpdate {
+        id: row.get("id"),
+        rating: row.get("rating"),
+    })
+    .collect();
+
     *state.recordings_cache.write().await = None;
-    Ok(())
+    Ok(RecordingRatingUpdateResult {
+        release_groups,
+        artists,
+    })
 }
 
 // ── Library queries ───────────────────────────────────────────────────────────

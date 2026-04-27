@@ -112,6 +112,16 @@ type ReleaseGroupRow = {
   rating: number | null;
 };
 
+type EntityRatingUpdate = {
+  id: string;
+  rating: number | null;
+};
+
+type RecordingRatingUpdateResult = {
+  release_groups: EntityRatingUpdate[];
+  artists: EntityRatingUpdate[];
+};
+
 type SmartPlaylistResult = {
   recordings: RecordingRow[];
   total_duration_ms: number;
@@ -280,6 +290,22 @@ async function reportPoolTimeout(context: string, value: unknown) {
 
 function applyRatingToRecording(recording: RecordingRow, recordingId: string, stars: number | null): RecordingRow {
   return recording.id === recordingId ? { ...recording, rating: stars } : recording;
+}
+
+function applyAggregateRatings<T extends { id: string; rating: number | null }>(
+  rows: T[],
+  updates: EntityRatingUpdate[],
+): T[] {
+  if (updates.length === 0) {
+    return rows;
+  }
+
+  const ratingsById = new Map(updates.map((update) => [update.id, update.rating] as const));
+  return rows.map((row) => (
+    ratingsById.has(row.id)
+      ? { ...row, rating: ratingsById.get(row.id) ?? null }
+      : row
+  ));
 }
 
 function App() {
@@ -1183,9 +1209,11 @@ function App() {
     );
 
     try {
-      await invoke("set_recording_rating", {
+      const updateResult = await invoke<RecordingRatingUpdateResult>("set_recording_rating", {
         request: { id: recordingId, stars },
       });
+      setArtists((current) => applyAggregateRatings(current, updateResult.artists));
+      setReleaseGroups((current) => applyAggregateRatings(current, updateResult.release_groups));
     } catch (ratingError) {
       setRecordings(previousRecordings);
       setHistory(previousHistory);
