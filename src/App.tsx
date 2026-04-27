@@ -296,6 +296,26 @@ function applyRatingToRecording(recording: RecordingRow, recordingId: string, st
   return recording.id === recordingId ? { ...recording, rating: stars } : recording;
 }
 
+function reconcileRecording(recording: RecordingRow, recordingsById: Map<string, RecordingRow>): RecordingRow {
+  return recordingsById.get(recording.id) ?? recording;
+}
+
+function reconcileRecordingList(
+  items: RecordingRow[],
+  recordingsById: Map<string, RecordingRow>,
+): RecordingRow[] {
+  let changed = false;
+  const nextItems = items.map((item) => {
+    const nextItem = reconcileRecording(item, recordingsById);
+    if (nextItem !== item) {
+      changed = true;
+    }
+    return nextItem;
+  });
+
+  return changed ? nextItems : items;
+}
+
 function applyAggregateRatings<T extends { id: string; rating: number | null }>(
   rows: T[],
   updates: EntityRatingUpdate[],
@@ -756,6 +776,43 @@ function App() {
       }
     };
   }, [bootstrap?.needs_setup, bootstrap?.import_progress.is_running, search, selectedArtistId]);
+
+  useEffect(() => {
+    if (recordings.length === 0) {
+      return;
+    }
+
+    const recordingsById = new Map(recordings.map((recording) => [recording.id, recording] as const));
+    setHistory((current) => reconcileRecordingList(current, recordingsById));
+    setQueue((current) => reconcileRecordingList(current, recordingsById));
+    setCurrentTrack((current) => (current ? reconcileRecording(current, recordingsById) : current));
+    setSmartResult((current) => (
+      current
+        ? {
+            ...current,
+            recordings: reconcileRecordingList(current.recordings, recordingsById),
+          }
+        : current
+    ));
+    setCompareAnchor((current) => (current ? reconcileRecording(current, recordingsById) : current));
+    setComparisonModal((current) => (
+      current
+        ? {
+            ...current,
+            recA: reconcileRecording(current.recA, recordingsById),
+            recB: reconcileRecording(current.recB, recordingsById),
+          }
+        : current
+    ));
+    setContextMenu((current) => (
+      current
+        ? {
+            ...current,
+            recording: reconcileRecording(current.recording, recordingsById),
+          }
+        : current
+    ));
+  }, [recordings]);
 
   useEffect(() => {
     let isMounted = true;
