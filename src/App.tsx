@@ -210,6 +210,7 @@ function compareRecordings(a: RecordingRow, b: RecordingRow, col: SortColumn, as
       break;
     case "releases":
       delta = (a.releases[0]?.release_group_title ?? "").localeCompare(b.releases[0]?.release_group_title ?? "");
+      if (delta === 0) delta = (a.releases[0]?.track_position ?? Infinity) - (b.releases[0]?.track_position ?? Infinity);
       break;
     case "genre":
       delta = (a.genre ?? "").localeCompare(b.genre ?? "");
