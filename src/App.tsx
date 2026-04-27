@@ -369,6 +369,7 @@ function App() {
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
   const releaseGroupSearchInFlightRef = useRef(false);
+  const releaseGroupPruneInFlightRef = useRef(false);
   const queuedReleaseGroupSearchRef = useRef<{ artistId: string | null; search: string } | null>(null);
 
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
@@ -542,6 +543,10 @@ function App() {
   async function loadArtists() {
     const rows = await invoke<ArtistRow[]>("list_artists");
     setArtists(rows);
+    setSelectedArtistId((current) => (
+      current && !rows.some((artist) => artist.id === current) ? null : current
+    ));
+    return rows;
   }
 
   async function loadReleaseGroups(nextArtistId: string | null, nextSearch: string) {
@@ -549,7 +554,30 @@ function App() {
       artistId: nextArtistId,
       search: nextSearch.trim() || null,
     });
-    setReleaseGroups(rows);
+    const visibleRows = rows.filter((releaseGroup) => releaseGroup.recording_count > 0);
+    setReleaseGroups(visibleRows);
+    setSelectedReleaseGroupId((current) => (
+      current && !visibleRows.some((releaseGroup) => releaseGroup.id === current) ? null : current
+    ));
+    if (visibleRows.length !== rows.length && !releaseGroupPruneInFlightRef.current) {
+      releaseGroupPruneInFlightRef.current = true;
+      void (async () => {
+        try {
+          await invoke("prune_empty_library_entities_command");
+          const artistRows = await loadArtists();
+          const resolvedArtistId = nextArtistId && artistRows.some((artist) => artist.id === nextArtistId)
+            ? nextArtistId
+            : null;
+          await loadReleaseGroups(resolvedArtistId, nextSearch);
+        } catch (pruneError) {
+          await reportPoolTimeout("empty album cleanup", pruneError);
+          setError(pruneError instanceof Error ? pruneError.message : String(pruneError));
+        } finally {
+          releaseGroupPruneInFlightRef.current = false;
+        }
+      })();
+    }
+    return visibleRows;
   }
 
   function scheduleReleaseGroupSearch(nextArtistId: string | null, nextSearch: string) {
@@ -588,8 +616,11 @@ function App() {
     setIsRefreshingLibrary(true);
     try {
       await loadRecordings();
-      await loadArtists();
-      await loadReleaseGroups(nextArtistId, nextSearch);
+      const artistRows = await loadArtists();
+      const resolvedArtistId = nextArtistId && artistRows.some((artist) => artist.id === nextArtistId)
+        ? nextArtistId
+        : null;
+      await loadReleaseGroups(resolvedArtistId, nextSearch);
       await loadAllTags();
       await loadPlaylists();
     } catch (loadError) {
@@ -1151,6 +1182,11 @@ function App() {
         chosenRating,
       });
       setRecordings(updated);
+      const artistRows = await loadArtists();
+      const nextArtistId = selectedArtistId && artistRows.some((artist) => artist.id === selectedArtistId)
+        ? selectedArtistId
+        : null;
+      await loadReleaseGroups(nextArtistId, search);
       setComparisonModal(null);
       setComparisonWasPlaying(false);
     } catch (mergeError) {

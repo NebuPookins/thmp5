@@ -98,6 +98,7 @@ pub fn run() {
             commands::list_recordings,
             commands::list_artists,
             commands::list_release_groups,
+            commands::prune_empty_library_entities_command,
             commands::record_play_history,
             commands::set_recording_rating,
             commands::get_player_state,

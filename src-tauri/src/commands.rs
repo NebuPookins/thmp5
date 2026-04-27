@@ -11,7 +11,7 @@ use crate::models::{
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
-use sqlx::Row;
+use sqlx::{Row, Sqlite, Transaction};
 use std::sync::Arc;
 
 /// CTEs shared by list_recordings and evaluate_smart_playlist.
@@ -880,6 +880,24 @@ pub async fn list_release_groups(
 }
 
 #[tauri::command]
+pub async fn prune_empty_library_entities_command(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut tx = state
+        .db
+        .raw_pool()
+        .begin()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    prune_empty_library_entities(&mut tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_cover_art(
     state: tauri::State<'_, AppState>,
     recording_id: String,
@@ -1347,6 +1365,10 @@ pub async fn merge_recordings(
         .await
         .map_err(|e| e.to_string())?;
 
+    prune_empty_library_entities(&mut tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
     tx.commit().await.map_err(|e| e.to_string())?;
 
     // Invalidate cache and return fresh list
@@ -1355,6 +1377,59 @@ pub async fn merge_recordings(
     let result = (*all).clone();
     *state.recordings_cache.write().await = Some(all);
     Ok(result)
+}
+
+async fn prune_empty_library_entities(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM medium
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM track
+             WHERE track.medium_id = medium.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM release
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM medium
+             WHERE medium.release_id = release.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM release_group
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM release
+             WHERE release.release_group_id = release_group.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM artist
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM recording_artist
+             WHERE recording_artist.artist_id = artist.id
+         )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM release_group_artist
+             WHERE release_group_artist.artist_id = artist.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
 }
 
 fn validate_rating(stars: Option<i64>) -> Result<(), String> {
