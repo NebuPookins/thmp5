@@ -972,6 +972,10 @@ function App() {
     setQueue((current) => [...current, recording]);
   }
 
+  function removeFromQueue(index: number) {
+    setQueue((current) => current.filter((_, i) => i !== index));
+  }
+
   async function handlePauseResume() {
     if (!currentTrack) {
       if (queue.length > 0) {
@@ -1846,11 +1850,20 @@ function App() {
                       </div>
                     </li>
                   ) : null}
-                  {queue.map((item) => (
-                    <li key={`${item.id}-${item.primary_source_id}`}>
+                  {queue.map((item, index) => (
+                    <li className="queue-upcoming-item" key={`${index}-${item.id}-${item.primary_source_id}`}>
                       <div className="queue-row">
                         <strong>{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
+                        <button
+                          className="queue-remove-btn"
+                          onClick={() => removeFromQueue(index)}
+                          title="Remove from queue"
+                          type="button"
+                          aria-label="Remove from queue"
+                        >
+                          ×
+                        </button>
                       </div>
                       <div className="queue-row">
                         <span>{item.artist_credit_name ?? "Unknown Artist"}</span>

@@ -536,6 +536,35 @@ thead th {
   opacity: 0.45;
 }
 
+.queue-upcoming-item {
+  position: relative;
+}
+
+.queue-remove-btn {
+  flex-shrink: 0;
+  display: none;
+  background: none;
+  border: none;
+  color: #7a93b0;
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.queue-remove-btn:hover {
+  color: #e07070;
+  background: rgba(220, 80, 80, 0.15);
+}
+
+.queue-upcoming-item:hover .queue-remove-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .empty-item {
   justify-content: center;
   align-items: flex-start;
