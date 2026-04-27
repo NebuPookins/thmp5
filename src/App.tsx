@@ -337,6 +337,7 @@ function App() {
   const [mergeTitleCustom, setMergeTitleCustom] = useState("");
   const [mergeArtistChoice, setMergeArtistChoice] = useState<"A" | "B" | "custom">("A");
   const [mergeArtistCustom, setMergeArtistCustom] = useState("");
+  const [mergeRatingChoice, setMergeRatingChoice] = useState<"A" | "B">("A");
   const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
@@ -1046,6 +1047,7 @@ function App() {
     if (wasPlaying) {
       try { await invoke("pause"); } catch { /* ignore */ }
     }
+    setMergeRatingChoice(recA.rating === null && recB.rating !== null ? "B" : "A");
     setComparisonModal({ recA, recB, step: "compare" });
   }
 
@@ -1108,6 +1110,9 @@ function App() {
       : mergeTitleChoice === "B" ? recB.title
       : mergeTitleCustom;
     const customArtistText = mergeArtistChoice === "custom" ? mergeArtistCustom : null;
+    const chosenRating = recA.rating === recB.rating
+      ? recA.rating
+      : mergeRatingChoice === "A" ? recA.rating : recB.rating;
     try {
       await invoke("stop");
       const updated = await invoke<RecordingRow[]>("merge_recordings", {
@@ -1116,6 +1121,7 @@ function App() {
         title,
         artistChoice: mergeArtistChoice,
         customArtistText,
+        chosenRating,
       });
       setRecordings(updated);
       setComparisonModal(null);
@@ -2249,6 +2255,34 @@ function App() {
                   />
                 )}
               </div>
+              {recA.rating !== recB.rating && (() => {
+                function starLabel(r: number | null) {
+                  return r === null ? "(no rating)" : "★".repeat(r) + "☆".repeat(5 - r);
+                }
+                return (
+                  <div className="merge-field-section">
+                    <div className="merge-field-label">Rating</div>
+                    <label className="merge-field-option">
+                      <input
+                        checked={mergeRatingChoice === "A"}
+                        name="merge-rating"
+                        onChange={() => setMergeRatingChoice("A")}
+                        type="radio"
+                      />
+                      A: {starLabel(recA.rating)}
+                    </label>
+                    <label className="merge-field-option">
+                      <input
+                        checked={mergeRatingChoice === "B"}
+                        name="merge-rating"
+                        onChange={() => setMergeRatingChoice("B")}
+                        type="radio"
+                      />
+                      B: {starLabel(recB.rating)}
+                    </label>
+                  </div>
+                );
+              })()}
               <div className="comparison-modal-footer">
                 <button
                   className="comparison-back-btn"

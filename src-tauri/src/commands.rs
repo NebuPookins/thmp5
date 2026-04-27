@@ -1158,6 +1158,7 @@ pub async fn merge_recordings(
     title: String,
     artist_choice: String,
     custom_artist_text: Option<String>,
+    chosen_rating: Option<i64>,
 ) -> Result<Vec<RecordingRow>, String> {
     let mut tx = state
         .db
@@ -1251,6 +1252,23 @@ pub async fn merge_recordings(
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Apply chosen rating to primary
+    sqlx::query("DELETE FROM user_rating WHERE recording_id = ?")
+        .bind(&primary_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(stars) = chosen_rating {
+        sqlx::query(
+            "INSERT INTO user_rating (recording_id, stars, updated_at) VALUES (?, ?, datetime('now'))",
+        )
+        .bind(&primary_id)
+        .bind(stars)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
 
     // track.recording_id has no ON DELETE CASCADE, so remove duplicate's track rows first
     sqlx::query("DELETE FROM track WHERE recording_id = ?")
