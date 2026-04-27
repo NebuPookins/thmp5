@@ -1,4 +1,5 @@
 mod audio;
+mod audio_probe;
 mod commands;
 mod db;
 pub mod file_issues;

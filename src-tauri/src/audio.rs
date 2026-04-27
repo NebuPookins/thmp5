@@ -1,3 +1,4 @@
+use crate::audio_probe::{open_wave_mp3_payload, probe_media_source as shared_probe_media_source};
 use crate::file_issues::FileIssueLog;
 use crate::models::{PlaybackStatus, PlayerState};
 use crate::sleep_inhibitor::SleepInhibitor;
@@ -8,6 +9,7 @@ use opus::Decoder as OpusDecoder;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -16,10 +18,7 @@ use std::time::Duration;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{CodecType, DecoderOptions, CODEC_TYPE_OPUS};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::formats::{SeekMode, SeekTo};
 use symphonia::core::units::Time;
 use tauri::{AppHandle, Emitter};
 
@@ -809,7 +808,6 @@ fn write_output_data<T, F>(
 /// first byte after the entire tag (i.e. where the actual audio data begins).
 /// Returns `None` if there is no ID3v2 header at the current file position.
 fn id3v2_end_offset(file: &mut File) -> Option<u64> {
-    use std::io::Read;
     let mut header = [0u8; 10];
     file.read_exact(&mut header).ok()?;
     if &header[0..3] != b"ID3" {
@@ -869,24 +867,32 @@ impl LocalFileSource {
                         return Self::probe_file(path, file2);
                     }
                 }
+                if let Some(segment) = open_wave_mp3_payload(path)? {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %first_err,
+                        "Retrying by decoding MP3 payload from RIFF/WAVE wrapper"
+                    );
+                    return Self::probe_media_source(path, segment, Some("mp3"));
+                }
                 Err(first_err)
             }
         }
     }
 
     fn probe_file(path: &Path, file: File) -> Result<Self> {
-        let media_source = MediaSourceStream::new(Box::new(file), Default::default());
-        let mut hint = Hint::new();
-        if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
-            hint.with_extension(extension);
-        }
+        Self::probe_media_source(path, file, None)
+    }
 
-        let probed = symphonia::default::get_probe().format(
-            &hint,
-            media_source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )?;
+    fn probe_media_source<M>(
+        path: &Path,
+        media_source: M,
+        force_extension: Option<&str>,
+    ) -> Result<Self>
+    where
+        M: symphonia::core::io::MediaSource + 'static,
+    {
+        let probed = shared_probe_media_source(path, media_source, force_extension)?;
         let format = probed.format;
         let track = format
             .default_track()

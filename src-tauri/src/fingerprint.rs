@@ -1,3 +1,4 @@
+use crate::audio_probe::{open_wave_mp3_payload, probe_media_source};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -5,16 +6,13 @@ use base64::Engine as _;
 use opus::Decoder as OpusDecoder;
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use serde::Deserialize;
+use std::fs::File;
 use std::path::Path;
 use std::sync::OnceLock;
 use symphonia::core::{
     audio::SampleBuffer,
     codecs::{DecoderOptions, CODEC_TYPE_OPUS},
     errors::Error as SymphoniaError,
-    formats::FormatOptions,
-    io::MediaSourceStream,
-    meta::MetadataOptions,
-    probe::Hint,
 };
 
 /// Decode only the first 30 seconds of audio for the initial fingerprint pass.
@@ -78,23 +76,22 @@ pub fn ber(a: &[u32], b: &[u32]) -> f32 {
 /// Decode up to `MAX_FINGERPRINT_MS` of audio and run the Chromaprint algorithm.
 /// Returns the raw fingerprint integers and the duration of audio decoded.
 fn decode_chromaprint(path: &Path, config: &Configuration) -> Result<(Vec<u32>, u64)> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .context("Failed to probe audio format")?;
+    let file = File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    let probed = match probe_media_source(path, file, None) {
+        Ok(probed) => probed,
+        Err(first_err) => {
+            if let Some(segment) = open_wave_mp3_payload(path)? {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %first_err,
+                    "Retrying fingerprint probe by decoding MP3 payload from RIFF/WAVE wrapper"
+                );
+                probe_media_source(path, segment, Some("mp3"))?
+            } else {
+                return Err(first_err);
+            }
+        }
+    };
 
     let mut format = probed.format;
 
