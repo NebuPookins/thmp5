@@ -99,6 +99,7 @@ type ArtistRow = {
   release_group_count: number;
   recording_count: number;
   rating: number | null;
+  last_played: string | null;
 };
 
 type ReleaseGroupRow = {
@@ -110,6 +111,7 @@ type ReleaseGroupRow = {
   recording_count: number;
   release_date: string | null;
   rating: number | null;
+  last_played: string | null;
 };
 
 type EntityRatingUpdate = {
@@ -211,6 +213,44 @@ function formatAlbumRating(value: number | null): string {
 }
 
 type SortColumn = "title" | "artist" | "releases" | "genre" | "rating" | "duration" | "plays" | "last_played";
+
+function compareAggregateRatings(
+  aRating: number | null,
+  bRating: number | null,
+): number {
+  if (aRating === null && bRating === null) {
+    return 0;
+  }
+
+  if (aRating === null) {
+    return -1;
+  }
+
+  if (bRating === null) {
+    return 1;
+  }
+
+  return bRating - aRating;
+}
+
+function compareAggregateLastPlayed(
+  aLastPlayed: string | null,
+  bLastPlayed: string | null,
+): number {
+  if (aLastPlayed === null && bLastPlayed === null) {
+    return 0;
+  }
+
+  if (aLastPlayed === null) {
+    return -1;
+  }
+
+  if (bLastPlayed === null) {
+    return 1;
+  }
+
+  return aLastPlayed.localeCompare(bLastPlayed);
+}
 
 function compareRecordings(a: RecordingRow, b: RecordingRow, col: SortColumn, asc: boolean): number {
   let delta = 0;
@@ -412,12 +452,50 @@ function App() {
 
   const visibleArtists = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    if (!needle) {
-      return artists;
-    }
+    const filteredArtists = !needle
+      ? artists
+      : artists.filter((artist) => artist.name.toLowerCase().includes(needle));
 
-    return artists.filter((artist) => artist.name.toLowerCase().includes(needle));
+    return [...filteredArtists].sort((a, b) => {
+      const ratingDelta = compareAggregateRatings(a.rating, b.rating);
+      if (ratingDelta !== 0) {
+        return ratingDelta;
+      }
+
+      const lastPlayedDelta = compareAggregateLastPlayed(a.last_played, b.last_played);
+      if (lastPlayedDelta !== 0) {
+        return lastPlayedDelta;
+      }
+
+      const recordingCountDelta = b.recording_count - a.recording_count;
+      if (recordingCountDelta !== 0) {
+        return recordingCountDelta;
+      }
+
+      return a.sort_name.localeCompare(b.sort_name) || a.name.localeCompare(b.name);
+    });
   }, [artists, search]);
+
+  const visibleReleaseGroups = useMemo(() => (
+    [...releaseGroups].sort((a, b) => {
+      const ratingDelta = compareAggregateRatings(a.rating, b.rating);
+      if (ratingDelta !== 0) {
+        return ratingDelta;
+      }
+
+      const lastPlayedDelta = compareAggregateLastPlayed(a.last_played, b.last_played);
+      if (lastPlayedDelta !== 0) {
+        return lastPlayedDelta;
+      }
+
+      const recordingCountDelta = b.recording_count - a.recording_count;
+      if (recordingCountDelta !== 0) {
+        return recordingCountDelta;
+      }
+
+      return a.title.localeCompare(b.title) || (a.artist_credit_name ?? "").localeCompare(b.artist_credit_name ?? "");
+    })
+  ), [releaseGroups]);
 
   const filteredRecordings = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -959,6 +1037,17 @@ function App() {
         setError(recordError instanceof Error ? recordError.message : String(recordError));
       }
       void loadRecordings();
+      void (async () => {
+        try {
+          const artistRows = await loadArtists();
+          const resolvedArtistId = selectedArtistId && artistRows.some((artist) => artist.id === selectedArtistId)
+            ? selectedArtistId
+            : null;
+          await loadReleaseGroups(resolvedArtistId, search);
+        } catch (reloadError) {
+          setError(reloadError instanceof Error ? reloadError.message : String(reloadError));
+        }
+      })();
 
       setHistory((current) => [finishedTrack, ...current].slice(0, queueHistoryLimit));
     }
@@ -1593,10 +1682,10 @@ function App() {
                     </button>
                   </div>
                   <div className="browser-list">
-                    {releaseGroups.length === 0 ? (
+                    {visibleReleaseGroups.length === 0 ? (
                       <p className="empty-browser-state">No albums available for this view.</p>
                     ) : (
-                      releaseGroups.map((releaseGroup) => (
+                      visibleReleaseGroups.map((releaseGroup) => (
                         <div
                           className={`browser-item ${releaseGroup.id === selectedReleaseGroupId ? "browser-item-active" : ""}`}
                           key={releaseGroup.id}

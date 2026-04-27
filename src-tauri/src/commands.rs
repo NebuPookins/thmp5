@@ -821,11 +821,13 @@ pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<Artis
             a.sort_name,
             COUNT(DISTINCT rga.release_group_id) AS release_group_count,
             COUNT(DISTINCT ra.recording_id)      AS recording_count,
-            AVG(ur.stars)                        AS rating
+            AVG(ur.stars)                        AS rating,
+            MAX(ph.played_at)                    AS last_played
          FROM artist a
          LEFT JOIN recording_artist ra      ON ra.artist_id = a.id
          LEFT JOIN release_group_artist rga ON rga.artist_id = a.id
          LEFT JOIN user_rating ur           ON ur.recording_id = ra.recording_id
+         LEFT JOIN play_history ph          ON ph.recording_id = ra.recording_id
          GROUP BY a.id
          ORDER BY lower(a.sort_name)",
     )
@@ -844,6 +846,7 @@ pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<Artis
                 .unwrap_or(0),
             recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
             rating: row.get("rating"),
+            last_played: row.get("last_played"),
         })
         .collect();
 
@@ -893,7 +896,18 @@ pub async fn list_release_groups(
                         ON ur2.recording_id = t2.recording_id
                     WHERE rel2.release_group_id = rg.id
                 ) AS track_ratings
-            )                                                        AS rating
+            )                                                        AS rating,
+            (
+                SELECT MAX(ph2.played_at)
+                FROM release rel2
+                JOIN medium m2
+                    ON m2.release_id = rel2.id
+                JOIN track t2
+                    ON t2.medium_id = m2.id
+                JOIN play_history ph2
+                    ON ph2.recording_id = t2.recording_id
+                WHERE rel2.release_group_id = rg.id
+            )                                                        AS last_played
          FROM release_group rg
          LEFT JOIN release_group_artist rga
              ON rga.release_group_id = rg.id AND rga.position = 0
@@ -934,6 +948,7 @@ pub async fn list_release_groups(
             recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
             release_date: row.get("release_date"),
             rating: row.get("rating"),
+            last_played: row.get("last_played"),
         })
         .collect();
 
