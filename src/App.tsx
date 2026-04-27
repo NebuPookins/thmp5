@@ -160,6 +160,10 @@ type FileIssue = {
 
 type QueueItem = RecordingRow;
 
+type ContextMenuState =
+  | { kind: "recording"; x: number; y: number; path: string; recording: RecordingRow }
+  | { kind: "source"; x: number; y: number; path: string; recording: RecordingRow };
+
 const DEFAULT_PLAYER_STATE: PlayerState = {
   status: "stopped",
   recording_id: null,
@@ -349,7 +353,7 @@ function App() {
   const [externalCommands, setExternalCommands] = useState<ExternalCommand[]>([]);
   const [newCmdName, setNewCmdName] = useState("");
   const [newCmdTemplate, setNewCmdTemplate] = useState("");
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string; recording: RecordingRow } | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [compareAnchor, setCompareAnchor] = useState<RecordingRow | null>(null);
   const [comparisonModal, setComparisonModal] = useState<{
     recA: RecordingRow;
@@ -1014,6 +1018,30 @@ function App() {
       await invoke("spawn_external_command", { template, filePath });
     } catch (spawnError) {
       setError(spawnError instanceof Error ? spawnError.message : String(spawnError));
+    }
+  }
+
+  async function handleRescanSource(path: string) {
+    try {
+      setError(null);
+      await invoke("rescan_source", { path });
+    } catch (rescanError) {
+      await reportPoolTimeout("source rescan", rescanError);
+      setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
+    } finally {
+      await loadLibraryData(selectedArtistId, search);
+    }
+  }
+
+  async function handleRescanSources(paths: string[]) {
+    try {
+      setError(null);
+      await invoke("rescan_sources", { paths });
+    } catch (rescanError) {
+      await reportPoolTimeout("source rescan", rescanError);
+      setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
+    } finally {
+      await loadLibraryData(selectedArtistId, search);
     }
   }
 
@@ -1771,8 +1799,7 @@ function App() {
                                   onContextMenu={(e) => {
                                     e.preventDefault();
                                     const path = recording.primary_source_path ?? recording.source_paths[0];
-                                    if (!path && externalCommands.length === 0) return;
-                                    setContextMenu({ x: e.clientX, y: e.clientY, path: path ?? "", recording });
+                                    setContextMenu({ kind: "recording", x: e.clientX, y: e.clientY, path: path ?? "", recording });
                                   }}
                                   title={
                                     recording.primary_source_id
@@ -1833,7 +1860,16 @@ function App() {
                                   <td>{formatLastPlayed(recording.last_played)}</td>
                                   <td className="source-paths-cell">
                                     {recording.source_paths.map((p) => (
-                                      <div key={p} title={p} className="source-path">
+                                      <div
+                                        key={p}
+                                        title={p}
+                                        className="source-path"
+                                        onContextMenu={(e) => {
+                                          e.preventDefault();
+                                          e.stopPropagation();
+                                          setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: p, recording });
+                                        }}
+                                      >
                                         {p}
                                       </div>
                                     ))}
@@ -2384,44 +2420,89 @@ function App() {
             className="ctx-menu"
             style={{ left: contextMenu.x, top: contextMenu.y }}
           >
-            {compareAnchor === null ? (
+            {contextMenu.kind === "recording" && (
+              <>
+                {contextMenu.recording.source_paths.length === 1 ? (
+                  <li>
+                    <button
+                      className="ctx-menu-item"
+                      type="button"
+                      onClick={() => {
+                        void handleRescanSources(contextMenu.recording.source_paths);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Rescan source
+                    </button>
+                  </li>
+                ) : contextMenu.recording.source_paths.length > 1 ? (
+                  <li>
+                    <button
+                      className="ctx-menu-item"
+                      type="button"
+                      onClick={() => {
+                        void handleRescanSources(contextMenu.recording.source_paths);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Rescan all sources
+                    </button>
+                  </li>
+                ) : null}
+                {compareAnchor === null ? (
+                  <li>
+                    <button
+                      className="ctx-menu-item"
+                      type="button"
+                      onClick={() => {
+                        setCompareAnchor(contextMenu.recording);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Compare with another recording...
+                    </button>
+                  </li>
+                ) : compareAnchor.id !== contextMenu.recording.id ? (
+                  <li>
+                    <button
+                      className="ctx-menu-item"
+                      type="button"
+                      onClick={() => {
+                        void openComparisonModal(compareAnchor, contextMenu.recording);
+                        setCompareAnchor(null);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Compare with "{compareAnchor.title}"
+                    </button>
+                  </li>
+                ) : (
+                  <li>
+                    <button
+                      className="ctx-menu-item"
+                      type="button"
+                      onClick={() => {
+                        setCompareAnchor(null);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Cancel comparison mode
+                    </button>
+                  </li>
+                )}
+              </>
+            )}
+            {contextMenu.kind === "source" && (
               <li>
                 <button
                   className="ctx-menu-item"
                   type="button"
                   onClick={() => {
-                    setCompareAnchor(contextMenu.recording);
+                    void handleRescanSource(contextMenu.path);
                     setContextMenu(null);
                   }}
                 >
-                  Compare with another recording...
-                </button>
-              </li>
-            ) : compareAnchor.id !== contextMenu.recording.id ? (
-              <li>
-                <button
-                  className="ctx-menu-item"
-                  type="button"
-                  onClick={() => {
-                    void openComparisonModal(compareAnchor, contextMenu.recording);
-                    setCompareAnchor(null);
-                    setContextMenu(null);
-                  }}
-                >
-                  Compare with "{compareAnchor.title}"
-                </button>
-              </li>
-            ) : (
-              <li>
-                <button
-                  className="ctx-menu-item"
-                  type="button"
-                  onClick={() => {
-                    setCompareAnchor(null);
-                    setContextMenu(null);
-                  }}
-                >
-                  Cancel comparison mode
+                  Rescan source
                 </button>
               </li>
             )}

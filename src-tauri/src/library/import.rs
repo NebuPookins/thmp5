@@ -92,6 +92,230 @@ pub async fn import_paths(
     Ok(stats)
 }
 
+pub async fn rescan_source(db: &DbPool, path: &Path, acoustid_key: Option<&str>) -> Result<()> {
+    let path_str = path.to_string_lossy().to_string();
+    let mut conn = db
+        .acquire(format!("source_rescan.lookup path={path_str}"))
+        .await
+        .context("Failed to acquire DB connection for source rescan lookup")?;
+    let existing_source = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, recording_id
+         FROM source
+         WHERE file_path = ? AND source_type = 'local_file'",
+    )
+    .bind(&path_str)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("Failed to load source for rescan")?
+    .ok_or_else(|| anyhow::anyhow!("Source not found for path: {}", path.display()))?;
+    drop(conn);
+
+    let (source_id, recording_id) = existing_source;
+    let (file_size, file_mtime_ms) = file_identity(path).context("Failed to read file metadata")?;
+
+    struct BlockingResult {
+        hash: String,
+        meta: TrackMetadata,
+        warnings: Vec<String>,
+        fp: Option<fingerprint::FingerprintResult>,
+    }
+
+    let p = path.to_path_buf();
+    let blocking = tokio::task::spawn_blocking(move || {
+        let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
+        set_io_priority_idle();
+        let hash = file_sha256(&p).context("Failed to hash file")?;
+        let metadata_read = read_metadata(&p).context("Failed to read metadata")?;
+        let fp = match fingerprint::generate_fingerprint(&p) {
+            Ok(fp) => Some(fp),
+            Err(e) => {
+                tracing::warn!(path = %p.display(), "Fingerprint generation failed during rescan: {e}");
+                None
+            }
+        };
+        Ok::<_, anyhow::Error>(BlockingResult {
+            hash,
+            meta: metadata_read.meta,
+            warnings: metadata_read.warning.into_iter().collect(),
+            fp,
+        })
+    })
+    .await;
+
+    let blocking = match blocking {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => anyhow::bail!("Blocking rescan task panicked: {e}"),
+    };
+
+    let acoustid_match: Option<AcoustIdMatch> = match (acoustid_key, blocking.fp.as_ref()) {
+        (Some(key), Some(fp_result)) => match fingerprint::lookup_acoustid(key, fp_result).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "AcoustID lookup failed during rescan: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    let mut db_conn = db
+        .acquire(format!("source_rescan.transaction path={path_str}"))
+        .await
+        .context("Failed to acquire DB connection for source rescan transaction")?;
+    let mut tx = db_conn
+        .begin()
+        .await
+        .context("Failed to start source rescan transaction")?;
+
+    let artist_name = blocking
+        .meta
+        .album_artist
+        .as_deref()
+        .or(blocking.meta.artist.as_deref())
+        .unwrap_or("Unknown Artist")
+        .to_string();
+    let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
+
+    let album_title = blocking
+        .meta
+        .album
+        .as_deref()
+        .unwrap_or("Unknown Album")
+        .to_string();
+    let release_group_id = get_or_create_release_group(&mut tx, &album_title, &artist_id).await?;
+    let release_date = blocking.meta.year.map(|y| y.to_string());
+    let release_id = get_or_create_release(
+        &mut tx,
+        &release_group_id,
+        &album_title,
+        release_date.as_deref(),
+    )
+    .await?;
+    let disc = blocking.meta.disc_number.unwrap_or(1) as i64;
+    let medium_id = get_or_create_medium(&mut tx, &release_id, disc).await?;
+    let track_position = blocking.meta.track_number.unwrap_or(0) as i64;
+
+    let existing_track_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM track WHERE recording_id = ? ORDER BY id LIMIT 1",
+    )
+    .bind(&recording_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("Failed to load track row for source rescan")?;
+
+    let title = blocking.meta.title.as_deref().unwrap_or("Unknown Title");
+    let fingerprint_str = blocking.fp.as_ref().map(|f| f.fingerprint.as_str());
+
+    let acoustid_value = acoustid_match.as_ref().map(|a| a.acoustid.as_str());
+    let recording_mbid_value = acoustid_match
+        .as_ref()
+        .and_then(|a| a.recording_mbid.as_deref());
+
+    sqlx::query(
+        "UPDATE recording
+         SET title = ?,
+             duration_ms = ?,
+             genre = ?,
+             bpm = ?,
+             comment = ?,
+             acoustid = COALESCE(?, acoustid),
+             mbid = COALESCE(?, mbid)
+         WHERE id = ?",
+    )
+    .bind(title)
+    .bind(blocking.meta.duration_ms as i64)
+    .bind(&blocking.meta.genre)
+    .bind(blocking.meta.bpm)
+    .bind(&blocking.meta.comment)
+    .bind(acoustid_value)
+    .bind(recording_mbid_value)
+    .bind(&recording_id)
+    .execute(&mut *tx)
+    .await
+    .context("Failed to update recording during source rescan")?;
+
+    sync_tags_from_comment(&mut tx, &recording_id, blocking.meta.comment.as_deref()).await?;
+
+    sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
+        .bind(&recording_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to replace recording artist during source rescan")?;
+    insert_recording_artist(&mut tx, &recording_id, &artist_id, 0, "main").await?;
+
+    if let Some(track_id) = existing_track_id {
+        sqlx::query(
+            "UPDATE track
+             SET medium_id = ?, position = ?, title = NULL, duration_ms = NULL
+             WHERE id = ?",
+        )
+        .bind(&medium_id)
+        .bind(track_position)
+        .bind(&track_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to update track placement during source rescan")?;
+    } else {
+        get_or_create_track(&mut tx, &medium_id, &recording_id, track_position).await?;
+    }
+
+    sqlx::query(
+        "UPDATE source
+         SET file_hash = ?,
+             format = ?,
+             duration_ms = ?,
+             fingerprint = ?,
+             file_size = ?,
+             file_mtime_ms = ?,
+             replay_gain_track_db = ?,
+             replay_gain_track_peak = ?,
+             replay_gain_album_db = ?,
+             replay_gain_album_peak = ?,
+             last_verified = datetime('now')
+         WHERE id = ?",
+    )
+    .bind(&blocking.hash)
+    .bind(&blocking.meta.format)
+    .bind(blocking.meta.duration_ms as i64)
+    .bind(fingerprint_str)
+    .bind(file_size)
+    .bind(file_mtime_ms)
+    .bind(blocking.meta.replay_gain_track_db)
+    .bind(blocking.meta.replay_gain_track_peak)
+    .bind(blocking.meta.replay_gain_album_db)
+    .bind(blocking.meta.replay_gain_album_peak)
+    .bind(&source_id)
+    .execute(&mut *tx)
+    .await
+    .context("Failed to update source during rescan")?;
+
+    tx.commit()
+        .await
+        .context("Failed to commit source rescan transaction")?;
+
+    let mut prune_conn = db
+        .acquire(format!("source_rescan.prune path={path_str}"))
+        .await
+        .context("Failed to acquire DB connection for source rescan cleanup")?;
+    let mut prune_tx = prune_conn
+        .begin()
+        .await
+        .context("Failed to start source rescan cleanup transaction")?;
+    prune_empty_library_entities(&mut prune_tx).await?;
+    prune_tx
+        .commit()
+        .await
+        .context("Failed to commit source rescan cleanup transaction")?;
+
+    tracing::info!(path = %path.display(), recording_id = %recording_id, source_id = %source_id, "Rescanned source");
+    for warning in blocking.warnings {
+        println!("[importer] rescan warning: {}: {}", path.display(), warning);
+    }
+
+    Ok(())
+}
+
 /// Returns `Ok(true)` if imported, `Ok(false)` if skipped (already exists).
 pub(crate) async fn import_file(
     db: &DbPool,
@@ -640,6 +864,59 @@ async fn sync_tags_from_comment(
             .execute(&mut **tx)
             .await?;
     }
+    Ok(())
+}
+
+async fn prune_empty_library_entities(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM medium
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM track
+             WHERE track.medium_id = medium.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM release
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM medium
+             WHERE medium.release_id = release.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM release_group
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM release
+             WHERE release.release_group_id = release_group.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "DELETE FROM artist
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM recording_artist
+             WHERE recording_artist.artist_id = artist.id
+         )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM release_group_artist
+             WHERE release_group_artist.artist_id = artist.id
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
     Ok(())
 }
 

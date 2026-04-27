@@ -1,6 +1,6 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::file_issues::FileIssue;
-use crate::library::import::import_paths as do_import;
+use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
     AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
     FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats,
@@ -161,6 +161,67 @@ pub async fn trigger_library_scan(
         .spawn_scan(state.db.clone(), root, state.acoustid_api_key.clone());
 
     Ok(state.importer.snapshot())
+}
+
+#[tauri::command]
+pub async fn rescan_source(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Source path cannot be empty.".to_string());
+    }
+
+    let source_path = std::path::Path::new(trimmed);
+    if !source_path.is_file() {
+        return Err(format!("Source file is missing: {}", source_path.display()));
+    }
+
+    do_rescan_source(&state.db, source_path, state.acoustid_api_key.as_deref())
+        .await
+        .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()))?;
+    *state.recordings_cache.write().await = None;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rescan_sources(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("At least one source path is required.".to_string());
+    }
+
+    let mut failures = Vec::new();
+
+    for path in paths {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err("Source path cannot be empty.".to_string());
+        }
+
+        let source_path = std::path::Path::new(trimmed);
+        if !source_path.is_file() {
+            failures.push(format!("{}: Source file is missing", source_path.display()));
+            continue;
+        }
+
+        if let Err(error) =
+            do_rescan_source(&state.db, source_path, state.acoustid_api_key.as_deref()).await
+        {
+            failures.push(format!("{}:\n{error:#}", source_path.display()));
+        }
+    }
+
+    *state.recordings_cache.write().await = None;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to rescan {} source(s):\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        ))
+    }
 }
 
 #[tauri::command]
