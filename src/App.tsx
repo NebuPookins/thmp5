@@ -405,6 +405,7 @@ function App() {
   }, [recordings, search, selectedArtist, selectedReleaseGroup, selectedTag, sortColumn, sortAsc]);
 
   const trackTableScrollRef = useRef<HTMLDivElement>(null);
+  const isComparisonScrubbing = useRef(false);
   const rowVirtualizer = useVirtualizer({
     count: filteredRecordings.length,
     getScrollElement: () => trackTableScrollRef.current,
@@ -703,7 +704,7 @@ function App() {
         }
       });
       const unlistenPosition = await listen<number>("player-position", (event) => {
-        if (!isMounted) {
+        if (!isMounted || isComparisonScrubbing.current) {
           return;
         }
 
@@ -1096,6 +1097,7 @@ function App() {
     } else {
       try { await invoke("seek", { request: { position_ms: ms } }); } catch { /* ignore */ }
     }
+    isComparisonScrubbing.current = false;
   }
 
   async function handleCompleteMerge() {
@@ -2102,6 +2104,7 @@ function App() {
                 max={durationMs}
                 min={0}
                 onChange={(e) => { void handleComparisonScrubChange(side, Number(e.currentTarget.value)); }}
+                onPointerDown={() => { isComparisonScrubbing.current = true; }}
                 onPointerUp={(e) => { void handleComparisonScrubCommit(side, Number((e.currentTarget as HTMLInputElement).value)); }}
                 step={1}
                 type="range"
@@ -2135,8 +2138,8 @@ function App() {
                   <button className="modal-close-btn" onClick={closeComparisonModal} type="button">×</button>
                 </div>
                 <div className="comparison-grid">
-                  <ScrubSide side="A" rec={recA} durationMs={durA} />
-                  <ScrubSide side="B" rec={recB} durationMs={durB} />
+                  {ScrubSide({ side: "A", rec: recA, durationMs: durA })}
+                  {ScrubSide({ side: "B", rec: recB, durationMs: durB })}
                 </div>
                 <div className="comparison-similarity">
                   {berDisplay}
