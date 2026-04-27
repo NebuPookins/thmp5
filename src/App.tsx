@@ -1045,6 +1045,12 @@ function App() {
     }
   }
 
+  function openRecordingContextMenu(e: React.MouseEvent, recording: RecordingRow) {
+    e.preventDefault();
+    const path = recording.primary_source_path ?? recording.source_paths[0];
+    setContextMenu({ kind: "recording", x: e.clientX, y: e.clientY, path: path ?? "", recording });
+  }
+
   function enqueueRecording(recording: RecordingRow) {
     if (!recording.primary_source_id) {
       setError(`No playable local file is available for "${recording.title}".`);
@@ -1796,11 +1802,7 @@ function App() {
                                   data-index={virtualRow.index}
                                   ref={rowVirtualizer.measureElement}
                                   onDoubleClick={() => enqueueRecording(recording)}
-                                  onContextMenu={(e) => {
-                                    e.preventDefault();
-                                    const path = recording.primary_source_path ?? recording.source_paths[0];
-                                    setContextMenu({ kind: "recording", x: e.clientX, y: e.clientY, path: path ?? "", recording });
-                                  }}
+                                  onContextMenu={(e) => openRecordingContextMenu(e, recording)}
                                   title={
                                     recording.primary_source_id
                                       ? "Double click to play or queue"
@@ -1926,7 +1928,11 @@ function App() {
               ) : (
                 <>
                   {[...history].reverse().map((item, i) => (
-                    <li className="queue-history-item" key={`history-${i}-${item.id}`}>
+                    <li
+                      className="queue-history-item"
+                      key={`history-${i}-${item.id}`}
+                      onContextMenu={(e) => openRecordingContextMenu(e, item)}
+                    >
                       <div className="queue-row">
                         <strong>{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
@@ -1943,7 +1949,7 @@ function App() {
                     </li>
                   ))}
                   {currentTrack ? (
-                    <li className="queue-now-playing">
+                    <li className="queue-now-playing" onContextMenu={(e) => openRecordingContextMenu(e, currentTrack)}>
                       <div className="queue-row">
                         <strong>{currentTrack.title}</strong>
                         <span className="queue-duration">{formatDuration(currentTrack.duration_ms)}</span>
@@ -1960,7 +1966,11 @@ function App() {
                     </li>
                   ) : null}
                   {queue.map((item, index) => (
-                    <li className="queue-upcoming-item" key={`${index}-${item.id}-${item.primary_source_id}`}>
+                    <li
+                      className="queue-upcoming-item"
+                      key={`${index}-${item.id}-${item.primary_source_id}`}
+                      onContextMenu={(e) => openRecordingContextMenu(e, item)}
+                    >
                       <div className="queue-row">
                         <strong>{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
