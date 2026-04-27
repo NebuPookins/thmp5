@@ -1103,6 +1103,179 @@ pub async fn delete_playlist(state: tauri::State<'_, AppState>, id: i64) -> Resu
     Ok(())
 }
 
+#[tauri::command]
+pub async fn compare_recordings(
+    state: tauri::State<'_, AppState>,
+    recording_id_a: String,
+    recording_id_b: String,
+) -> Result<f32, String> {
+    let mut conn = state
+        .db
+        .acquire("command.compare_recordings")
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let path_a: String = sqlx::query_scalar(
+        "SELECT file_path FROM source
+         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
+         ORDER BY file_path LIMIT 1",
+    )
+    .bind(&recording_id_a)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .flatten()
+    .ok_or_else(|| "Recording A has no local file".to_string())?;
+
+    let path_b: String = sqlx::query_scalar(
+        "SELECT file_path FROM source
+         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
+         ORDER BY file_path LIMIT 1",
+    )
+    .bind(&recording_id_b)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .flatten()
+    .ok_or_else(|| "Recording B has no local file".to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let a = crate::fingerprint::raw_fingerprint(std::path::Path::new(&path_a))
+            .map_err(|e| e.to_string())?;
+        let b = crate::fingerprint::raw_fingerprint(std::path::Path::new(&path_b))
+            .map_err(|e| e.to_string())?;
+        Ok(crate::fingerprint::ber(&a, &b))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn merge_recordings(
+    state: tauri::State<'_, AppState>,
+    primary_id: String,
+    duplicate_id: String,
+    title: String,
+    artist_choice: String,
+    custom_artist_text: Option<String>,
+) -> Result<Vec<RecordingRow>, String> {
+    let mut tx = state
+        .db
+        .raw_pool()
+        .begin()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Transfer unique tags from duplicate to primary
+    sqlx::query(
+        "INSERT OR IGNORE INTO recording_tag (recording_id, tag)
+         SELECT ?, tag FROM recording_tag WHERE recording_id = ?",
+    )
+    .bind(&primary_id)
+    .bind(&duplicate_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Rebind play history
+    sqlx::query("UPDATE play_history SET recording_id = ? WHERE recording_id = ?")
+        .bind(&primary_id)
+        .bind(&duplicate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Move sources to primary recording
+    sqlx::query("UPDATE source SET recording_id = ? WHERE recording_id = ?")
+        .bind(&primary_id)
+        .bind(&duplicate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Apply chosen artist
+    match artist_choice.as_str() {
+        "B" => {
+            // Copy duplicate's artist links and credit text to primary
+            sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
+                .bind(&primary_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "INSERT INTO recording_artist (recording_id, artist_id, position, role, credited_as)
+                 SELECT ?, artist_id, position, role, credited_as
+                 FROM recording_artist WHERE recording_id = ?",
+            )
+            .bind(&primary_id)
+            .bind(&duplicate_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "UPDATE recording SET artist_credit_text =
+                   (SELECT artist_credit_text FROM recording WHERE id = ?)
+                 WHERE id = ?",
+            )
+            .bind(&duplicate_id)
+            .bind(&primary_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        "custom" => {
+            let text = custom_artist_text
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
+                .bind(&primary_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE recording SET artist_credit_text = ? WHERE id = ?")
+                .bind(&text)
+                .bind(&primary_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        _ => {} // "A": keep primary's existing artist
+    }
+
+    // Apply chosen title
+    sqlx::query("UPDATE recording SET title = ? WHERE id = ?")
+        .bind(&title)
+        .bind(&primary_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // track.recording_id has no ON DELETE CASCADE, so remove duplicate's track rows first
+    sqlx::query("DELETE FROM track WHERE recording_id = ?")
+        .bind(&duplicate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Delete duplicate (CASCADE removes remaining child rows)
+    sqlx::query("DELETE FROM recording WHERE id = ?")
+        .bind(&duplicate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    // Invalidate cache and return fresh list
+    *state.recordings_cache.write().await = None;
+    let all = std::sync::Arc::new(fetch_all_recordings_from_db(&state.db).await?);
+    let result = (*all).clone();
+    *state.recordings_cache.write().await = Some(all);
+    Ok(result)
+}
+
 fn validate_rating(stars: Option<i64>) -> Result<(), String> {
     if let Some(stars) = stars {
         if !(1..=5).contains(&stars) {

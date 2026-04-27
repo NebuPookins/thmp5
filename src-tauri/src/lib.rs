@@ -117,6 +117,8 @@ pub fn run() {
             commands::save_smart_playlist,
             commands::delete_playlist,
             commands::get_file_issues,
+            commands::compare_recordings,
+            commands::merge_recordings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

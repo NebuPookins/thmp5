@@ -322,7 +322,22 @@ function App() {
   const [externalCommands, setExternalCommands] = useState<ExternalCommand[]>([]);
   const [newCmdName, setNewCmdName] = useState("");
   const [newCmdTemplate, setNewCmdTemplate] = useState("");
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; path: string; recording: RecordingRow } | null>(null);
+  const [compareAnchor, setCompareAnchor] = useState<RecordingRow | null>(null);
+  const [comparisonModal, setComparisonModal] = useState<{
+    recA: RecordingRow;
+    recB: RecordingRow;
+    step: "compare" | "merge";
+  } | null>(null);
+  const [comparisonBer, setComparisonBer] = useState<number | null | "loading" | "error">(null);
+  const [comparisonSideAMs, setComparisonSideAMs] = useState(0);
+  const [comparisonSideBMs, setComparisonSideBMs] = useState(0);
+  const [comparisonActiveSide, setComparisonActiveSide] = useState<"A" | "B">("A");
+  const [mergeTitleChoice, setMergeTitleChoice] = useState<"A" | "B" | "custom">("A");
+  const [mergeTitleCustom, setMergeTitleCustom] = useState("");
+  const [mergeArtistChoice, setMergeArtistChoice] = useState<"A" | "B" | "custom">("A");
+  const [mergeArtistCustom, setMergeArtistCustom] = useState("");
+  const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
   const releaseGroupSearchInFlightRef = useRef(false);
@@ -696,6 +711,12 @@ function App() {
           ...current,
           position_ms: event.payload,
         }));
+
+        setComparisonActiveSide((side) => {
+          if (side === "A") setComparisonSideAMs(event.payload);
+          else setComparisonSideBMs(event.payload);
+          return side;
+        });
       });
       const unlistenEnded = await listen<{
         recording_id: string;
@@ -774,6 +795,29 @@ function App() {
       () => setPlayerCoverArt(null),
     );
   }, [playerState.recording_id]);
+
+  useEffect(() => {
+    if (!comparisonModal) {
+      setComparisonBer(null);
+      return;
+    }
+    if (comparisonModal.step !== "compare") return;
+    setComparisonBer("loading");
+    setComparisonSideAMs(0);
+    setComparisonSideBMs(0);
+    setComparisonActiveSide("A");
+    setMergeTitleChoice("A");
+    setMergeTitleCustom("");
+    setMergeArtistChoice("A");
+    setMergeArtistCustom("");
+    invoke<number>("compare_recordings", {
+      recordingIdA: comparisonModal.recA.id,
+      recordingIdB: comparisonModal.recB.id,
+    })
+      .then((ber) => setComparisonBer(ber))
+      .catch(() => setComparisonBer("error"));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [comparisonModal?.recA.id, comparisonModal?.recB.id]);
 
   // Keep ref in sync so stale-closure callbacks (e.g. player-track-ended listener)
   // always see the latest value.
@@ -991,6 +1035,90 @@ function App() {
     }
   }
 
+  async function openComparisonModal(recA: RecordingRow, recB: RecordingRow) {
+    const wasPlaying = playerState.status === "playing";
+    setComparisonWasPlaying(wasPlaying);
+    if (wasPlaying) {
+      try { await invoke("pause"); } catch { /* ignore */ }
+    }
+    setComparisonModal({ recA, recB, step: "compare" });
+  }
+
+  async function closeComparisonModal() {
+    try { await invoke("stop"); } catch { /* ignore */ }
+    setComparisonModal(null);
+    if (comparisonWasPlaying && currentTrack?.primary_source_id) {
+      try {
+        await invoke("play", { request: { source_id: currentTrack.primary_source_id } });
+      } catch { /* ignore */ }
+    }
+  }
+
+  async function handleComparisonSwitchSide(side: "A" | "B") {
+    if (!comparisonModal) return;
+    const rec = side === "A" ? comparisonModal.recA : comparisonModal.recB;
+    const seekMs = side === "A" ? comparisonSideAMs : comparisonSideBMs;
+    if (side === comparisonActiveSide) {
+      // Toggle pause/resume on the active side
+      try {
+        if (playerState.status === "playing") {
+          await invoke("pause");
+        } else {
+          await invoke("resume");
+        }
+      } catch { /* ignore */ }
+      return;
+    }
+    setComparisonActiveSide(side);
+    if (rec.primary_source_id) {
+      try {
+        await invoke("play", { request: { source_id: rec.primary_source_id } });
+        if (seekMs > 0) await invoke("seek", { request: { position_ms: seekMs } });
+      } catch { /* ignore */ }
+    }
+  }
+
+  async function handleComparisonScrubChange(side: "A" | "B", ms: number) {
+    if (side === "A") setComparisonSideAMs(ms);
+    else setComparisonSideBMs(ms);
+    if (side === comparisonActiveSide) {
+      setPlayerState((current) => ({ ...current, position_ms: ms }));
+    }
+  }
+
+  async function handleComparisonScrubCommit(side: "A" | "B", ms: number) {
+    if (side !== comparisonActiveSide) {
+      await handleComparisonSwitchSide(side);
+    } else {
+      try { await invoke("seek", { request: { position_ms: ms } }); } catch { /* ignore */ }
+    }
+  }
+
+  async function handleCompleteMerge() {
+    if (!comparisonModal) return;
+    const { recA, recB } = comparisonModal;
+    const title =
+      mergeTitleChoice === "A" ? recA.title
+      : mergeTitleChoice === "B" ? recB.title
+      : mergeTitleCustom;
+    const customArtistText = mergeArtistChoice === "custom" ? mergeArtistCustom : null;
+    try {
+      await invoke("stop");
+      const updated = await invoke<RecordingRow[]>("merge_recordings", {
+        primaryId: recA.id,
+        duplicateId: recB.id,
+        title,
+        artistChoice: mergeArtistChoice,
+        customArtistText,
+      });
+      setRecordings(updated);
+      setComparisonModal(null);
+      setComparisonWasPlaying(false);
+    } catch (mergeError) {
+      setError(mergeError instanceof Error ? mergeError.message : String(mergeError));
+    }
+  }
+
   async function handleVolumeChange(nextVolume: number) {
     try {
       setPlayerState((current) => ({
@@ -1193,6 +1321,19 @@ function App() {
       </section>
 
       {error ? <section className="error-banner">{error}</section> : null}
+
+      {compareAnchor && !comparisonModal && (
+        <div className="compare-banner">
+          Right-click any other track to compare with <strong>{compareAnchor.title}</strong>
+          <button
+            className="compare-banner-cancel"
+            onClick={() => setCompareAnchor(null)}
+            type="button"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
 
       <section className="layout-grid">
         <section className="table-panel">
@@ -1553,8 +1694,8 @@ function App() {
                                   onContextMenu={(e) => {
                                     e.preventDefault();
                                     const path = recording.primary_source_path ?? recording.source_paths[0];
-                                    if (externalCommands.length === 0 || !path) return;
-                                    setContextMenu({ x: e.clientX, y: e.clientY, path });
+                                    if (!path && externalCommands.length === 0) return;
+                                    setContextMenu({ x: e.clientX, y: e.clientY, path: path ?? "", recording });
                                   }}
                                   title={
                                     recording.primary_source_id
@@ -1913,6 +2054,210 @@ function App() {
         </div>
       ) : null}
 
+      {comparisonModal && (() => {
+        const { recA, recB, step } = comparisonModal;
+        const durA = recA.duration_ms ?? 0;
+        const durB = recB.duration_ms ?? 0;
+
+        function fmtMs(ms: number) {
+          const s = Math.floor(ms / 1000);
+          return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+        }
+
+        function ScrubSide({ side, rec, durationMs }: { side: "A" | "B"; rec: RecordingRow; durationMs: number }) {
+          const isActive = comparisonActiveSide === side;
+          const posMs = isActive ? playerState.position_ms : (side === "A" ? comparisonSideAMs : comparisonSideBMs);
+          const canPlay = !!rec.primary_source_id;
+          return (
+            <div className="comparison-side">
+              <span className="comparison-side-label">{side === "A" ? "Recording A" : "Recording B"}</span>
+              <span className="comparison-side-title">{rec.title}</span>
+              <span className="comparison-side-artist">{rec.artist_credit_name ?? "Unknown Artist"}</span>
+              <span className="comparison-side-paths">{(rec.primary_source_path ?? rec.source_paths[0]) ?? "No local file"}</span>
+              <button
+                className={`comparison-listen-btn${isActive ? " active" : ""}`}
+                disabled={!canPlay}
+                onClick={() => { void handleComparisonSwitchSide(side); }}
+                title={canPlay ? (isActive ? (playerState.status === "playing" ? "Pause" : "Resume") : `Listen to ${side}`) : "No local file"}
+                type="button"
+              >
+                {isActive ? (playerState.status === "playing" ? "⏸ Pause" : "▶ Resume") : `▶ Listen to ${side}`}
+              </button>
+              <input
+                className="comparison-scrub"
+                disabled={durationMs <= 0 || !canPlay}
+                max={durationMs}
+                min={0}
+                onChange={(e) => { void handleComparisonScrubChange(side, Number(e.currentTarget.value)); }}
+                onPointerUp={(e) => { void handleComparisonScrubCommit(side, Number((e.currentTarget as HTMLInputElement).value)); }}
+                step={1}
+                type="range"
+                value={posMs}
+              />
+              <span className="comparison-time">{fmtMs(posMs)} / {fmtMs(durationMs)}</span>
+            </div>
+          );
+        }
+
+        const berDisplay = (() => {
+          if (comparisonBer === "loading") return <span>Computing similarity…</span>;
+          if (comparisonBer === "error") return <span className="similarity-different">Could not compute similarity</span>;
+          if (comparisonBer === null) return null;
+          const pct = ((1 - comparisonBer) * 100).toFixed(1);
+          const cls = comparisonBer < 0.4 ? "similarity-same" : comparisonBer < 0.6 ? "similarity-maybe" : "similarity-different";
+          const verdict = comparisonBer < 0.4 ? "Likely the same recording" : comparisonBer < 0.6 ? "Possibly the same recording" : "Likely different recordings";
+          return (
+            <span className={cls}>
+              {pct}% match (BER {comparisonBer.toFixed(3)}) — {verdict}
+            </span>
+          );
+        })();
+
+        if (step === "compare") {
+          return (
+            <div className="modal-overlay" onClick={closeComparisonModal}>
+              <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 700 }}>
+                <div className="modal-header">
+                  <h2>Compare Recordings</h2>
+                  <button className="modal-close-btn" onClick={closeComparisonModal} type="button">×</button>
+                </div>
+                <div className="comparison-grid">
+                  <ScrubSide side="A" rec={recA} durationMs={durA} />
+                  <ScrubSide side="B" rec={recB} durationMs={durB} />
+                </div>
+                <div className="comparison-similarity">
+                  {berDisplay}
+                </div>
+                <div className="comparison-modal-footer">
+                  <button className="comparison-cancel-btn" onClick={closeComparisonModal} type="button">Cancel</button>
+                  <button
+                    className="comparison-confirm-btn"
+                    onClick={() => setComparisonModal({ recA, recB, step: "merge" })}
+                    type="button"
+                  >
+                    Proceed to Merge…
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        // step === "merge"
+        const chosenTitle =
+          mergeTitleChoice === "A" ? recA.title
+          : mergeTitleChoice === "B" ? recB.title
+          : mergeTitleCustom;
+        return (
+          <div className="modal-overlay" onClick={closeComparisonModal}>
+            <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 500 }}>
+              <div className="modal-header">
+                <h2>Choose Metadata to Keep</h2>
+                <button className="modal-close-btn" onClick={closeComparisonModal} type="button">×</button>
+              </div>
+              <div className="merge-field-section">
+                <div className="merge-field-label">Title</div>
+                <label className="merge-field-option">
+                  <input
+                    checked={mergeTitleChoice === "A"}
+                    name="merge-title"
+                    onChange={() => setMergeTitleChoice("A")}
+                    type="radio"
+                  />
+                  A: {recA.title}
+                </label>
+                <label className="merge-field-option">
+                  <input
+                    checked={mergeTitleChoice === "B"}
+                    name="merge-title"
+                    onChange={() => setMergeTitleChoice("B")}
+                    type="radio"
+                  />
+                  B: {recB.title}
+                </label>
+                <label className="merge-field-option">
+                  <input
+                    checked={mergeTitleChoice === "custom"}
+                    name="merge-title"
+                    onChange={() => setMergeTitleChoice("custom")}
+                    type="radio"
+                  />
+                  Custom:
+                </label>
+                {mergeTitleChoice === "custom" && (
+                  <input
+                    className="merge-field-custom-input"
+                    onChange={(e) => setMergeTitleCustom(e.currentTarget.value)}
+                    placeholder="Enter title…"
+                    type="text"
+                    value={mergeTitleCustom}
+                  />
+                )}
+              </div>
+              <div className="merge-field-section">
+                <div className="merge-field-label">Artist</div>
+                <label className="merge-field-option">
+                  <input
+                    checked={mergeArtistChoice === "A"}
+                    name="merge-artist"
+                    onChange={() => setMergeArtistChoice("A")}
+                    type="radio"
+                  />
+                  A: {recA.artist_credit_name ?? "Unknown Artist"}
+                </label>
+                <label className="merge-field-option">
+                  <input
+                    checked={mergeArtistChoice === "B"}
+                    name="merge-artist"
+                    onChange={() => setMergeArtistChoice("B")}
+                    type="radio"
+                  />
+                  B: {recB.artist_credit_name ?? "Unknown Artist"}
+                </label>
+                <label className="merge-field-option">
+                  <input
+                    checked={mergeArtistChoice === "custom"}
+                    name="merge-artist"
+                    onChange={() => setMergeArtistChoice("custom")}
+                    type="radio"
+                  />
+                  Custom:
+                </label>
+                {mergeArtistChoice === "custom" && (
+                  <input
+                    className="merge-field-custom-input"
+                    onChange={(e) => setMergeArtistCustom(e.currentTarget.value)}
+                    placeholder="Artist name…"
+                    type="text"
+                    value={mergeArtistCustom}
+                  />
+                )}
+              </div>
+              <div className="comparison-modal-footer">
+                <button
+                  className="comparison-back-btn"
+                  onClick={() => setComparisonModal({ recA, recB, step: "compare" })}
+                  type="button"
+                >
+                  ← Back
+                </button>
+                <button
+                  className="comparison-confirm-btn"
+                  disabled={
+                    (mergeTitleChoice === "custom" && !chosenTitle.trim()) ||
+                    (mergeArtistChoice === "custom" && !mergeArtistCustom.trim())
+                  }
+                  onClick={() => { void handleCompleteMerge(); }}
+                  type="button"
+                >
+                  ✓ Complete Merge
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {contextMenu && (
         <>
           <div
@@ -1924,6 +2269,50 @@ function App() {
             className="ctx-menu"
             style={{ left: contextMenu.x, top: contextMenu.y }}
           >
+            {compareAnchor === null ? (
+              <li>
+                <button
+                  className="ctx-menu-item"
+                  type="button"
+                  onClick={() => {
+                    setCompareAnchor(contextMenu.recording);
+                    setContextMenu(null);
+                  }}
+                >
+                  Compare with another recording...
+                </button>
+              </li>
+            ) : compareAnchor.id !== contextMenu.recording.id ? (
+              <li>
+                <button
+                  className="ctx-menu-item"
+                  type="button"
+                  onClick={() => {
+                    void openComparisonModal(compareAnchor, contextMenu.recording);
+                    setCompareAnchor(null);
+                    setContextMenu(null);
+                  }}
+                >
+                  Compare with "{compareAnchor.title}"
+                </button>
+              </li>
+            ) : (
+              <li>
+                <button
+                  className="ctx-menu-item"
+                  type="button"
+                  onClick={() => {
+                    setCompareAnchor(null);
+                    setContextMenu(null);
+                  }}
+                >
+                  Cancel comparison mode
+                </button>
+              </li>
+            )}
+            {externalCommands.length > 0 && contextMenu.path && (
+              <li className="ctx-menu-divider" />
+            )}
             {externalCommands.map((cmd) => (
               <li key={cmd.name}>
                 <button

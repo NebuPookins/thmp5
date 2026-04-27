@@ -1287,3 +1287,162 @@ thead th {
 .ext-cmd-template-input {
   width: 220px !important;
 }
+
+/* ── Compare mode banner ───────────────────────────────────────────────── */
+.compare-banner {
+  background: #2a2a3a;
+  border-bottom: 1px solid #444;
+  padding: 6px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.85rem;
+  color: #ccc;
+  flex-shrink: 0;
+}
+.compare-banner strong { color: #fff; }
+.compare-banner-cancel {
+  margin-left: auto;
+  background: none;
+  border: 1px solid #666;
+  border-radius: 4px;
+  color: #aaa;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.compare-banner-cancel:hover { border-color: #aaa; color: #fff; }
+
+/* ── Context menu divider ──────────────────────────────────────────────── */
+.ctx-menu-divider {
+  height: 1px;
+  background: #444;
+  margin: 4px 0;
+  list-style: none;
+  pointer-events: none;
+}
+
+/* ── Comparison modal ──────────────────────────────────────────────────── */
+.comparison-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.comparison-side {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.comparison-side-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #777;
+}
+
+.comparison-side-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.comparison-side-artist { color: #aaa; font-size: 0.85rem; }
+
+.comparison-side-paths {
+  font-size: 0.7rem;
+  color: #666;
+  word-break: break-all;
+}
+
+.comparison-listen-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  border: 1px solid #555;
+  background: #333;
+  color: #ddd;
+  cursor: pointer;
+  width: fit-content;
+  margin-top: 4px;
+}
+.comparison-listen-btn:hover:not(:disabled) { border-color: #888; }
+.comparison-listen-btn.active { background: #4a7c59; border-color: #4a7c59; color: #fff; }
+.comparison-listen-btn:disabled { opacity: 0.4; cursor: default; }
+
+.comparison-scrub { width: 100%; margin-top: 2px; }
+
+.comparison-time { font-size: 0.75rem; color: #888; }
+
+.comparison-similarity {
+  padding: 10px;
+  background: #1e1e2e;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  text-align: center;
+  font-size: 0.9rem;
+}
+
+.similarity-same { color: #4caf50; }
+.similarity-maybe { color: #ff9800; }
+.similarity-different { color: #f44336; }
+
+.comparison-modal-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.comparison-confirm-btn {
+  background: #4a7c59;
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.comparison-confirm-btn:hover:not(:disabled) { background: #5a9c6a; }
+.comparison-confirm-btn:disabled { opacity: 0.5; cursor: default; }
+
+.comparison-cancel-btn,
+.comparison-back-btn {
+  background: #333;
+  color: #aaa;
+  border: 1px solid #555;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.comparison-cancel-btn:hover,
+.comparison-back-btn:hover { border-color: #888; color: #ddd; }
+
+/* ── Merge picker ──────────────────────────────────────────────────────── */
+.merge-field-section { margin-bottom: 16px; }
+
+.merge-field-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #777;
+  margin-bottom: 6px;
+}
+
+.merge-field-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  cursor: pointer;
+}
+
+.merge-field-custom-input {
+  display: block;
+  margin-left: 20px;
+  margin-top: 4px;
+  background: #1a1a2e;
+  border: 1px solid #555;
+  border-radius: 4px;
+  color: #eee;
+  padding: 4px 8px;
+  width: calc(100% - 24px);
+}
