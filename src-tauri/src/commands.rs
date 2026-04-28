@@ -1,7 +1,9 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::db::DbPool;
 use crate::file_issues::FileIssue;
-use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
+use crate::library::import::{
+    import_paths as do_import, prune_library, rescan_source as do_rescan_source,
+};
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
     FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats,
@@ -209,6 +211,7 @@ pub async fn rescan_source(
         source_path,
         state.acoustid_api_key.as_deref(),
         &state.write_serializer,
+        false,
     )
     .await
     .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()));
@@ -257,6 +260,7 @@ async fn rescan_path_list(
             source_path,
             state.acoustid_api_key.as_deref(),
             &state.write_serializer,
+            true,
         )
         .await
         {
@@ -267,6 +271,12 @@ async fn rescan_path_list(
     }
 
     *state.recordings_cache.write().await = None;
+
+    // Single prune pass after the batch, regardless of individual failures.
+    if let Err(e) = prune_library(&state.db).await {
+        tracing::warn!("Library pruning after batch rescan failed: {e}");
+    }
+
     if failures.is_empty() {
         Ok(())
     } else {
@@ -347,6 +357,36 @@ pub async fn rescan_sources_for_release_group(
 
     if paths.is_empty() {
         return Err("No local sources found for this album.".to_string());
+    }
+
+    rescan_path_list(&app, &state, paths).await
+}
+
+#[tauri::command]
+pub async fn rescan_all_sources(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let paths: Vec<String> = {
+        let mut conn = state
+            .db
+            .acquire("command.rescan_all_sources".to_string())
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query_scalar(
+            "SELECT DISTINCT s.file_path
+             FROM source s
+             WHERE s.source_type = 'local_file'
+               AND s.file_path IS NOT NULL
+             ORDER BY s.file_path",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?
+    };
+
+    if paths.is_empty() {
+        return Err("No local sources found in the library.".to_string());
     }
 
     rescan_path_list(&app, &state, paths).await

@@ -1118,6 +1118,15 @@ function App() {
     }
   }
 
+  async function handleRescanAll() {
+    setError(null);
+    try {
+      await invoke("rescan_all_sources");
+    } catch (scanError) {
+      setError(scanError instanceof Error ? scanError.message : String(scanError));
+    }
+  }
+
   async function saveQueueSettings() {
     const parsed = Number.parseInt(queueHistoryLimitInput, 10);
     if (!Number.isFinite(parsed) || parsed < 1) {
@@ -2277,7 +2286,14 @@ function App() {
                       onClick={handleRescan}
                       type="button"
                     >
-                      Rescan library
+                      Scan for new files
+                    </button>
+                    <button
+                      className="secondary-button"
+                      onClick={handleRescanAll}
+                      type="button"
+                    >
+                      Rescan all files
                     </button>
                   </div>
                 </div>

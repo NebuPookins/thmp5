@@ -98,6 +98,7 @@ pub async fn rescan_source(
     path: &Path,
     acoustid_key: Option<&str>,
     serializer: &Semaphore,
+    skip_prune: bool,
 ) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
     let mut conn = db
@@ -114,6 +115,16 @@ pub async fn rescan_source(
     .await
     .context("Failed to load source for rescan")?
     .ok_or_else(|| anyhow::anyhow!("Source not found for path: {}", path.display()))?;
+
+    let current_artist_id: Option<String> = sqlx::query_scalar(
+        "SELECT ra.artist_id
+         FROM recording_artist ra
+         WHERE ra.recording_id = ? AND ra.position = 0",
+    )
+    .bind(&existing_source.1)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("Failed to load current artist for rescan")?;
     drop(conn);
 
     let (source_id, recording_id) = existing_source;
@@ -185,12 +196,13 @@ pub async fn rescan_source(
 
     let artist_name = blocking
         .meta
-        .album_artist
+        .artist
         .as_deref()
-        .or(blocking.meta.artist.as_deref())
+        .or(blocking.meta.album_artist.as_deref())
         .unwrap_or("Unknown Artist")
         .to_string();
     let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
+    let artist_changed = current_artist_id.as_deref() != Some(&artist_id);
 
     let album_title = blocking
         .meta
@@ -252,12 +264,14 @@ pub async fn rescan_source(
 
     sync_tags_from_comment(&mut tx, &recording_id, blocking.meta.comment.as_deref()).await?;
 
-    sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
-        .bind(&recording_id)
-        .execute(&mut *tx)
-        .await
-        .context("Failed to replace recording artist during source rescan")?;
-    insert_recording_artist(&mut tx, &recording_id, &artist_id, 0, "main").await?;
+    if artist_changed {
+        sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
+            .bind(&recording_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to replace recording artist during source rescan")?;
+        insert_recording_artist(&mut tx, &recording_id, &artist_id, 0, "main").await?;
+    }
 
     if let Some(track_id) = existing_track_id {
         sqlx::query(
@@ -309,23 +323,25 @@ pub async fn rescan_source(
         .await
         .context("Failed to commit source rescan transaction")?;
 
-    let mut prune_conn = db
-        .acquire(format!("source_rescan.prune path={path_str}"))
-        .await
-        .context("Failed to acquire DB connection for source rescan cleanup")?;
-    prune_conn
-        .set_busy_timeout(std::time::Duration::from_secs(30))
-        .await
-        .context("Failed to set busy timeout for source rescan cleanup")?;
-    let mut prune_tx = prune_conn
-        .begin()
-        .await
-        .context("Failed to start source rescan cleanup transaction")?;
-    prune_empty_library_entities(&mut prune_tx).await?;
-    prune_tx
-        .commit()
-        .await
-        .context("Failed to commit source rescan cleanup transaction")?;
+    if !skip_prune {
+        let mut prune_conn = db
+            .acquire(format!("source_rescan.prune path={path_str}"))
+            .await
+            .context("Failed to acquire DB connection for source rescan cleanup")?;
+        prune_conn
+            .set_busy_timeout(std::time::Duration::from_secs(30))
+            .await
+            .context("Failed to set busy timeout for source rescan cleanup")?;
+        let mut prune_tx = prune_conn
+            .begin()
+            .await
+            .context("Failed to start source rescan cleanup transaction")?;
+        prune_empty_library_entities(&mut prune_tx).await?;
+        prune_tx
+            .commit()
+            .await
+            .context("Failed to commit source rescan cleanup transaction")?;
+    }
 
     tracing::info!(path = %path.display(), recording_id = %recording_id, source_id = %source_id, "Rescanned source");
     for warning in blocking.warnings {
@@ -560,9 +576,9 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
 
     // ── 7. Artist ─────────────────────────────────────────────────────────────
     let artist_name = meta
-        .album_artist
+        .artist
         .as_deref()
-        .or(meta.artist.as_deref())
+        .or(meta.album_artist.as_deref())
         .unwrap_or("Unknown Artist")
         .to_string();
     let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
@@ -943,6 +959,26 @@ async fn sync_tags_from_comment(
             .execute(&mut **tx)
             .await?;
     }
+    Ok(())
+}
+
+/// Run after a batch of rescans to clean up any orphaned library entities.
+pub async fn prune_library(db: &DbPool) -> Result<()> {
+    let mut conn = db
+        .acquire("prune_library".to_string())
+        .await
+        .context("Failed to acquire DB connection for library pruning")?;
+    conn.set_busy_timeout(std::time::Duration::from_secs(30))
+        .await
+        .context("Failed to set busy timeout for library pruning")?;
+    let mut tx = conn
+        .begin()
+        .await
+        .context("Failed to start library pruning transaction")?;
+    prune_empty_library_entities(&mut tx).await?;
+    tx.commit()
+        .await
+        .context("Failed to commit library pruning transaction")?;
     Ok(())
 }
 
