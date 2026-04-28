@@ -128,6 +128,19 @@ impl DbPool {
     }
 }
 
+impl TrackedConnection {
+    /// Sets `PRAGMA busy_timeout` on this connection so that write transactions
+    /// wait for the lock rather than immediately returning SQLITE_BUSY.
+    /// Call this before starting any write transaction that may contend with others.
+    pub async fn set_busy_timeout(&mut self, timeout: Duration) -> Result<()> {
+        let ms = timeout.as_millis() as u64;
+        sqlx::query(&format!("PRAGMA busy_timeout = {ms}"))
+            .execute(&mut *self.conn)
+            .await?;
+        Ok(())
+    }
+}
+
 impl Deref for TrackedConnection {
     type Target = SqliteConnection;
 

@@ -12,7 +12,9 @@ use crate::models::{
 use crate::query::{self, LimitUnit};
 use crate::AppState;
 use sqlx::{Row, Sqlite, Transaction};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tauri::Emitter;
 
 /// CTEs shared by list_recordings and evaluate_smart_playlist.
 /// Aggregating in CTEs replaces three correlated subqueries (one per row) with three
@@ -164,7 +166,11 @@ pub async fn trigger_library_scan(
 }
 
 #[tauri::command]
-pub async fn rescan_source(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn rescan_source(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err("Source path cannot be empty.".to_string());
@@ -175,41 +181,59 @@ pub async fn rescan_source(state: tauri::State<'_, AppState>, path: String) -> R
         return Err(format!("Source file is missing: {}", source_path.display()));
     }
 
-    do_rescan_source(&state.db, source_path, state.acoustid_api_key.as_deref())
+    let n = state.rescan_remaining.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = app.emit("rescan-remaining", n);
+
+    let result = do_rescan_source(&state.db, source_path, state.acoustid_api_key.as_deref())
         .await
-        .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()))?;
+        .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()));
+
+    let n = state.rescan_remaining.fetch_sub(1, Ordering::Relaxed) - 1;
+    let _ = app.emit("rescan-remaining", n);
+
     *state.recordings_cache.write().await = None;
-    Ok(())
+    result
 }
 
 #[tauri::command]
 pub async fn rescan_sources(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<(), String> {
     if paths.is_empty() {
         return Err("At least one source path is required.".to_string());
     }
+    let trimmed: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    rescan_path_list(&app, &state, trimmed).await
+}
+
+/// Shared loop: track per-file counter in AppState, emit "rescan-remaining" after each file.
+async fn rescan_path_list(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let count = paths.len() as i64;
+    let n = state.rescan_remaining.fetch_add(count, Ordering::Relaxed) + count;
+    let _ = app.emit("rescan-remaining", n);
 
     let mut failures = Vec::new();
-
     for path in paths {
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
-            return Err("Source path cannot be empty.".to_string());
-        }
-
-        let source_path = std::path::Path::new(trimmed);
+        let source_path = std::path::Path::new(&path);
         if !source_path.is_file() {
             failures.push(format!("{}: Source file is missing", source_path.display()));
-            continue;
-        }
-
-        if let Err(error) =
+        } else if let Err(error) =
             do_rescan_source(&state.db, source_path, state.acoustid_api_key.as_deref()).await
         {
             failures.push(format!("{}:\n{error:#}", source_path.display()));
         }
+        let n = state.rescan_remaining.fetch_sub(1, Ordering::Relaxed) - 1;
+        let _ = app.emit("rescan-remaining", n);
     }
 
     *state.recordings_cache.write().await = None;
@@ -222,6 +246,80 @@ pub async fn rescan_sources(
             failures.join("\n\n")
         ))
     }
+}
+
+#[tauri::command]
+pub async fn rescan_sources_for_artist(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    artist_id: String,
+) -> Result<(), String> {
+    let paths: Vec<String> = {
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.rescan_sources_for_artist artist_id={artist_id}"
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query_scalar(
+            "SELECT DISTINCT s.file_path
+             FROM source s
+             JOIN recording_artist ra ON ra.recording_id = s.recording_id
+             WHERE ra.artist_id = ?
+               AND s.source_type = 'local_file'
+               AND s.file_path IS NOT NULL
+             ORDER BY s.file_path",
+        )
+        .bind(&artist_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?
+    };
+
+    if paths.is_empty() {
+        return Err("No local sources found for this artist.".to_string());
+    }
+
+    rescan_path_list(&app, &state, paths).await
+}
+
+#[tauri::command]
+pub async fn rescan_sources_for_release_group(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    release_group_id: String,
+) -> Result<(), String> {
+    let paths: Vec<String> = {
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.rescan_sources_for_release_group release_group_id={release_group_id}"
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query_scalar(
+            "SELECT DISTINCT s.file_path
+             FROM source s
+             JOIN track t ON t.recording_id = s.recording_id
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             WHERE rel.release_group_id = ?
+               AND s.source_type = 'local_file'
+               AND s.file_path IS NOT NULL
+             ORDER BY s.file_path",
+        )
+        .bind(&release_group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?
+    };
+
+    if paths.is_empty() {
+        return Err("No local sources found for this album.".to_string());
+    }
+
+    rescan_path_list(&app, &state, paths).await
 }
 
 #[tauri::command]

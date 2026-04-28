@@ -16,6 +16,7 @@ use db::DbPool;
 use file_issues::FileIssueLog;
 use importer::ImportManager;
 use models::RecordingRow;
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -32,6 +33,9 @@ pub struct AppState {
     /// In-memory cache of all recordings, sorted by (lower(artist.sort_name), lower(title)).
     /// Populated on first `list_recordings` call; invalidated by any write that changes recording data.
     pub recordings_cache: RwLock<Option<Arc<Vec<RecordingRow>>>>,
+    /// Number of individual source files currently queued or in-progress for rescan.
+    /// Incremented before each file, decremented after; emits "rescan-remaining" events.
+    pub rescan_remaining: AtomicI64,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,6 +75,7 @@ pub fn run() {
                 log_file_path: log_path.display().to_string(),
                 file_issues,
                 recordings_cache: RwLock::new(None),
+                rescan_remaining: AtomicI64::new(0),
             };
 
             if let Ok(Some(root_path)) =
@@ -93,6 +98,8 @@ pub fn run() {
             commands::trigger_library_scan,
             commands::rescan_source,
             commands::rescan_sources,
+            commands::rescan_sources_for_artist,
+            commands::rescan_sources_for_release_group,
             commands::set_music_root,
             commands::update_queue_settings,
             commands::save_external_commands,

@@ -163,6 +163,10 @@ pub async fn rescan_source(db: &DbPool, path: &Path, acoustid_key: Option<&str>)
         .acquire(format!("source_rescan.transaction path={path_str}"))
         .await
         .context("Failed to acquire DB connection for source rescan transaction")?;
+    db_conn
+        .set_busy_timeout(std::time::Duration::from_secs(30))
+        .await
+        .context("Failed to set busy timeout for source rescan transaction")?;
     let mut tx = db_conn
         .begin()
         .await
@@ -298,6 +302,10 @@ pub async fn rescan_source(db: &DbPool, path: &Path, acoustid_key: Option<&str>)
         .acquire(format!("source_rescan.prune path={path_str}"))
         .await
         .context("Failed to acquire DB connection for source rescan cleanup")?;
+    prune_conn
+        .set_busy_timeout(std::time::Duration::from_secs(30))
+        .await
+        .context("Failed to set busy timeout for source rescan cleanup")?;
     let mut prune_tx = prune_conn
         .begin()
         .await
