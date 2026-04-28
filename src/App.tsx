@@ -164,7 +164,9 @@ type QueueItem = RecordingRow;
 
 type ContextMenuState =
   | { kind: "recording"; x: number; y: number; path: string; recording: RecordingRow }
-  | { kind: "source"; x: number; y: number; path: string; recording: RecordingRow };
+  | { kind: "source"; x: number; y: number; path: string; recording: RecordingRow }
+  | { kind: "artist"; x: number; y: number; artist_id: string; artist_name: string }
+  | { kind: "release_group"; x: number; y: number; release_group_id: string; title: string };
 
 const DEFAULT_PLAYER_STATE: PlayerState = {
   status: "stopped",
@@ -392,7 +394,6 @@ function App() {
   const [isSavingMusicRoot, setIsSavingMusicRoot] = useState(false);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const [isSubmittingWizard, setIsSubmittingWizard] = useState(false);
-  const [isRefreshingLibrary, setIsRefreshingLibrary] = useState(false);
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
   const [ratingKeyInFlight, setRatingKeyInFlight] = useState<string | null>(null);
   const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
@@ -432,6 +433,7 @@ function App() {
   const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
+  const [rescanRemaining, setRescanRemaining] = useState(0);
   const releaseGroupSearchInFlightRef = useRef(false);
   const releaseGroupPruneInFlightRef = useRef(false);
   const queuedReleaseGroupSearchRef = useRef<{ artistId: string | null; search: string } | null>(null);
@@ -715,7 +717,6 @@ function App() {
   }
 
   async function loadLibraryData(nextArtistId = selectedArtistId, nextSearch = search) {
-    setIsRefreshingLibrary(true);
     try {
       await loadRecordings();
       const artistRows = await loadArtists();
@@ -728,8 +729,6 @@ function App() {
     } catch (loadError) {
       await reportPoolTimeout("loadLibraryData", loadError);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
-    } finally {
-      setIsRefreshingLibrary(false);
     }
   }
 
@@ -883,7 +882,7 @@ function App() {
         : current
     ));
     setContextMenu((current) => (
-      current
+      current && (current.kind === "recording" || current.kind === "source")
         ? {
             ...current,
             recording: reconcileRecording(current.recording, recordingsById),
@@ -931,12 +930,18 @@ function App() {
           setError(event.payload.message);
         }
       });
+      const unlistenRescan = await listen<number>("rescan-remaining", (event) => {
+        if (isMounted) {
+          setRescanRemaining(Math.max(0, event.payload));
+        }
+      });
 
       return () => {
         unlistenState();
         unlistenPosition();
         unlistenEnded();
         unlistenError();
+        unlistenRescan();
       };
     }
 
@@ -1183,6 +1188,30 @@ function App() {
     try {
       setError(null);
       await invoke("rescan_sources", { paths });
+    } catch (rescanError) {
+      await reportPoolTimeout("source rescan", rescanError);
+      setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
+    } finally {
+      await loadLibraryData(selectedArtistId, search);
+    }
+  }
+
+  async function handleRescanArtist(artistId: string) {
+    try {
+      setError(null);
+      await invoke("rescan_sources_for_artist", { artistId });
+    } catch (rescanError) {
+      await reportPoolTimeout("source rescan", rescanError);
+      setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
+    } finally {
+      await loadLibraryData(selectedArtistId, search);
+    }
+  }
+
+  async function handleRescanReleaseGroup(releaseGroupId: string) {
+    try {
+      setError(null);
+      await invoke("rescan_sources_for_release_group", { releaseGroupId });
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
@@ -1482,6 +1511,9 @@ function App() {
   }
 
   const fingerprintCores = Math.min(6, Math.max(2, navigator.hardwareConcurrency ?? 4));
+  const contextMenuPath = contextMenu && (contextMenu.kind === "recording" || contextMenu.kind === "source")
+    ? contextMenu.path
+    : null;
 
   return (
     <main className="app-shell">
@@ -1654,6 +1686,10 @@ function App() {
                           onClick={() =>
                             setSelectedArtistId((current) => (current === artist.id ? null : artist.id))
                           }
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            setContextMenu({ kind: "artist", x: e.clientX, y: e.clientY, artist_id: artist.id, artist_name: artist.name });
+                          }}
                           type="button"
                         >
                           <strong>{artist.name}</strong>
@@ -1694,6 +1730,10 @@ function App() {
                               current === releaseGroup.id ? null : releaseGroup.id,
                             )
                           }
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            setContextMenu({ kind: "release_group", x: e.clientX, y: e.clientY, release_group_id: releaseGroup.id, title: releaseGroup.title });
+                          }}
                           onKeyDown={(event) => {
                             if (event.key === "Enter" || event.key === " ") {
                               event.preventDefault();
@@ -2213,14 +2253,6 @@ function App() {
                   <div className="modal-actions">
                     <button
                       className="secondary-button"
-                      disabled={isRefreshingLibrary}
-                      onClick={() => { void loadLibraryData(); }}
-                      type="button"
-                    >
-                      {isRefreshingLibrary ? "Refreshing…" : "Refresh library"}
-                    </button>
-                    <button
-                      className="secondary-button"
                       onClick={handleRescan}
                       type="button"
                     >
@@ -2662,29 +2694,59 @@ function App() {
                 </button>
               </li>
             )}
-            {externalCommands.length > 0 && contextMenu.path && (
-              <li className="ctx-menu-divider" />
-            )}
-            {externalCommands.map((cmd) => (
-              <li key={cmd.name}>
+            {contextMenu.kind === "artist" && (
+              <li>
                 <button
                   className="ctx-menu-item"
                   type="button"
                   onClick={() => {
-                    void handleSpawnExternalCommand(cmd.template, contextMenu.path);
+                    void handleRescanArtist(contextMenu.artist_id);
                     setContextMenu(null);
                   }}
                 >
-                  {cmd.name}
+                  Rescan sources
                 </button>
               </li>
+            )}
+            {contextMenu.kind === "release_group" && (
+              <li>
+                <button
+                  className="ctx-menu-item"
+                  type="button"
+                  onClick={() => {
+                    void handleRescanReleaseGroup(contextMenu.release_group_id);
+                    setContextMenu(null);
+                  }}
+                >
+                  Rescan sources
+                </button>
+              </li>
+            )}
+            {externalCommands.length > 0 && contextMenuPath && (
+              <li className="ctx-menu-divider" />
+            )}
+            {externalCommands.map((cmd) => (
+              contextMenuPath ? (
+                <li key={cmd.name}>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      void handleSpawnExternalCommand(cmd.template, contextMenuPath);
+                      setContextMenu(null);
+                    }}
+                  >
+                    {cmd.name}
+                  </button>
+                </li>
+              ) : null
             ))}
           </ul>
         </>
       )}
 
       <footer className="status-bar">
-        <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running ? "status-bar-indicator-active" : ""}`} />
+        <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running || rescanRemaining > 0 ? "status-bar-indicator-active" : ""}`} />
         <span>Scanned {bootstrap?.import_progress.scanned ?? 0}</span>
         <span className="status-bar-sep">·</span>
         <span>Imported {bootstrap?.import_progress.imported ?? 0}</span>
@@ -2706,6 +2768,12 @@ function App() {
             <span>
               Fingerprinting {bootstrap!.import_progress.fingerprinting_count} song{bootstrap!.import_progress.fingerprinting_count !== 1 ? "s" : ""} using {fingerprintCores} CPU core{fingerprintCores !== 1 ? "s" : ""}
             </span>
+          </>
+        ) : null}
+        {rescanRemaining > 0 ? (
+          <>
+            <span className="status-bar-sep">·</span>
+            <span>Rescanning {rescanRemaining} source{rescanRemaining !== 1 ? "s" : ""}</span>
           </>
         ) : null}
       </footer>
