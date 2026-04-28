@@ -595,3 +595,142 @@ pub fn extract_cover_art(path: &Path) -> Result<Option<String>> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(picture.data());
     Ok(Some(format!("data:{mime};base64,{encoded}")))
 }
+
+/// Read all ID3/text tag frames from a file, returning a list of (frame_id, field_name, value) tuples.
+/// Uses Lofty to open the file and extract all supported text tags.
+pub fn list_all_tags(path: &Path) -> Result<Vec<crate::models::SourceTagInfo>> {
+    use lofty::tag::Accessor;
+
+    let tagged_file = Probe::open(path)
+        .context("Failed to open file for tag reading")?
+        .guess_file_type()
+        .context("Failed to detect file type")?
+        .read()?;
+
+    let mut tags: Vec<crate::models::SourceTagInfo> = Vec::new();
+
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag());
+
+    let Some(tag) = tag else {
+        return Ok(tags);
+    };
+
+    // Standard fields via Accessor trait
+    if let Some(v) = tag.title() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TIT2".into(),
+            field_name: "title".into(),
+            value: v.into_owned(),
+        });
+    }
+    if let Some(v) = tag.artist() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TPE1".into(),
+            field_name: "artist".into(),
+            value: v.into_owned(),
+        });
+    }
+    if let Some(v) = tag.album() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TALB".into(),
+            field_name: "album".into(),
+            value: v.into_owned(),
+        });
+    }
+    if let Some(v) = tag.genre() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TCON".into(),
+            field_name: "genre".into(),
+            value: v.into_owned(),
+        });
+    }
+    if let Some(v) = tag.comment() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "COMM".into(),
+            field_name: "comment".into(),
+            value: v.into_owned(),
+        });
+    }
+    if let Some(v) = tag.year() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TYER".into(),
+            field_name: "year".into(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = tag.track() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TRCK".into(),
+            field_name: "track_number".into(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = tag.track_total() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TRCK".into(),
+            field_name: "track_total".into(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = tag.disk() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TPOS".into(),
+            field_name: "disc_number".into(),
+            value: v.to_string(),
+        });
+    }
+
+    // Extended fields via individual lookups using get_string
+    // (ItemKey enum is not publicly accessible in this lofty version)
+    for (key_name, field_key) in [
+        ("album_artist", ItemKey::AlbumArtist),
+        ("bpm", ItemKey::Bpm),
+        ("composer", ItemKey::Composer),
+        ("conductor", ItemKey::Conductor),
+        ("publisher", ItemKey::Publisher),
+        ("lyricist", ItemKey::Lyricist),
+        ("encoder_settings", ItemKey::EncoderSettings),
+        ("musicbrainz_track_id", ItemKey::MusicBrainzTrackId),
+        ("musicbrainz_release_id", ItemKey::MusicBrainzReleaseId),
+        ("musicbrainz_artist_id", ItemKey::MusicBrainzArtistId),
+        (
+            "musicbrainz_release_group_id",
+            ItemKey::MusicBrainzReleaseGroupId,
+        ),
+        ("replaygain_track_gain", ItemKey::ReplayGainTrackGain),
+        ("replaygain_track_peak", ItemKey::ReplayGainTrackPeak),
+        ("replaygain_album_gain", ItemKey::ReplayGainAlbumGain),
+        ("replaygain_album_peak", ItemKey::ReplayGainAlbumPeak),
+        ("initial_key", ItemKey::InitialKey),
+        ("language", ItemKey::Language),
+        ("original_artist", ItemKey::OriginalArtist),
+        ("copyright_url", ItemKey::CopyrightUrl),
+        ("original_release_date", ItemKey::OriginalReleaseDate),
+    ] {
+        if let Some(v) = tag.get_string(&field_key) {
+            tags.push(crate::models::SourceTagInfo {
+                frame_id: key_name.to_string(),
+                field_name: key_name.to_string(),
+                value: v.to_string(),
+            });
+        }
+    }
+
+    // Also scan raw tag items for any user-defined (TXXX) frames
+    for item in tag.items() {
+        let key_desc = format!("{:?}", item.key());
+        if key_desc.contains("TXXX") || key_desc.contains("UserText") {
+            if let Some(text) = item.value().text() {
+                tags.push(crate::models::SourceTagInfo {
+                    frame_id: key_desc,
+                    field_name: "user_text".into(),
+                    value: text.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(tags)
+}

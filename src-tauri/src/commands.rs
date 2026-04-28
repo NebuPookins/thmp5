@@ -3,12 +3,12 @@ use crate::db::DbPool;
 use crate::file_issues::FileIssue;
 use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
-    AppBootstrap, AppConfig, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
+    AppBootstrap, AppConfig, ArtistDetail, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
     FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats,
     InitialSetupRequest, LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow,
-    QueueSettingsUpdate, RatingUpdateRequest, RecordingRatingUpdateResult, RecordingRow,
-    ReleaseGroupRow, ReleaseInfo, SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult,
-    VolumeRequest,
+    QueueSettingsUpdate, RatingUpdateRequest, RecordingDetail, RecordingRatingUpdateResult,
+    RecordingRow, ReleaseGroupDetail, ReleaseGroupRow, ReleaseInfo, SaveSmartPlaylistRequest,
+    SeekRequest, SmartPlaylistResult, SourceDetail, VolumeRequest,
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
@@ -1778,5 +1778,351 @@ async fn load_library_summary(db: &crate::db::DbPool) -> anyhow::Result<LibraryS
         artist_count,
         release_group_count,
         source_count,
+    })
+}
+
+#[tauri::command]
+pub async fn get_artist_detail(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<ArtistDetail, String> {
+    let mut conn = state
+        .db
+        .acquire(format!("command.get_artist_detail id={id}"))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Artist base info
+    let artist_row = sqlx::query(
+        "SELECT a.id, a.name, a.sort_name, a.mbid,
+                AVG(ur.stars) AS rating,
+                MAX(ph.played_at) AS last_played,
+                COUNT(DISTINCT ra.recording_id) AS recording_count
+         FROM artist a
+         LEFT JOIN recording_artist ra ON ra.artist_id = a.id
+         LEFT JOIN user_rating ur ON ur.recording_id = ra.recording_id
+         LEFT JOIN play_history ph ON ph.recording_id = ra.recording_id
+         WHERE a.id = ?
+         GROUP BY a.id",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("Artist {id} not found"))?;
+
+    // Release groups for this artist
+    let rg_rows = sqlx::query(
+        "SELECT rg.id, rg.title, rg.rg_type,
+                MIN(rel.release_date) AS release_date,
+                COUNT(DISTINCT t.recording_id) AS recording_count,
+                (SELECT AVG(ur2.stars)
+                 FROM release rel2
+                 JOIN medium m2 ON m2.release_id = rel2.id
+                 JOIN track t2 ON t2.medium_id = m2.id
+                 JOIN user_rating ur2 ON ur2.recording_id = t2.recording_id
+                 WHERE rel2.release_group_id = rg.id) AS rating,
+                COALESCE(rg.artist_credit_text, rga.credited_as, a2.name) AS artist_credit_name,
+                a2.id AS primary_artist_id
+         FROM release_group rg
+         JOIN release_group_artist rga ON rga.release_group_id = rg.id AND rga.position = 0
+         JOIN artist a2 ON a2.id = rga.artist_id
+         LEFT JOIN release rel ON rel.release_group_id = rg.id
+         LEFT JOIN medium m ON m.release_id = rel.id
+         LEFT JOIN track t ON t.medium_id = m.id
+         WHERE rga.artist_id = ?
+         GROUP BY rg.id
+         ORDER BY rg.title",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let release_groups: Vec<crate::models::ArtistReleaseGroup> = rg_rows
+        .into_iter()
+        .map(|row| crate::models::ArtistReleaseGroup {
+            id: row.get("id"),
+            title: row.get("title"),
+            rg_type: row.get("rg_type"),
+            release_date: row.get("release_date"),
+            recording_count: row.get::<Option<i64>, _>("recording_count").unwrap_or(0),
+            rating: row.get("rating"),
+            primary_artist_id: row.get("primary_artist_id"),
+            artist_credit_name: row.get("artist_credit_name"),
+        })
+        .collect();
+
+    Ok(ArtistDetail {
+        id: artist_row.get("id"),
+        name: artist_row.get("name"),
+        sort_name: artist_row.get("sort_name"),
+        mbid: artist_row.get("mbid"),
+        rating: artist_row.get("rating"),
+        last_played: artist_row.get("last_played"),
+        recording_count: artist_row
+            .get::<Option<i64>, _>("recording_count")
+            .unwrap_or(0),
+        release_group_count: release_groups.len() as i64,
+        release_groups,
+    })
+}
+
+#[tauri::command]
+pub async fn get_release_group_detail(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<ReleaseGroupDetail, String> {
+    let mut conn = state
+        .db
+        .acquire(format!("command.get_release_group_detail id={id}"))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Release group base info
+    let rg_row = sqlx::query(
+        "SELECT rg.id, rg.title, rg.rg_type,
+                COALESCE(rg.artist_credit_text, rga.credited_as, a.name) AS artist_credit_name,
+                a.id AS primary_artist_id,
+                MIN(rel.release_date) AS release_date,
+                (SELECT AVG(ur2.stars)
+                 FROM release rel2
+                 JOIN medium m2 ON m2.release_id = rel2.id
+                 JOIN track t2 ON t2.medium_id = m2.id
+                 JOIN user_rating ur2 ON ur2.recording_id = t2.recording_id
+                 WHERE rel2.release_group_id = rg.id) AS rating,
+                (SELECT MAX(ph2.played_at)
+                 FROM release rel2
+                 JOIN medium m2 ON m2.release_id = rel2.id
+                 JOIN track t2 ON t2.medium_id = m2.id
+                 JOIN play_history ph2 ON ph2.recording_id = t2.recording_id
+                 WHERE rel2.release_group_id = rg.id) AS last_played
+         FROM release_group rg
+         LEFT JOIN release_group_artist rga ON rga.release_group_id = rg.id AND rga.position = 0
+         LEFT JOIN artist a ON a.id = rga.artist_id
+         LEFT JOIN release rel ON rel.release_group_id = rg.id
+         WHERE rg.id = ?
+         GROUP BY rg.id",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("Release group {id} not found"))?;
+
+    // Releases with mediums and tracks
+    let release_rows = sqlx::query(
+        "SELECT rel.id AS release_id, rel.title AS release_title,
+                rel.release_date, rel.country, rel.label, rel.catalog_number
+         FROM release rel
+         WHERE rel.release_group_id = ?
+         ORDER BY rel.release_date, rel.title",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut releases = Vec::new();
+    for rel_row in release_rows {
+        let release_id: String = rel_row.get("release_id");
+
+        let medium_rows = sqlx::query(
+            "SELECT m.id AS medium_id, m.position, m.format
+             FROM medium m
+             WHERE m.release_id = ?
+             ORDER BY m.position",
+        )
+        .bind(&release_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let mut mediums = Vec::new();
+        for med_row in medium_rows {
+            let medium_id: String = med_row.get("medium_id");
+
+            let track_rows = sqlx::query(
+                "SELECT t.id, t.position, t.title, t.duration_ms,
+                        r.id AS recording_id, r.title AS recording_title,
+                        COALESCE(ra.credited_as, a.name) AS artist_credit_name,
+                        a.id AS primary_artist_id
+                 FROM track t
+                 JOIN recording r ON r.id = t.recording_id
+                 LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
+                 LEFT JOIN artist a ON a.id = ra.artist_id
+                 WHERE t.medium_id = ?
+                 ORDER BY t.position",
+            )
+            .bind(&medium_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let tracks = track_rows
+                .into_iter()
+                .map(|trow| crate::models::TrackDetail {
+                    id: trow.get("id"),
+                    position: trow.get("position"),
+                    title: trow.get("title"),
+                    duration_ms: trow.get("duration_ms"),
+                    recording_id: trow.get("recording_id"),
+                    recording_title: trow.get("recording_title"),
+                    artist_credit_name: trow.get("artist_credit_name"),
+                    primary_artist_id: trow.get("primary_artist_id"),
+                })
+                .collect();
+
+            mediums.push(crate::models::MediumDetail {
+                id: medium_id,
+                position: med_row.get("position"),
+                format: med_row.get("format"),
+                tracks,
+            });
+        }
+
+        releases.push(crate::models::ReleaseDetail {
+            id: release_id,
+            title: rel_row.get("release_title"),
+            release_date: rel_row.get("release_date"),
+            country: rel_row.get("country"),
+            label: rel_row.get("label"),
+            catalog_number: rel_row.get("catalog_number"),
+            mediums,
+        });
+    }
+
+    Ok(ReleaseGroupDetail {
+        id: rg_row.get("id"),
+        title: rg_row.get("title"),
+        rg_type: rg_row.get("rg_type"),
+        artist_credit_name: rg_row.get("artist_credit_name"),
+        primary_artist_id: rg_row.get("primary_artist_id"),
+        rating: rg_row.get("rating"),
+        last_played: rg_row.get("last_played"),
+        release_date: rg_row.get("release_date"),
+        releases,
+    })
+}
+
+#[tauri::command]
+pub async fn get_recording_detail(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<RecordingDetail, String> {
+    let mut conn = state
+        .db
+        .acquire(format!("command.get_recording_detail id={id}"))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let row = sqlx::query(
+        "SELECT r.id, r.title, r.duration_ms, r.genre, r.bpm, r.comment,
+                r.artist_credit_text, r.mbid, r.acoustid,
+                COALESCE(ra.credited_as, a.name) AS artist_credit_name,
+                a.id AS primary_artist_id,
+                ur.stars AS rating,
+                COALESCE(ph.play_count, 0) AS play_count,
+                ph.last_played
+         FROM recording r
+         LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
+         LEFT JOIN artist a ON a.id = ra.artist_id
+         LEFT JOIN user_rating ur ON ur.recording_id = r.id
+         LEFT JOIN (
+             SELECT recording_id, COUNT(*) AS play_count, MAX(played_at) AS last_played
+             FROM play_history GROUP BY recording_id
+         ) ph ON ph.recording_id = r.id
+         WHERE r.id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("Recording {id} not found"))?;
+
+    // Releases for this recording
+    let release_rows = sqlx::query(
+        "SELECT rg.id AS release_group_id, rg.title AS release_group_title,
+                t.position AS track_position, m.position AS disc_position
+         FROM track t
+         JOIN medium m ON m.id = t.medium_id
+         JOIN release rel ON rel.id = m.release_id
+         JOIN release_group rg ON rg.id = rel.release_group_id
+         WHERE t.recording_id = ?
+         ORDER BY rg.title, m.position, t.position",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let releases = release_rows
+        .into_iter()
+        .map(|rrow| ReleaseInfo {
+            release_group_id: rrow.get("release_group_id"),
+            release_group_title: rrow.get("release_group_title"),
+            track_position: rrow.get("track_position"),
+            disc_position: rrow.get("disc_position"),
+        })
+        .collect();
+
+    // Sources for this recording
+    let source_rows = sqlx::query(
+        "SELECT s.id, s.source_type, s.file_path, s.format, s.duration_ms,
+                s.replay_gain_track_db, s.replay_gain_track_peak
+         FROM source s
+         WHERE s.recording_id = ?
+         ORDER BY s.source_type, s.file_path",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut sources = Vec::new();
+    for srow in source_rows {
+        let file_path: Option<String> = srow.get("file_path");
+        let source_type: String = srow.get("source_type");
+
+        let tags = if let Some(ref path_str) = file_path {
+            if source_type == "local_file" {
+                crate::library::scanner::list_all_tags(std::path::Path::new(path_str))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        sources.push(SourceDetail {
+            id: srow.get("id"),
+            source_type,
+            file_path,
+            format: srow.get("format"),
+            duration_ms: srow.get("duration_ms"),
+            replay_gain_track_db: srow.get("replay_gain_track_db"),
+            replay_gain_track_peak: srow.get("replay_gain_track_peak"),
+            tags,
+        });
+    }
+
+    Ok(RecordingDetail {
+        id: row.get("id"),
+        title: row.get("title"),
+        duration_ms: row.get("duration_ms"),
+        genre: row.get("genre"),
+        bpm: row.get("bpm"),
+        comment: row.get("comment"),
+        artist_credit_name: row.get("artist_credit_name"),
+        primary_artist_id: row.get("primary_artist_id"),
+        artist_credit_text: row.get("artist_credit_text"),
+        mbid: row.get("mbid"),
+        acoustid: row.get("acoustid"),
+        rating: row.get("rating"),
+        play_count: row.get::<Option<i64>, _>("play_count").unwrap_or(0),
+        last_played: row.get("last_played"),
+        releases,
+        sources,
     })
 }

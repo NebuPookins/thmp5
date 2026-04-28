@@ -2,6 +2,7 @@ import { FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } fr
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import "./App.css";
 
 type LibrarySummary = {
@@ -433,6 +434,7 @@ function App() {
   const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
+  const [detailView, setDetailView] = useState<DetailNav | null>(null);
   const [pendingJobs, setPendingJobs] = useState(0);
   const [currentJobType, setCurrentJobType] = useState("");
   const releaseGroupSearchInFlightRef = useRef(false);
@@ -1859,7 +1861,13 @@ function App() {
             </section>
 
             <section className="track-column">
-              {browserLeftTab === "smartplaylists" ? (
+              {detailView ? (
+                <EntityDetailView
+                  nav={detailView}
+                  onNavigate={(nav) => setDetailView(nav)}
+                  onClose={() => setDetailView(null)}
+                />
+              ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">
                   {smartResult ? (
                     <>
@@ -2623,6 +2631,19 @@ function App() {
           >
             {contextMenu.kind === "recording" && (
               <>
+                <li>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      setDetailView({ type: "recording", id: contextMenu.recording.id });
+                      setContextMenu(null);
+                    }}
+                  >
+                    View details
+                  </button>
+                </li>
+                <li className="ctx-menu-divider" />
                 {contextMenu.recording.source_paths.length === 1 ? (
                   <li>
                     <button
@@ -2722,32 +2743,60 @@ function App() {
               </li>
             )}
             {contextMenu.kind === "artist" && (
-              <li>
-                <button
-                  className="ctx-menu-item"
-                  type="button"
-                  onClick={() => {
-                    void handleRescanArtist(contextMenu.artist_id);
-                    setContextMenu(null);
-                  }}
-                >
-                  Rescan sources
-                </button>
-              </li>
+              <>
+                <li>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      setDetailView({ type: "artist", id: contextMenu.artist_id });
+                      setContextMenu(null);
+                    }}
+                  >
+                    View details
+                  </button>
+                </li>
+                <li>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      void handleRescanArtist(contextMenu.artist_id);
+                      setContextMenu(null);
+                    }}
+                  >
+                    Rescan sources
+                  </button>
+                </li>
+              </>
             )}
             {contextMenu.kind === "release_group" && (
-              <li>
-                <button
-                  className="ctx-menu-item"
-                  type="button"
-                  onClick={() => {
-                    void handleRescanReleaseGroup(contextMenu.release_group_id);
-                    setContextMenu(null);
-                  }}
-                >
-                  Rescan sources
-                </button>
-              </li>
+              <>
+                <li>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      setDetailView({ type: "release_group", id: contextMenu.release_group_id });
+                      setContextMenu(null);
+                    }}
+                  >
+                    View details
+                  </button>
+                </li>
+                <li>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      void handleRescanReleaseGroup(contextMenu.release_group_id);
+                      setContextMenu(null);
+                    }}
+                  >
+                    Rescan sources
+                  </button>
+                </li>
+              </>
             )}
             {externalCommands.length > 0 && contextMenuPath && (
               <li className="ctx-menu-divider" />

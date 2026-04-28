@@ -296,3 +296,113 @@ pub struct SaveSmartPlaylistRequest {
     pub name: String,
     pub query: String,
 }
+
+// ── Entity detail view types ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtistDetail {
+    pub id: String,
+    pub name: String,
+    pub sort_name: String,
+    pub mbid: Option<String>,
+    pub rating: Option<f64>,
+    pub last_played: Option<String>,
+    pub recording_count: i64,
+    pub release_group_count: i64,
+    pub release_groups: Vec<ArtistReleaseGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtistReleaseGroup {
+    pub id: String,
+    pub title: String,
+    pub rg_type: Option<String>,
+    pub release_date: Option<String>,
+    pub recording_count: i64,
+    pub rating: Option<f64>,
+    pub primary_artist_id: Option<String>,
+    pub artist_credit_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseGroupDetail {
+    pub id: String,
+    pub title: String,
+    pub rg_type: Option<String>,
+    pub artist_credit_name: Option<String>,
+    pub primary_artist_id: Option<String>,
+    pub rating: Option<f64>,
+    pub last_played: Option<String>,
+    pub release_date: Option<String>,
+    pub releases: Vec<ReleaseDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseDetail {
+    pub id: String,
+    pub title: String,
+    pub release_date: Option<String>,
+    pub country: Option<String>,
+    pub label: Option<String>,
+    pub catalog_number: Option<String>,
+    pub mediums: Vec<MediumDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediumDetail {
+    pub id: String,
+    pub position: i64,
+    pub format: Option<String>,
+    pub tracks: Vec<TrackDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackDetail {
+    pub id: String,
+    pub position: i64,
+    pub title: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub recording_id: String,
+    pub recording_title: String,
+    pub artist_credit_name: Option<String>,
+    pub primary_artist_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingDetail {
+    pub id: String,
+    pub title: String,
+    pub duration_ms: Option<i64>,
+    pub genre: Option<String>,
+    pub bpm: Option<f64>,
+    pub comment: Option<String>,
+    pub artist_credit_name: Option<String>,
+    pub primary_artist_id: Option<String>,
+    pub artist_credit_text: Option<String>,
+    pub mbid: Option<String>,
+    pub acoustid: Option<String>,
+    pub rating: Option<i64>,
+    pub play_count: i64,
+    pub last_played: Option<String>,
+    pub releases: Vec<ReleaseInfo>,
+    pub sources: Vec<SourceDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDetail {
+    pub id: String,
+    pub source_type: String,
+    pub file_path: Option<String>,
+    pub format: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub replay_gain_track_db: Option<f64>,
+    pub replay_gain_track_peak: Option<f64>,
+    pub tags: Vec<SourceTagInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceTagInfo {
+    pub frame_id: String,
+    pub field_name: String,
+    pub value: String,
+}

@@ -135,6 +135,9 @@ pub fn run() {
             commands::get_file_issues,
             commands::compare_recordings,
             commands::merge_recordings,
+            commands::get_artist_detail,
+            commands::get_release_group_detail,
+            commands::get_recording_detail,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

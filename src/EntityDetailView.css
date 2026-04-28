@@ -1,0 +1,273 @@
+/* ── Entity detail panel ──────────────────────────────────────────────────── */
+
+.entity-detail-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  height: 100%;
+}
+
+.entity-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.entity-detail-body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+
+.entity-detail-hero {
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid rgba(149, 173, 198, 0.12);
+}
+
+.entity-detail-hero h2 {
+  margin: 0 0 4px;
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+.entity-detail-hero p {
+  margin: 2px 0;
+}
+
+.entity-detail-stats {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: #8fa5c2;
+}
+
+/* ── Sections ─────────────────────────────────────────────────────────────── */
+
+.entity-detail-section {
+  margin-bottom: 18px;
+}
+
+.entity-detail-section-title {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #b9c9dc;
+}
+
+.entity-detail-section-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+/* ── Links ────────────────────────────────────────────────────────────────── */
+
+.entity-link {
+  background: none;
+  border: none;
+  color: #7ab8ff;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-decoration-color: rgba(122, 184, 255, 0.3);
+  text-underline-offset: 2px;
+  transition: color 120ms ease, text-decoration-color 120ms ease;
+}
+
+.entity-link:hover {
+  color: #aad0ff;
+  text-decoration-color: rgba(170, 208, 255, 0.6);
+}
+
+/* ── Lists ────────────────────────────────────────────────────────────────── */
+
+.entity-detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.entity-detail-list-item {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(149, 173, 198, 0.08);
+}
+
+.entity-detail-list-item-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.entity-detail-list-item-meta {
+  font-size: 0.8rem;
+  color: #8fa5c2;
+  margin-top: 2px;
+}
+
+/* ── Badges ───────────────────────────────────────────────────────────────── */
+
+.entity-detail-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(101, 125, 154, 0.18);
+  color: #b9c9dc;
+}
+
+/* ── Medium / disc ────────────────────────────────────────────────────────── */
+
+.entity-detail-medium {
+  margin: 10px 0;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 10px;
+  border: 1px solid rgba(149, 173, 198, 0.06);
+}
+
+.entity-detail-medium-label {
+  margin: 0 0 6px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #b9c9dc;
+}
+
+/* ── Track table ──────────────────────────────────────────────────────────── */
+
+.entity-detail-track-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: auto;
+  font-size: 0.85rem;
+}
+
+.entity-detail-track-table th {
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(124, 148, 177, 0.12);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8fa5c2;
+  text-align: left;
+}
+
+.entity-detail-track-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid rgba(124, 148, 177, 0.06);
+}
+
+.entity-detail-track-table tbody tr:hover {
+  background: rgba(73, 135, 255, 0.06);
+}
+
+/* ── Meta table ───────────────────────────────────────────────────────────── */
+
+.entity-detail-meta-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.entity-detail-meta-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid rgba(124, 148, 177, 0.06);
+}
+
+.entity-detail-meta-table td:first-child {
+  width: 140px;
+  color: #8fa5c2;
+  font-weight: 500;
+}
+
+/* ── Source sections ──────────────────────────────────────────────────────── */
+
+.entity-detail-source {
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.15);
+  border: 1px solid rgba(149, 173, 198, 0.06);
+  margin-bottom: 8px;
+}
+
+.entity-detail-source-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.entity-detail-source-path {
+  font-size: 0.78rem;
+  font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+  color: #8a9ab0;
+  word-break: break-all;
+  margin: 2px 0;
+  line-height: 1.4;
+}
+
+/* ── ID3 Tags table ───────────────────────────────────────────────────────── */
+
+.entity-detail-tags-section {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(149, 173, 198, 0.08);
+}
+
+.entity-detail-tags-label {
+  margin: 0 0 4px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #8fa5c2;
+}
+
+.entity-detail-tags-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.entity-detail-tags-table th {
+  padding: 3px 6px;
+  border-bottom: 1px solid rgba(124, 148, 177, 0.1);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #7a93b0;
+  text-align: left;
+}
+
+.entity-detail-tags-table td {
+  padding: 3px 6px;
+  border-bottom: 1px solid rgba(124, 148, 177, 0.04);
+  vertical-align: top;
+}
+
+.entity-detail-tags-table tbody tr:hover {
+  background: rgba(73, 135, 255, 0.04);
+}
+
+.entity-detail-tag-value {
+  word-break: break-all;
+  max-width: 300px;
+}
+
+.entity-detail-monospace {
+  font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+  font-size: 0.78rem;
+}
