@@ -76,7 +76,8 @@ const RECORDING_CTES: &str = "
              rg2.id || char(1) ||
              rg2.title || char(1) ||
              COALESCE(CAST(t2.position AS TEXT), '') || char(1) ||
-             COALESCE(CAST(m2.position AS TEXT), '') AS entry
+             COALESCE(CAST(m2.position AS TEXT), '') || char(1) ||
+             COALESCE(CAST((SELECT MAX(m3.position) FROM medium m3 WHERE m3.release_id = rel2.id) AS TEXT), '') AS entry
       FROM track t2
       JOIN medium m2         ON m2.id = t2.medium_id
       JOIN release rel2      ON rel2.id = m2.release_id
@@ -871,7 +872,7 @@ fn parse_recording_row(row: &sqlx::sqlite::SqliteRow) -> RecordingRow {
                 r.split('\0')
                     .filter(|s| !s.is_empty())
                     .map(|entry| {
-                        let mut parts = entry.splitn(4, '\x01');
+                        let mut parts = entry.splitn(5, '\x01');
                         let release_group_id = parts.next().unwrap_or("").to_string();
                         let release_group_title = parts.next().unwrap_or("").to_string();
                         let track_position =
@@ -894,11 +895,22 @@ fn parse_recording_row(row: &sqlx::sqlite::SqliteRow) -> RecordingRow {
                                     }
                                 },
                             );
+                        let disc_total =
+                            parts.next().and_then(
+                                |s| {
+                                    if s.is_empty() {
+                                        None
+                                    } else {
+                                        s.parse().ok()
+                                    }
+                                },
+                            );
                         ReleaseInfo {
                             release_group_id,
                             release_group_title,
                             track_position,
                             disc_position,
+                            disc_total,
                         }
                     })
                     .collect()
@@ -1283,7 +1295,7 @@ pub async fn evaluate_smart_playlist(
                     r.split('\0')
                         .filter(|s| !s.is_empty())
                         .map(|entry| {
-                            let mut parts = entry.splitn(4, '\x01');
+                            let mut parts = entry.splitn(5, '\x01');
                             let release_group_id = parts.next().unwrap_or("").to_string();
                             let release_group_title = parts.next().unwrap_or("").to_string();
                             let track_position = parts.next().and_then(|s| {
@@ -1300,11 +1312,19 @@ pub async fn evaluate_smart_playlist(
                                     s.parse().ok()
                                 }
                             });
+                            let disc_total = parts.next().and_then(|s| {
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    s.parse().ok()
+                                }
+                            });
                             ReleaseInfo {
                                 release_group_id,
                                 release_group_title,
                                 track_position,
                                 disc_position,
+                                disc_total,
                             }
                         })
                         .collect()
@@ -2083,7 +2103,8 @@ pub async fn get_recording_detail(
     // Releases for this recording
     let release_rows = sqlx::query(
         "SELECT rg.id AS release_group_id, rg.title AS release_group_title,
-                t.position AS track_position, m.position AS disc_position
+                t.position AS track_position, m.position AS disc_position,
+                (SELECT MAX(m3.position) FROM medium m3 WHERE m3.release_id = rel.id) AS disc_total
          FROM track t
          JOIN medium m ON m.id = t.medium_id
          JOIN release rel ON rel.id = m.release_id
@@ -2103,6 +2124,7 @@ pub async fn get_recording_detail(
             release_group_title: rrow.get("release_group_title"),
             track_position: rrow.get("track_position"),
             disc_position: rrow.get("disc_position"),
+            disc_total: rrow.get("disc_total"),
         })
         .collect();
 

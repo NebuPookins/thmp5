@@ -133,6 +133,7 @@ pub struct ReleaseInfo {
     pub release_group_title: String,
     pub track_position: Option<i64>,
     pub disc_position: Option<i64>,
+    pub disc_total: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

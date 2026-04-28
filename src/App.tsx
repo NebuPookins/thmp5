@@ -72,6 +72,7 @@ type ReleaseInfo = {
   release_group_title: string;
   track_position: number | null;
   disc_position: number | null;
+  disc_total: number | null;
 };
 
 type RecordingRow = {
@@ -2031,7 +2032,7 @@ function App() {
                                     {recording.releases.length === 0
                                       ? "—"
                                       : recording.releases.map((rel, i) => {
-                                          const pos = rel.disc_position && rel.disc_position > 1
+                                          const pos = rel.disc_total && rel.disc_total > 1 && rel.disc_position
                                             ? `${rel.disc_position}.${rel.track_position ?? "—"}`
                                             : rel.track_position != null
                                               ? String(rel.track_position)

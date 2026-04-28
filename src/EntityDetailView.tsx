@@ -28,6 +28,7 @@ type ReleaseInfo = {
   release_group_title: string;
   track_position: number | null;
   disc_position: number | null;
+  disc_total: number | null;
 };
 
 // ── Artist detail types ─────────────────────────────────────────────────────
@@ -428,7 +429,7 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
               <h3 className="entity-detail-section-title">Appears on</h3>
               <div className="entity-detail-list">
                 {recording.releases.map((rel, i) => {
-                  const pos = rel.disc_position && rel.disc_position > 1
+                  const pos = rel.disc_total && rel.disc_total > 1 && rel.disc_position
                     ? `Disc ${rel.disc_position}, Track ${rel.track_position ?? "—"}`
                     : rel.track_position != null
                       ? `Track ${rel.track_position}`
