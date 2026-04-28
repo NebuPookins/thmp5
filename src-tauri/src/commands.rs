@@ -1,4 +1,5 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
+use crate::db::DbPool;
 use crate::file_issues::FileIssue;
 use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
@@ -11,10 +12,29 @@ use crate::models::{
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
-use sqlx::{Row, Sqlite, Transaction};
+use serde::Serialize;
+use sqlx::{Acquire, Row, Sqlite, Transaction};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Emitter;
+
+#[derive(Clone, Serialize)]
+struct JobUpdate {
+    remaining: i64,
+    job_type: String,
+}
+
+/// Emit a `job-update` event so the frontend can show the queue status.
+fn emit_job_update(app: &tauri::AppHandle, state: &AppState, job_type: &str) {
+    let remaining = state.pending_jobs.load(Ordering::Relaxed);
+    let _ = app.emit(
+        "job-update",
+        JobUpdate {
+            remaining,
+            job_type: job_type.to_string(),
+        },
+    );
+}
 
 /// CTEs shared by list_recordings and evaluate_smart_playlist.
 /// Aggregating in CTEs replaces three correlated subqueries (one per row) with three
@@ -181,15 +201,20 @@ pub async fn rescan_source(
         return Err(format!("Source file is missing: {}", source_path.display()));
     }
 
-    let n = state.rescan_remaining.fetch_add(1, Ordering::Relaxed) + 1;
-    let _ = app.emit("rescan-remaining", n);
+    state.pending_jobs.fetch_add(1, Ordering::Relaxed);
+    emit_job_update(&app, &state, "rescan");
 
-    let result = do_rescan_source(&state.db, source_path, state.acoustid_api_key.as_deref())
-        .await
-        .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()));
+    let result = do_rescan_source(
+        &state.db,
+        source_path,
+        state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
+    )
+    .await
+    .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()));
 
-    let n = state.rescan_remaining.fetch_sub(1, Ordering::Relaxed) - 1;
-    let _ = app.emit("rescan-remaining", n);
+    state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+    emit_job_update(&app, &state, "rescan");
 
     *state.recordings_cache.write().await = None;
     result
@@ -212,28 +237,33 @@ pub async fn rescan_sources(
     rescan_path_list(&app, &state, trimmed).await
 }
 
-/// Shared loop: track per-file counter in AppState, emit "rescan-remaining" after each file.
+/// Shared loop: track per-file counter in AppState, emit `job-update` after each file.
 async fn rescan_path_list(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<(), String> {
     let count = paths.len() as i64;
-    let n = state.rescan_remaining.fetch_add(count, Ordering::Relaxed) + count;
-    let _ = app.emit("rescan-remaining", n);
+    state.pending_jobs.fetch_add(count, Ordering::Relaxed);
+    emit_job_update(app, state, "rescan");
 
     let mut failures = Vec::new();
     for path in paths {
         let source_path = std::path::Path::new(&path);
         if !source_path.is_file() {
             failures.push(format!("{}: Source file is missing", source_path.display()));
-        } else if let Err(error) =
-            do_rescan_source(&state.db, source_path, state.acoustid_api_key.as_deref()).await
+        } else if let Err(error) = do_rescan_source(
+            &state.db,
+            source_path,
+            state.acoustid_api_key.as_deref(),
+            &state.write_serializer,
+        )
+        .await
         {
             failures.push(format!("{}:\n{error:#}", source_path.display()));
         }
-        let n = state.rescan_remaining.fetch_sub(1, Ordering::Relaxed) - 1;
-        let _ = app.emit("rescan-remaining", n);
+        state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+        emit_job_update(app, state, "rescan");
     }
 
     *state.recordings_cache.write().await = None;
@@ -1355,6 +1385,63 @@ pub async fn delete_playlist(state: tauri::State<'_, AppState>, id: i64) -> Resu
         .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_recording(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    state.pending_jobs.fetch_add(1, Ordering::Relaxed);
+    emit_job_update(&app, &state, "delete");
+
+    let _permit = state
+        .write_serializer
+        .acquire()
+        .await
+        .map_err(|e| format!("Failed to acquire write lock for delete: {e}"))?;
+
+    let result = delete_recording_inner(&state.db, &id).await;
+    drop(_permit);
+
+    state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+    emit_job_update(&app, &state, "delete");
+
+    *state.recordings_cache.write().await = None;
+    result
+}
+
+async fn delete_recording_inner(db: &DbPool, id: &str) -> Result<(), String> {
+    let mut conn = db
+        .acquire(format!("command.delete_recording_inner id={id}"))
+        .await
+        .map_err(|e| e.to_string())?;
+    conn.set_busy_timeout(std::time::Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
+
+    // track.recording_id has no ON DELETE CASCADE
+    sqlx::query("DELETE FROM track WHERE recording_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // CASCADE deletes source, recording_artist, recording_tag, user_rating, play_history
+    sqlx::query("DELETE FROM recording WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    prune_empty_library_entities(&mut tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 

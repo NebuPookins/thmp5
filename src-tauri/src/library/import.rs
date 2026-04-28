@@ -8,6 +8,7 @@ use sqlx::{Connection, Sqlite, Transaction};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -92,7 +93,12 @@ pub async fn import_paths(
     Ok(stats)
 }
 
-pub async fn rescan_source(db: &DbPool, path: &Path, acoustid_key: Option<&str>) -> Result<()> {
+pub async fn rescan_source(
+    db: &DbPool,
+    path: &Path,
+    acoustid_key: Option<&str>,
+    serializer: &Semaphore,
+) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
     let mut conn = db
         .acquire(format!("source_rescan.lookup path={path_str}"))
@@ -158,6 +164,11 @@ pub async fn rescan_source(db: &DbPool, path: &Path, acoustid_key: Option<&str>)
         },
         _ => None,
     };
+
+    let _permit = serializer
+        .acquire()
+        .await
+        .context("Failed to acquire write serializer for source rescan")?;
 
     let mut db_conn = db
         .acquire(format!("source_rescan.transaction path={path_str}"))
@@ -520,6 +531,24 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         return Ok(true);
     }
 
+    // ── 6. If re-importing (existing source found), look up the recording
+    //    to reuse so that we don't orphan the original recording. ─────────────
+    let existing_recording_id: Option<String> = if existing_source_id.is_some() {
+        let mut conn = db
+            .acquire(format!(
+                "import.store.lookup_recording_for_reimport path={path_str}"
+            ))
+            .await
+            .context("Failed to acquire DB connection for existing recording lookup")?;
+        sqlx::query_scalar::<_, String>("SELECT recording_id FROM source WHERE id = ?")
+            .bind(existing_source_id.as_deref().unwrap())
+            .fetch_optional(&mut *conn)
+            .await
+            .context("Failed to look up existing recording for source")?
+    } else {
+        None
+    };
+
     let mut conn = db
         .acquire(format!("import.store.transaction path={path_str}"))
         .await
@@ -529,7 +558,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         .await
         .context("Failed to start import transaction")?;
 
-    // ── 6. Artist ─────────────────────────────────────────────────────────────
+    // ── 7. Artist ─────────────────────────────────────────────────────────────
     let artist_name = meta
         .album_artist
         .as_deref()
@@ -538,12 +567,54 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         .to_string();
     let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
 
-    // ── 7. Find or create Recording (3-level dedup) ───────────────────────────
-    let recording_id =
-        find_or_create_recording(&mut tx, &meta, &artist_id, acoustid_match.as_ref()).await?;
+    // ── 8. Find or create Recording ───────────────────────────────────────────
+    let recording_id = if let Some(ref rec_id) = existing_recording_id {
+        // Re-import of a file that already existed — update the existing recording
+        // in place rather than creating a new one (which would leave the original
+        // recording orphaned with no sources).
+        let title = meta.title.as_deref().unwrap_or("Unknown Title");
+        let acoustid_value = acoustid_match.as_ref().map(|a| a.acoustid.as_str());
+        let recording_mbid_value = acoustid_match
+            .as_ref()
+            .and_then(|a| a.recording_mbid.as_deref());
+        sqlx::query(
+            "UPDATE recording
+             SET title = ?,
+                 duration_ms = ?,
+                 genre = ?,
+                 bpm = ?,
+                 comment = ?,
+                 acoustid = COALESCE(?, acoustid),
+                 mbid = COALESCE(?, mbid)
+             WHERE id = ?",
+        )
+        .bind(title)
+        .bind(meta.duration_ms as i64)
+        .bind(&meta.genre)
+        .bind(meta.bpm)
+        .bind(&meta.comment)
+        .bind(acoustid_value)
+        .bind(recording_mbid_value)
+        .bind(rec_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to update recording during re-import")?;
+
+        // Replace recording artist (handles artist metadata changes).
+        sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
+            .bind(rec_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to replace recording artist during re-import")?;
+        insert_recording_artist(&mut tx, rec_id, &artist_id, 0, "main").await?;
+
+        rec_id.clone()
+    } else {
+        find_or_create_recording(&mut tx, &meta, &artist_id, acoustid_match.as_ref()).await?
+    };
     sync_tags_from_comment(&mut tx, &recording_id, meta.comment.as_deref()).await?;
 
-    // ── 8. ReleaseGroup / Release / Medium ────────────────────────────────────
+    // ── 9. ReleaseGroup / Release / Medium ────────────────────────────────────
     let album_title = meta.album.as_deref().unwrap_or("Unknown Album").to_string();
     let release_group_id = get_or_create_release_group(&mut tx, &album_title, &artist_id).await?;
 
@@ -559,7 +630,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
     let disc = meta.disc_number.unwrap_or(1) as i64;
     let medium_id = get_or_create_medium(&mut tx, &release_id, disc).await?;
 
-    // ── 9. Track ──────────────────────────────────────────────────────────────
+    // ── 10. Track ─────────────────────────────────────────────────────────────
     let track_position = meta.track_number.unwrap_or(0) as i64;
     get_or_create_track(&mut tx, &medium_id, &recording_id, track_position).await?;
 

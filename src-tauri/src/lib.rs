@@ -19,7 +19,7 @@ use models::RecordingRow;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tauri::Manager;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 pub struct AppState {
     pub db: DbPool,
@@ -33,9 +33,12 @@ pub struct AppState {
     /// In-memory cache of all recordings, sorted by (lower(artist.sort_name), lower(title)).
     /// Populated on first `list_recordings` call; invalidated by any write that changes recording data.
     pub recordings_cache: RwLock<Option<Arc<Vec<RecordingRow>>>>,
-    /// Number of individual source files currently queued or in-progress for rescan.
-    /// Incremented before each file, decremented after; emits "rescan-remaining" events.
-    pub rescan_remaining: AtomicI64,
+    /// Total number of background jobs (rescans + deletes) queued or in-progress.
+    /// Used for UI progress display and to decide when to invalidate cache.
+    pub pending_jobs: AtomicI64,
+    /// Serializes write operations (rescan, delete) so only one DB writer is active at a time,
+    /// preventing SQLITE_BUSY / "database is locked" errors under concurrent access.
+    pub write_serializer: Semaphore,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -75,7 +78,8 @@ pub fn run() {
                 log_file_path: log_path.display().to_string(),
                 file_issues,
                 recordings_cache: RwLock::new(None),
-                rescan_remaining: AtomicI64::new(0),
+                pending_jobs: AtomicI64::new(0),
+                write_serializer: Semaphore::new(1),
             };
 
             if let Ok(Some(root_path)) =
@@ -127,6 +131,7 @@ pub fn run() {
             commands::list_playlists,
             commands::save_smart_playlist,
             commands::delete_playlist,
+            commands::delete_recording,
             commands::get_file_issues,
             commands::compare_recordings,
             commands::merge_recordings,

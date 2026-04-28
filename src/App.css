@@ -1275,6 +1275,14 @@ thead th {
   background: rgba(101, 125, 154, 0.22);
 }
 
+.ctx-menu-item-danger {
+  color: #f47a7a;
+}
+
+.ctx-menu-item-danger:hover {
+  background: rgba(244, 122, 122, 0.15);
+}
+
 /* ── External commands settings ──────────────────────────────────────────── */
 
 .ext-cmd-hint {

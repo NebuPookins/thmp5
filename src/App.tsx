@@ -433,7 +433,8 @@ function App() {
   const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
-  const [rescanRemaining, setRescanRemaining] = useState(0);
+  const [pendingJobs, setPendingJobs] = useState(0);
+  const [currentJobType, setCurrentJobType] = useState("");
   const releaseGroupSearchInFlightRef = useRef(false);
   const releaseGroupPruneInFlightRef = useRef(false);
   const queuedReleaseGroupSearchRef = useRef<{ artistId: string | null; search: string } | null>(null);
@@ -930,9 +931,13 @@ function App() {
           setError(event.payload.message);
         }
       });
-      const unlistenRescan = await listen<number>("rescan-remaining", (event) => {
+      const unlistenJobUpdate = await listen<{remaining: number; job_type: string}>("job-update", (event) => {
         if (isMounted) {
-          setRescanRemaining(Math.max(0, event.payload));
+          setPendingJobs(Math.max(0, event.payload.remaining));
+          setCurrentJobType(event.payload.job_type);
+          if (event.payload.remaining <= 0 && !bootstrap?.import_progress.is_running) {
+            void loadLibraryData(selectedArtistId, search);
+          }
         }
       });
 
@@ -941,7 +946,7 @@ function App() {
         unlistenPosition();
         unlistenEnded();
         unlistenError();
-        unlistenRescan();
+        unlistenJobUpdate();
       };
     }
 
@@ -1218,6 +1223,14 @@ function App() {
     } finally {
       await loadLibraryData(selectedArtistId, search);
     }
+  }
+
+  function handleDeleteRecording(recordingId: string) {
+    // Fire-and-forget: the job-update event system will auto-refresh when the queue drains.
+    setError(null);
+    invoke("delete_recording", { id: recordingId }).catch((deleteError) => {
+      setError(deleteError instanceof Error ? deleteError.message : String(deleteError));
+    });
   }
 
   function openRecordingContextMenu(e: React.MouseEvent, recording: RecordingRow) {
@@ -2678,6 +2691,20 @@ function App() {
                     </button>
                   </li>
                 )}
+                {contextMenu.recording.source_paths.length === 0 && (
+                  <li>
+                    <button
+                      className="ctx-menu-item ctx-menu-item-danger"
+                      type="button"
+                      onClick={() => {
+                        void handleDeleteRecording(contextMenu.recording.id);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Delete recording
+                    </button>
+                  </li>
+                )}
               </>
             )}
             {contextMenu.kind === "source" && (
@@ -2746,7 +2773,7 @@ function App() {
       )}
 
       <footer className="status-bar">
-        <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running || rescanRemaining > 0 ? "status-bar-indicator-active" : ""}`} />
+        <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running || pendingJobs > 0 ? "status-bar-indicator-active" : ""}`} />
         <span>Scanned {bootstrap?.import_progress.scanned ?? 0}</span>
         <span className="status-bar-sep">·</span>
         <span>Imported {bootstrap?.import_progress.imported ?? 0}</span>
@@ -2770,10 +2797,10 @@ function App() {
             </span>
           </>
         ) : null}
-        {rescanRemaining > 0 ? (
+        {pendingJobs > 0 ? (
           <>
             <span className="status-bar-sep">·</span>
-            <span>Rescanning {rescanRemaining} source{rescanRemaining !== 1 ? "s" : ""}</span>
+            <span>{currentJobType === "delete" ? "Deleting" : "Processing"} {pendingJobs} job{pendingJobs !== 1 ? "s" : ""}</span>
           </>
         ) : null}
       </footer>
