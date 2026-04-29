@@ -10,6 +10,7 @@ mod logging;
 mod models;
 pub mod query;
 mod sleep_inhibitor;
+mod waveform;
 
 use audio::AudioEngineHandle;
 use db::DbPool;
@@ -127,6 +128,7 @@ pub fn run() {
             commands::set_volume,
             commands::stop,
             commands::get_cover_art,
+            commands::get_waveform,
             commands::list_all_tags,
             commands::evaluate_smart_playlist,
             commands::list_playlists,

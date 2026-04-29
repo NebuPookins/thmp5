@@ -1154,6 +1154,44 @@ pub async fn prune_empty_library_entities_command(
 }
 
 #[tauri::command]
+pub async fn get_waveform(
+    state: tauri::State<'_, AppState>,
+    recording_id: String,
+) -> Result<Vec<f32>, String> {
+    let mut conn = state
+        .db
+        .acquire(format!("command.get_waveform recording_id={recording_id}"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let file_path: Option<String> = sqlx::query_scalar(
+        "SELECT file_path FROM source
+         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
+         ORDER BY file_path LIMIT 1",
+    )
+    .bind(&recording_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .flatten();
+
+    let Some(path) = file_path else {
+        return Err("No file found for this recording".to_string());
+    };
+
+    let data = tokio::task::spawn_blocking(move || {
+        crate::waveform::compute_waveform(
+            std::path::Path::new(&path),
+            crate::waveform::WAVEFORM_RESOLUTION,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    Ok(data)
+}
+
+#[tauri::command]
 pub async fn get_cover_art(
     state: tauri::State<'_, AppState>,
     recording_id: String,

@@ -400,6 +400,9 @@ function App() {
   const [isSavingQueueSettings, setIsSavingQueueSettings] = useState(false);
   const [ratingKeyInFlight, setRatingKeyInFlight] = useState<string | null>(null);
   const [playerCoverArt, setPlayerCoverArt] = useState<string | null>(null);
+  const [waveformData, setWaveformData] = useState<number[] | null>(null);
+  const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
+  const waveformContainerRef = useRef<HTMLDivElement>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"options" | "issues">("options");
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
@@ -1001,13 +1004,102 @@ function App() {
   useEffect(() => {
     if (!playerState.recording_id) {
       setPlayerCoverArt(null);
+      setWaveformData(null);
       return;
     }
     void invoke<string | null>("get_cover_art", { recordingId: playerState.recording_id }).then(
       (art) => setPlayerCoverArt(art),
       () => setPlayerCoverArt(null),
     );
+    void invoke<number[]>("get_waveform", { recordingId: playerState.recording_id }).then(
+      setWaveformData,
+      () => setWaveformData(null),
+    );
   }, [playerState.recording_id]);
+
+  // Draw waveform on canvas whenever data, position, or container size changes.
+  useEffect(() => {
+    const canvas = waveformCanvasRef.current;
+    const container = waveformContainerRef.current;
+    if (!canvas || !container || !waveformData || waveformData.length === 0) {
+      return;
+    }
+
+    let animFrameId: number;
+
+    function draw() {
+      const dpr = window.devicePixelRatio || 1;
+      const canvas = waveformCanvasRef.current;
+      const container = waveformContainerRef.current;
+      const data = waveformData;
+      if (!canvas || !container || !data || data.length === 0) return;
+      const rect = container.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
+      if (w <= 0 || h <= 0) return;
+
+      // Resize canvas backing store only when needed (avoids flicker)
+      if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(h * dpr);
+        canvas.style.width = `${w}px`;
+        canvas.style.height = `${h}px`;
+      }
+
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      // Calculate the split point for played vs unplayed
+      const playRatio = activeDurationMs > 0
+        ? Math.min(playerState.position_ms / activeDurationMs, 1)
+        : 0;
+      const splitX = w * playRatio;
+
+      const barWidth = w / data.length;
+      const midY = h / 2;
+      const maxBarHeight = Math.max(h * 0.85, 2);
+
+      // Draw dim (unplayed) portion first — full waveform in dim color
+      ctx.fillStyle = "rgba(143, 165, 194, 0.25)";
+      for (let i = 0; i < data.length; i++) {
+        const barHeight = Math.max(data[i] * maxBarHeight, 1);
+        const x = i * barWidth;
+        ctx.fillRect(x, midY - barHeight / 2, Math.max(1, barWidth - 1), barHeight);
+      }
+
+      // Draw bright (played) portion on top — clipped to the left of splitX
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, splitX, h);
+      ctx.clip();
+
+      ctx.fillStyle = "#efb15a";
+      for (let i = 0; i < data.length; i++) {
+        const barHeight = Math.max(data[i] * maxBarHeight, 1);
+        const x = i * barWidth;
+        ctx.fillRect(x, midY - barHeight / 2, Math.max(1, barWidth - 1), barHeight);
+      }
+
+      ctx.restore();
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      cancelAnimationFrame(animFrameId);
+      animFrameId = requestAnimationFrame(draw);
+    });
+    resizeObserver.observe(container);
+
+    // Initial draw
+    animFrameId = requestAnimationFrame(draw);
+
+    return () => {
+      cancelAnimationFrame(animFrameId);
+      resizeObserver.disconnect();
+    };
+  }, [waveformData, playerState.position_ms, activeDurationMs]);
 
   useEffect(() => {
     if (!comparisonModal) {
@@ -1575,7 +1667,8 @@ function App() {
           >⏭</button>
         </div>
 
-        <div className="now-playing-block">
+        <div className="now-playing-block" ref={waveformContainerRef}>
+          <canvas className="waveform-canvas" ref={waveformCanvasRef} />
           <div className="now-playing-meta">
             <div className="now-playing-text">
               <div className="now-playing-title">
@@ -1589,26 +1682,31 @@ function App() {
                   : "Queue a track from the library"}
               </div>
             </div>
+            <div style={{ flex: 1 }} />
             {currentTrack ? (
-              <RatingStars
+              <span className="now-playing-rating">
+                <RatingStars
                 disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
                 onRate={handleRate}
                 recordingId={currentTrack.id}
                 value={currentTrack.rating}
               />
+              </span>
             ) : null}
           </div>
           <div className="topbar-scrubber">
             <span>{formatDuration(playerState.position_ms)}</span>
-            <input
-              className="slider-input"
-              disabled={!currentTrack || activeDurationMs <= 0}
-              max={activeDurationMs || 0}
-              min={0}
-              onChange={(event) => { void handleSeek(Number(event.currentTarget.value)); }}
-              type="range"
-              value={Math.min(playerState.position_ms, activeDurationMs || 0)}
-            />
+            <div className="scrubber-waveform-container">
+              <input
+                className="slider-input"
+                disabled={!currentTrack || activeDurationMs <= 0}
+                max={activeDurationMs || 0}
+                min={0}
+                onChange={(event) => { void handleSeek(Number(event.currentTarget.value)); }}
+                type="range"
+                value={Math.min(playerState.position_ms, activeDurationMs || 0)}
+              />
+            </div>
             <span>{formatDuration(activeDurationMs)}</span>
           </div>
         </div>
