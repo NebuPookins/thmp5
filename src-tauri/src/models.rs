@@ -262,12 +262,21 @@ pub struct TrackMetadata {
 pub struct MetadataReadResult {
     pub meta: TrackMetadata,
     pub warning: Option<String>,
+    pub all_tags: Vec<TagProperty>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TaglibHelperResponse {
     pub meta: TrackMetadata,
     pub warning: Option<String>,
+    #[serde(default)]
+    pub all_tags: Vec<TagProperty>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagProperty {
+    pub key: String,
+    pub value: String,
 }
 
 // ── Query engine ──────────────────────────────────────────────────────────────

@@ -204,13 +204,45 @@ std::optional<uint32_t> parse_u32(const std::optional<std::string>& value) {
   try {
     std::size_t used = 0;
     const auto parsed = std::stoul(*value, &used, 10);
-    if (used != value->size()) {
-      return std::nullopt;
+    // Accept full-string parse (e.g. "2009" -> 2009).
+    if (used == value->size()) {
+      return static_cast<uint32_t>(parsed);
     }
-    return static_cast<uint32_t>(parsed);
   } catch (...) {
+  }
+  // Try parsing just the part before '/' for "1/13" style values.
+  const auto slash = value->find('/');
+  if (slash != std::string::npos) {
+    try {
+      std::size_t used = 0;
+      const auto parsed = std::stoul(value->substr(0, slash), &used, 10);
+      if (used == slash) {
+        return static_cast<uint32_t>(parsed);
+      }
+    } catch (...) {
+    }
+  }
+  return std::nullopt;
+}
+
+/// Parse the part after '/' in "1/13" style values (e.g. track_total, disc_total).
+std::optional<uint32_t> parse_second_u32(const std::optional<std::string>& value) {
+  if (!value || value->empty()) {
     return std::nullopt;
   }
+  const auto slash = value->find('/');
+  if (slash == std::string::npos || slash + 1 >= value->size()) {
+    return std::nullopt;
+  }
+  try {
+    std::size_t used = 0;
+    const auto parsed = std::stoul(value->substr(slash + 1), &used, 10);
+    if (used == value->size() - slash - 1) {
+      return static_cast<uint32_t>(parsed);
+    }
+  } catch (...) {
+  }
+  return std::nullopt;
 }
 
 std::string lower_ext(std::string_view path) {
@@ -248,6 +280,23 @@ void print_json_u32_field(std::ostream& out, const char* key,
 
 void print_json_null_field(std::ostream& out, const char* key) {
   out << '"' << key << "\":null";
+}
+
+/// Output all properties from the TagLib property map as a JSON array of {key, value} objects.
+void print_all_properties(std::ostream& out, const TagLib::PropertyMap& props) {
+  out << '"' << "all_tags" << "\":[";
+  bool first = true;
+  for (const auto& [key, values] : props) {
+    if (!values.isEmpty()) {
+      if (!first) out << ',';
+      first = false;
+      out << '{'
+          << '"' << "key" << "\":\"" << json_escape(key.to8Bit(true)) << '"' << ','
+          << '"' << "value" << "\":\"" << json_escape(values.front().to8Bit(true)) << '"'
+          << '}';
+    }
+  }
+  out << ']';
 }
 
 }  // namespace
@@ -296,10 +345,15 @@ int main(int argc, char** argv) {
 
     const auto year =
         parse_u32(first_present({first_property(props, "DATE"), first_property(props, "YEAR")}));
-    const auto track_number = parse_u32(
-        first_present({first_property(props, "TRACKNUMBER"), first_property(props, "TRACK")}));
-    const auto track_total = parse_u32(
+    const auto track_number =
+        parse_u32(first_present({first_property(props, "TRACKNUMBER"), first_property(props, "TRACK")}));
+    const auto track_number_raw =
+        first_present({first_property(props, "TRACKNUMBER"), first_property(props, "TRACK")});
+    const auto track_total_val = parse_u32(
         first_present({first_property(props, "TRACKTOTAL"), first_property(props, "TOTALTRACKS")}));
+    // Fall back to parsing the second component from "1/13" style TRACKNUMBER.
+    const auto track_total = track_total_val ? track_total_val
+        : (track_number_raw ? parse_second_u32(track_number_raw) : std::optional<uint32_t>{});
     const auto disc_number =
         parse_u32(first_present({first_property(props, "DISCNUMBER"), first_property(props, "DISC")}));
 
@@ -348,6 +402,8 @@ int main(int argc, char** argv) {
     std::cout << ',';
     print_json_null_field(std::cout, "replay_gain_album_peak");
     std::cout << "},";
+    print_all_properties(std::cout, props);
+    std::cout << ',';
     std::cout
         << "\"warning\":\"Recovered metadata with TagLib sidecar after Lofty rejected the tags.\"";
     std::cout << '}';

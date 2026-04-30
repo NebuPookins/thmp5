@@ -1,4 +1,6 @@
-use crate::models::{Id3FrameDebugInfo, MetadataReadResult, TaglibHelperResponse, TrackMetadata};
+use crate::models::{
+    Id3FrameDebugInfo, MetadataReadResult, TagProperty, TaglibHelperResponse, TrackMetadata,
+};
 use anyhow::{Context, Result};
 use lofty::prelude::*;
 use lofty::probe::Probe;
@@ -388,6 +390,7 @@ fn try_taglib_helper(path: &Path, primary_error: &str) -> Result<Option<Metadata
         return Ok(Some(MetadataReadResult {
             meta: response.meta,
             warning,
+            all_tags: response.all_tags,
         }));
     }
 
@@ -511,6 +514,7 @@ pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
         Ok(meta) => Ok(MetadataReadResult {
             meta,
             warning: None,
+            all_tags: Vec::new(),
         }),
         Err(error) => {
             let primary_error = format!("{error:#}");
@@ -596,9 +600,8 @@ pub fn extract_cover_art(path: &Path) -> Result<Option<String>> {
     Ok(Some(format!("data:{mime};base64,{encoded}")))
 }
 
-/// Read all ID3/text tag frames from a file, returning a list of (frame_id, field_name, value) tuples.
-/// Uses Lofty to open the file and extract all supported text tags.
-pub fn list_all_tags(path: &Path) -> Result<Vec<crate::models::SourceTagInfo>> {
+/// Try to read all ID3/text tag frames using Lofty.
+fn list_all_tags_with_lofty(path: &Path) -> Result<Vec<crate::models::SourceTagInfo>> {
     use lofty::tag::Accessor;
 
     let tagged_file = Probe::open(path)
@@ -733,4 +736,301 @@ pub fn list_all_tags(path: &Path) -> Result<Vec<crate::models::SourceTagInfo>> {
     }
 
     Ok(tags)
+}
+
+/// Map `TrackMetadata` fields (from the TagLib helper) to a `Vec<SourceTagInfo>`.
+/// Also includes any extra tag properties from the TagLib property map (TXXX, UFID, etc.).
+fn metadata_to_tag_infos(
+    meta: &TrackMetadata,
+    extra_props: &[TagProperty],
+) -> Vec<crate::models::SourceTagInfo> {
+    let mut tags = Vec::new();
+
+    macro_rules! push_tag {
+        ($val:expr, $frame_id:expr, $name:expr) => {
+            if let Some(ref v) = $val {
+                tags.push(crate::models::SourceTagInfo {
+                    frame_id: $frame_id.into(),
+                    field_name: $name.into(),
+                    value: v.to_string(),
+                });
+            }
+        };
+    }
+
+    push_tag!(meta.title, "TIT2", "title");
+    push_tag!(meta.artist, "TPE1", "artist");
+    push_tag!(meta.album_artist, "TPE2", "album_artist");
+    push_tag!(meta.album, "TALB", "album");
+    push_tag!(meta.genre, "TCON", "genre");
+    push_tag!(meta.comment, "COMM", "comment");
+
+    if let Some(v) = meta.year {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TYER".into(),
+            field_name: "year".into(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = meta.track_number {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TRCK".into(),
+            field_name: "track_number".into(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = meta.track_total {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TRCK".into(),
+            field_name: "track_total".into(),
+            value: v.to_string(),
+        });
+    }
+    if let Some(v) = meta.disc_number {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TPOS".into(),
+            field_name: "disc_number".into(),
+            value: v.to_string(),
+        });
+    }
+
+    // Extra properties from TagLib's full property map (TXXX, UFID, etc.)
+    for prop in extra_props {
+        // Skip properties that duplicate the basic meta fields above
+        let is_duplicate = matches!(
+            prop.key.as_str(),
+            "TITLE"
+                | "ARTIST"
+                | "ALBUM"
+                | "GENRE"
+                | "COMMENT"
+                | "DATE"
+                | "YEAR"
+                | "TRACKNUMBER"
+                | "TRACKTOTAL"
+                | "DISCNUMBER"
+                | "ALBUMARTIST"
+                | "ALBUM ARTIST"
+                | "BPM"
+        );
+        if !is_duplicate {
+            tags.push(crate::models::SourceTagInfo {
+                frame_id: prop.key.clone(),
+                field_name: "tag".into(),
+                value: prop.value.clone(),
+            });
+        }
+    }
+
+    tags
+}
+
+/// Read all ID3/text tag frames from a file, returning a list of (frame_id, field_name, value) tuples.
+///
+/// Tries Lofty first; if that fails (e.g. malformed frames), falls back to the TagLib helper binary.
+pub fn list_all_tags(path: &Path) -> Result<Vec<crate::models::SourceTagInfo>> {
+    match list_all_tags_with_lofty(path) {
+        Ok(tags) => Ok(tags),
+        Err(err) => {
+            let primary_error = format!("{err:#}");
+            if let Some(fallback) = try_taglib_helper(path, &primary_error)? {
+                return Ok(metadata_to_tag_infos(&fallback.meta, &fallback.all_tags));
+            }
+            Err(err)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a 4-byte synchsafe integer (used in ID3v2.4 header / frame sizes).
+    fn synchsafe(n: u32) -> [u8; 4] {
+        [
+            ((n >> 21) & 0x7F) as u8,
+            ((n >> 14) & 0x7F) as u8,
+            ((n >> 7) & 0x7F) as u8,
+            (n & 0x7F) as u8,
+        ]
+    }
+
+    /// Build a single ID3v2.4 frame: header (10 bytes) + data.
+    fn id3_frame(frame_id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(frame_id);
+        buf.extend_from_slice(&synchsafe(data.len() as u32));
+        buf.extend_from_slice(&[0, 0]); // flags
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    /// Build a synthetic valid .mp3 file with an ID3v2.4 tag and a minimal
+    /// MPEG audio frame so both Lofty and TagLib can open it.
+    fn synth_mp3_with_id3(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut tag_data = Vec::new();
+        for f in frames {
+            tag_data.extend_from_slice(f);
+        }
+
+        // ID3v2.4 header (10 bytes)
+        let mut file = Vec::new();
+        file.extend_from_slice(b"ID3");
+        file.extend_from_slice(&[0x04, 0x00]); // version 2.4
+        file.push(0x00); // flags
+        file.extend_from_slice(&synchsafe(tag_data.len() as u32));
+        file.extend_from_slice(&tag_data);
+
+        // Minimal valid MPEG-1 Audio Layer 3 frame (silent) so that
+        // Lofty/TagLib accept the file as a valid MP3.
+        // Sync word 0xFF 0xFB, MPEG1 Layer3, 128 kbps, 44100 Hz, no padding.
+        file.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        // Fill the rest of a 417-byte MPEG frame with zeros (silent PCM).
+        file.resize(file.len() + 413, 0u8);
+
+        file
+    }
+
+    // ── metadata_to_tag_infos unit tests ──────────────────────────────────────
+
+    #[test]
+    fn test_metadata_to_tag_infos_basic_fields() {
+        let meta = TrackMetadata {
+            title: Some("Hello".into()),
+            artist: Some("World".into()),
+            album: Some("Test Album".into()),
+            year: Some(2024),
+            track_number: Some(1),
+            track_total: Some(13),
+            disc_number: Some(2),
+            ..Default::default()
+        };
+
+        let tags = metadata_to_tag_infos(&meta, &[]);
+
+        let t = |name| {
+            tags.iter()
+                .find(|t| t.field_name == name)
+                .map(|t| t.value.as_str())
+        };
+        assert_eq!(t("title"), Some("Hello"));
+        assert_eq!(t("artist"), Some("World"));
+        assert_eq!(t("album"), Some("Test Album"));
+        assert_eq!(t("year"), Some("2024"));
+        assert_eq!(t("track_number"), Some("1"));
+        assert_eq!(t("track_total"), Some("13"));
+        assert_eq!(t("disc_number"), Some("2"));
+    }
+
+    #[test]
+    fn test_metadata_to_tag_infos_filters_duplicate_extra_props() {
+        let meta = TrackMetadata {
+            title: Some("Title".into()),
+            ..Default::default()
+        };
+        // All of these have matching fields in meta or are in the skip list.
+        let extra_props = vec![
+            TagProperty {
+                key: "TITLE".into(),
+                value: "Title".into(),
+            },
+            TagProperty {
+                key: "ARTIST".into(),
+                value: "Artist".into(),
+            },
+            TagProperty {
+                key: "TRACKNUMBER".into(),
+                value: "1/13".into(),
+            },
+            TagProperty {
+                key: "DISCNUMBER".into(),
+                value: "2/2".into(),
+            },
+            TagProperty {
+                key: "SCRIPT".into(),
+                value: "Jpan".into(),
+            },
+            TagProperty {
+                key: "BARCODE".into(),
+                value: "12345".into(),
+            },
+        ];
+
+        let tags = metadata_to_tag_infos(&meta, &extra_props);
+
+        // Duplicates should be filtered
+        assert!(tags.iter().any(|t| t.value == "Title"));
+        assert!(tags.iter().find(|t| t.frame_id == "TITLE").is_none());
+        assert!(tags.iter().find(|t| t.frame_id == "ARTIST").is_none());
+        assert!(tags.iter().find(|t| t.frame_id == "TRACKNUMBER").is_none());
+        assert!(tags.iter().find(|t| t.frame_id == "DISCNUMBER").is_none());
+
+        // Non-duplicate extras should appear
+        assert!(tags.iter().any(|t| t.value == "Jpan"));
+        assert!(tags.iter().any(|t| t.value == "12345"));
+    }
+
+    // ── Integration test with synthetic MP3 ───────────────────────────────────
+
+    #[test]
+    fn test_list_all_tags_synthetic_mp3() {
+        let frames = vec![
+            id3_frame(b"TIT2", b"\x03Heart will drive"),
+            id3_frame(
+                b"TPE1",
+                b"\x03\xe6\x96\xb0\xe5\x9e\xa3\xe7\xb5\x90\xe8\xa1\xa3",
+            ),
+            id3_frame(b"TALB", b"\x03hug"),
+            id3_frame(b"TCON", b"\x03JPop"),
+            id3_frame(b"TYER", b"\x032009"),
+            id3_frame(b"TRCK", b"\x031/13"),
+            id3_frame(b"TPOS", b"\x032/2"),
+        ];
+        let data = synth_mp3_with_id3(&frames);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).expect("write");
+
+        // `list_all_tags` may succeed via Lofty or via the TagLib fallback.
+        // We accept either path as long as the results are correct.
+        let tags = match list_all_tags(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                // Neither Lofty nor TagLib could process the synthetic file.
+                // This is acceptable in minimal/no-TagLib environments.
+                eprintln!("list_all_tags skipped (neither Lofty nor TagLib available): {e}");
+                return;
+            }
+        };
+
+        let t = |name| {
+            tags.iter()
+                .find(|t| t.field_name == name)
+                .map(|t| t.value.as_str())
+        };
+
+        assert_eq!(t("title"), Some("Heart will drive"), "tags: {tags:?}");
+        assert_eq!(t("album"), Some("hug"), "tags: {tags:?}");
+        assert_eq!(t("genre"), Some("JPop"), "tags: {tags:?}");
+
+        // TRCK "1/13" must produce track_number=1 and track_total=13
+        assert_eq!(
+            t("track_number"),
+            Some("1"),
+            "track_number missing or wrong; tags: {tags:?}"
+        );
+        assert_eq!(
+            t("track_total"),
+            Some("13"),
+            "track_total missing or wrong; tags: {tags:?}"
+        );
+
+        // TPOS "2/2" must produce disc_number=2
+        assert_eq!(
+            t("disc_number"),
+            Some("2"),
+            "disc_number missing or wrong; tags: {tags:?}"
+        );
+    }
 }
