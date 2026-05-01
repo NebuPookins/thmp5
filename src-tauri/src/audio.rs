@@ -11,7 +11,8 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -29,6 +30,21 @@ pub const PLAYER_ERROR_EVENT: &str = "player-error";
 
 const PREBUFFER_FRAMES: usize = 8_192;
 const MAX_BUFFER_FRAMES: usize = 96_000;
+
+/// Playback status codes used with `AtomicU8` in `AudioCallbackCtx`.
+const STATUS_STOPPED: u8 = 0;
+const STATUS_LOADING: u8 = 1;
+const STATUS_PLAYING: u8 = 2;
+const STATUS_PAUSED: u8 = 3;
+
+fn status_from_u8(v: u8) -> PlaybackStatus {
+    match v {
+        STATUS_LOADING => PlaybackStatus::Loading,
+        STATUS_PLAYING => PlaybackStatus::Playing,
+        STATUS_PAUSED => PlaybackStatus::Paused,
+        _ => PlaybackStatus::Stopped,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PlayRequest {
@@ -51,6 +67,65 @@ pub struct PlayerErrorEvent {
     pub message: String,
 }
 
+/// Lock-free state accessible from the real-time cpal audio callback.
+/// The engine thread writes hot-path fields through atomics; the callback
+/// reads them without acquiring `SharedState`'s mutex.  The `current_track`
+/// buffer is accessed via `try_lock` with a silence fallback.
+struct AudioCallbackCtx {
+    status: AtomicU8,
+    volume: AtomicU32,
+    output_frame_position: AtomicU64,
+    last_position_emit_ms: AtomicU64,
+    output_sample_rate: AtomicU32,
+    output_channels: AtomicU16,
+    track_duration_ms: AtomicU64,
+    /// The track buffer – engine thread writes via `lock()`, callback
+    /// reads via `try_lock()`, falling back to silence on contention.
+    current_track: Mutex<Option<Arc<Mutex<TrackBuffer>>>>,
+    /// Metadata snapshot used by the callback to build track-ended events.
+    current_recording_id: Mutex<Option<String>>,
+    current_source_id: Mutex<Option<String>>,
+    /// Channels for sending events from the callback to the engine thread.
+    position_tx: Sender<u64>,
+    state_tx: Sender<PlayerState>,
+    track_ended_tx: Sender<TrackEndedEvent>,
+}
+
+impl AudioCallbackCtx {
+    fn new(
+        output_sample_rate: u32,
+        output_channels: u16,
+        position_tx: Sender<u64>,
+        state_tx: Sender<PlayerState>,
+        track_ended_tx: Sender<TrackEndedEvent>,
+    ) -> Self {
+        Self {
+            status: AtomicU8::new(STATUS_STOPPED),
+            volume: AtomicU32::new(f32::to_bits(1.0)),
+            output_frame_position: AtomicU64::new(0),
+            last_position_emit_ms: AtomicU64::new(0),
+            output_sample_rate: AtomicU32::new(output_sample_rate),
+            output_channels: AtomicU16::new(output_channels),
+            track_duration_ms: AtomicU64::new(0),
+            current_track: Mutex::new(None),
+            current_recording_id: Mutex::new(None),
+            current_source_id: Mutex::new(None),
+            position_tx,
+            state_tx,
+            track_ended_tx,
+        }
+    }
+
+    fn position_ms(&self) -> u64 {
+        let rate = self.output_sample_rate.load(Ordering::Relaxed);
+        if rate == 0 {
+            return 0;
+        }
+        let pos = self.output_frame_position.load(Ordering::Relaxed);
+        pos.saturating_mul(1000) / u64::from(rate)
+    }
+}
+
 enum AudioCommand {
     Play(PlayRequest),
     Pause,
@@ -64,41 +139,82 @@ enum AudioCommand {
 pub struct AudioEngineHandle {
     tx: Sender<AudioCommand>,
     shared: Arc<Mutex<SharedState>>,
+    ctx: Arc<AudioCallbackCtx>,
 }
 
 impl AudioEngineHandle {
     pub fn new(app: AppHandle, file_issues: FileIssueLog) -> Result<Self> {
         let sleep_inhibitor = Arc::new(SleepInhibitor::new("thmp5", "Music playback in progress"));
-        let shared = Arc::new(Mutex::new(SharedState::new(48_000, 2, sleep_inhibitor)));
+        let shared = Arc::new(Mutex::new(SharedState::new(sleep_inhibitor)));
         let (tx, rx) = mpsc::channel();
         let command_shared = Arc::clone(&shared);
+
+        // Event channels: callback → engine thread
+        let (position_tx, position_rx) = mpsc::channel();
+        let (state_tx, state_rx) = mpsc::channel();
+        let (track_ended_tx, track_ended_rx) = mpsc::channel();
+
+        let ctx = Arc::new(AudioCallbackCtx::new(
+            48_000,
+            2,
+            position_tx,
+            state_tx,
+            track_ended_tx,
+        ));
+        let command_ctx = Arc::clone(&ctx);
+        let events = EventReceivers {
+            position: position_rx,
+            state: state_rx,
+            track_ended: track_ended_rx,
+        };
 
         thread::Builder::new()
             .name("audio-engine".to_string())
             .spawn(move || {
                 let host = cpal::default_host();
                 let mut stream: Option<cpal::Stream> = None;
+                let events = Some(events);
                 tracing::info!("Audio engine thread started");
 
-                while let Ok(command) = rx.recv() {
-                    if matches!(command, AudioCommand::Play(_) | AudioCommand::Resume) {
-                        if let Err(error) =
-                            ensure_output_stream(&host, &mut stream, &command_shared, &app)
-                        {
-                            set_engine_error(&command_shared, &app, error.to_string());
-                            continue;
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(command) => {
+                            if matches!(command, AudioCommand::Play(_) | AudioCommand::Resume) {
+                                if let Err(error) = ensure_output_stream(
+                                    &host,
+                                    &mut stream,
+                                    &command_shared,
+                                    &command_ctx,
+                                    &app,
+                                ) {
+                                    set_engine_error(&command_shared, &app, error.to_string());
+                                    continue;
+                                }
+                            }
+
+                            if let Err(error) = handle_command(
+                                command,
+                                &command_shared,
+                                &command_ctx,
+                                &app,
+                                &file_issues,
+                            ) {
+                                set_engine_error(&command_shared, &app, format!("{error:#}"));
+                            }
                         }
+                        Err(RecvTimeoutError::Timeout) => { /* drain events below */ }
+                        Err(RecvTimeoutError::Disconnected) => break,
                     }
 
-                    if let Err(error) = handle_command(command, &command_shared, &app, &file_issues)
-                    {
-                        set_engine_error(&command_shared, &app, format!("{error:#}"));
+                    // Drain event channels from the cpal callback.
+                    if let Some(ref ev) = events {
+                        drain_events(&command_shared, &command_ctx, ev, &app);
                     }
                 }
             })
             .context("Failed to start audio engine thread")?;
 
-        Ok(Self { tx, shared })
+        Ok(Self { tx, shared, ctx })
     }
 
     pub fn play(&self, request: PlayRequest) -> Result<()> {
@@ -126,10 +242,35 @@ impl AudioEngineHandle {
     }
 
     pub fn snapshot(&self) -> PlayerState {
-        self.shared
+        let ctx = &self.ctx;
+        let status = status_from_u8(ctx.status.load(Ordering::Acquire));
+        let volume = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
+        let position_ms = ctx.position_ms();
+        let duration_ms = {
+            let d = ctx.track_duration_ms.load(Ordering::Relaxed);
+            (d > 0).then_some(d)
+        };
+        let recording_id = ctx.current_recording_id.lock().ok().and_then(|r| r.clone());
+        let source_id = ctx.current_source_id.lock().ok().and_then(|r| r.clone());
+
+        // Metadata only kept in SharedState.
+        let (title, artist) = self
+            .shared
             .lock()
-            .map(|shared| shared.player_state())
-            .unwrap_or_default()
+            .ok()
+            .map(|s| (s.current_title.clone(), s.current_artist.clone()))
+            .unwrap_or((None, None));
+
+        PlayerState {
+            status,
+            recording_id,
+            source_id,
+            title,
+            artist,
+            duration_ms,
+            position_ms,
+            volume,
+        }
     }
 
     fn send_command(&self, command: AudioCommand) -> Result<()> {
@@ -146,98 +287,59 @@ impl AudioEngineHandle {
 
 struct SharedState {
     sleep_inhibitor: Arc<SleepInhibitor>,
-    output_sample_rate: u32,
-    output_channels: u16,
-    status: PlaybackStatus,
-    volume: f32,
     engine_error: Option<String>,
-    current_track: Option<StreamingTrack>,
-    current_recording_id: Option<String>,
-    current_source_id: Option<String>,
     current_title: Option<String>,
     current_artist: Option<String>,
     current_file_path: Option<String>,
-    output_frame_position: u64,
-    last_position_emit_ms: u64,
 }
 
 impl SharedState {
-    fn new(
-        output_sample_rate: u32,
-        output_channels: u16,
-        sleep_inhibitor: Arc<SleepInhibitor>,
-    ) -> Self {
+    fn new(sleep_inhibitor: Arc<SleepInhibitor>) -> Self {
         Self {
             sleep_inhibitor,
-            output_sample_rate,
-            output_channels,
-            status: PlaybackStatus::Stopped,
-            volume: 1.0,
             engine_error: None,
-            current_track: None,
-            current_recording_id: None,
-            current_source_id: None,
             current_title: None,
             current_artist: None,
             current_file_path: None,
-            output_frame_position: 0,
-            last_position_emit_ms: 0,
         }
     }
 
-    fn player_state(&self) -> PlayerState {
-        PlayerState {
-            status: self.status.clone(),
-            recording_id: self.current_recording_id.clone(),
-            source_id: self.current_source_id.clone(),
-            title: self.current_title.clone(),
-            artist: self.current_artist.clone(),
-            duration_ms: self.current_track.as_ref().map(|track| track.duration_ms),
-            position_ms: self.position_ms(),
-            volume: self.volume,
-        }
-    }
-
-    fn position_ms(&self) -> u64 {
-        if self.output_sample_rate == 0 {
-            return 0;
-        }
-
-        self.output_frame_position.saturating_mul(1000) / u64::from(self.output_sample_rate)
-    }
-
-    fn stop_decoder(&mut self) {
-        if let Some(track) = &self.current_track {
-            if let Ok(mut buffer) = track.buffer.lock() {
-                buffer.stop_requested = true;
+    fn stop_decoder(&self, ctx: &AudioCallbackCtx) {
+        if let Ok(track) = ctx.current_track.lock() {
+            if let Some(buffer) = track.as_ref() {
+                if let Ok(buf) = buffer.lock() {
+                    buf.stop_requested.store(true, Ordering::Release);
+                }
             }
         }
     }
 
-    fn clear_track(&mut self) {
-        self.stop_decoder();
-        self.status = PlaybackStatus::Stopped;
-        self.current_track = None;
-        self.current_recording_id = None;
-        self.current_source_id = None;
+    fn clear_track(&mut self, ctx: &AudioCallbackCtx) {
+        self.stop_decoder(ctx);
+        // Clear callback context fields.
+        ctx.status.store(STATUS_STOPPED, Ordering::Release);
+        if let Ok(mut track) = ctx.current_track.lock() {
+            *track = None;
+        }
+        if let Ok(mut id) = ctx.current_recording_id.lock() {
+            *id = None;
+        }
+        if let Ok(mut id) = ctx.current_source_id.lock() {
+            *id = None;
+        }
+        ctx.output_frame_position.store(0, Ordering::Relaxed);
+        ctx.track_duration_ms.store(0, Ordering::Relaxed);
+        // Clear SharedState metadata.
         self.current_title = None;
         self.current_artist = None;
         self.current_file_path = None;
-        self.output_frame_position = 0;
-        self.last_position_emit_ms = 0;
     }
-}
-
-#[derive(Clone)]
-struct StreamingTrack {
-    buffer: Arc<Mutex<TrackBuffer>>,
-    duration_ms: u64,
 }
 
 struct TrackBuffer {
     samples: VecDeque<f32>,
     finished: bool,
-    stop_requested: bool,
+    stop_requested: AtomicBool,
 }
 
 impl TrackBuffer {
@@ -245,7 +347,7 @@ impl TrackBuffer {
         Self {
             samples: VecDeque::new(),
             finished: false,
-            stop_requested: false,
+            stop_requested: AtomicBool::new(false),
         }
     }
 
@@ -261,6 +363,7 @@ impl TrackBuffer {
 fn handle_command(
     command: AudioCommand,
     shared: &Arc<Mutex<SharedState>>,
+    ctx: &Arc<AudioCallbackCtx>,
     app: &AppHandle,
     file_issues: &FileIssueLog,
 ) -> Result<()> {
@@ -273,26 +376,20 @@ fn handle_command(
                 "Beginning streaming track load"
             );
             let file_path = request.file_path.clone();
-            if let Err(e) = start_playback(shared, app, request, 0) {
+            if let Err(e) = start_playback(shared, ctx, app, request, 0) {
                 file_issues.push_playback_error(file_path, e.to_string());
                 return Err(e);
             }
         }
         AudioCommand::Pause => {
             tracing::info!("Pausing playback");
-            update_state(shared, app, |state| {
-                if state.current_track.is_some() {
-                    state.status = PlaybackStatus::Paused;
-                }
-            });
+            ctx.status.store(STATUS_PAUSED, Ordering::Release);
         }
         AudioCommand::Resume => {
             tracing::info!("Resuming playback");
-            update_state(shared, app, |state| {
-                if state.current_track.is_some() {
-                    state.status = PlaybackStatus::Loading;
-                }
-            });
+            if ctx.current_track.lock().ok().map_or(false, |t| t.is_some()) {
+                ctx.status.store(STATUS_LOADING, Ordering::Release);
+            }
         }
         AudioCommand::Seek(position_ms) => {
             tracing::info!(position_ms, "Seeking playback");
@@ -301,13 +398,17 @@ fn handle_command(
                     .lock()
                     .map_err(|_| anyhow!("Audio state lock poisoned"))?;
                 PlayRequest {
-                    recording_id: state
+                    recording_id: ctx
                         .current_recording_id
-                        .clone()
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
                         .ok_or_else(|| anyhow!("No active track to seek"))?,
-                    source_id: state
+                    source_id: ctx
                         .current_source_id
-                        .clone()
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())
                         .ok_or_else(|| anyhow!("No active track to seek"))?,
                     file_path: state
                         .current_file_path
@@ -318,19 +419,19 @@ fn handle_command(
                 }
             };
 
-            start_playback(shared, app, request, position_ms)?;
+            start_playback(shared, ctx, app, request, position_ms)?;
         }
         AudioCommand::SetVolume(volume) => {
-            tracing::info!(volume, "Updating playback volume");
-            update_state(shared, app, |state| {
-                state.volume = volume.clamp(0.0, 1.5);
-            });
+            let clamped = volume.clamp(0.0, 1.5);
+            tracing::info!(volume = clamped, "Updating playback volume");
+            ctx.volume.store(clamped.to_bits(), Ordering::Relaxed);
         }
         AudioCommand::Stop => {
             tracing::info!("Stopping playback");
-            update_state(shared, app, |state| {
-                state.clear_track();
-            });
+            let mut state = shared
+                .lock()
+                .map_err(|_| anyhow!("Audio state lock poisoned"))?;
+            state.clear_track(ctx);
         }
     }
 
@@ -339,16 +440,15 @@ fn handle_command(
 
 fn start_playback(
     shared: &Arc<Mutex<SharedState>>,
+    ctx: &Arc<AudioCallbackCtx>,
     app: &AppHandle,
     request: PlayRequest,
     start_ms: u64,
 ) -> Result<()> {
-    let (output_rate, output_channels) = {
-        let state = shared
-            .lock()
-            .map_err(|_| anyhow!("Audio state lock poisoned"))?;
-        (state.output_sample_rate, state.output_channels)
-    };
+    let (output_rate, output_channels) = (
+        ctx.output_sample_rate.load(Ordering::Relaxed),
+        ctx.output_channels.load(Ordering::Relaxed),
+    );
 
     let source = LocalFileSource::open(Path::new(&request.file_path))
         .with_context(|| format!("Failed to open {}", request.file_path))?;
@@ -357,21 +457,41 @@ fn start_playback(
     let duration_ms = source.duration_ms;
     let current_output_position = start_ms.saturating_mul(u64::from(output_rate)) / 1000;
 
-    update_state(shared, app, |state| {
-        state.stop_decoder();
-        state.status = PlaybackStatus::Loading;
-        state.current_track = Some(StreamingTrack {
-            buffer: Arc::clone(&buffer),
-            duration_ms,
-        });
-        state.current_recording_id = Some(request.recording_id.clone());
-        state.current_source_id = Some(request.source_id.clone());
+    {
+        // Stop the previous decoder.
+        let state = shared
+            .lock()
+            .map_err(|_| anyhow!("Audio state lock poisoned"))?;
+        state.stop_decoder(ctx);
+    }
+
+    // Set up the callback context before spawning the decoder.
+    ctx.status.store(STATUS_LOADING, Ordering::Release);
+    {
+        let mut guard = ctx.current_track.lock().unwrap();
+        *guard = Some(Arc::clone(&buffer));
+    }
+    ctx.track_duration_ms.store(duration_ms, Ordering::Relaxed);
+    {
+        let mut guard = ctx.current_recording_id.lock().unwrap();
+        *guard = Some(request.recording_id.clone());
+    }
+    {
+        let mut guard = ctx.current_source_id.lock().unwrap();
+        *guard = Some(request.source_id.clone());
+    }
+    ctx.output_frame_position
+        .store(current_output_position, Ordering::Relaxed);
+    ctx.last_position_emit_ms
+        .store(start_ms.saturating_sub(250), Ordering::Relaxed);
+
+    // Update SharedState metadata.
+    {
+        let mut state = shared.lock().unwrap();
         state.current_title = request.title.clone();
         state.current_artist = request.artist.clone();
         state.current_file_path = Some(request.file_path.clone());
-        state.output_frame_position = current_output_position;
-        state.last_position_emit_ms = start_ms.saturating_sub(250);
-    });
+    }
 
     spawn_decoder_thread(
         source,
@@ -441,20 +561,22 @@ fn decode_into_buffer(
     );
 
     loop {
-        {
-            let state = buffer
-                .lock()
-                .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
-            if state.stop_requested {
-                tracing::info!("Decoder worker stopping early");
-                return Ok(());
-            }
-            if state.buffered_frames(output_channels as usize) >= MAX_BUFFER_FRAMES {
-                drop(state);
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
+        let state = buffer
+            .lock()
+            .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
+
+        if state.stop_requested.load(Ordering::Acquire) {
+            tracing::info!("Decoder worker stopping early");
+            return Ok(());
         }
+
+        if state.buffered_frames(output_channels as usize) >= MAX_BUFFER_FRAMES {
+            drop(state);
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        drop(state);
 
         match source.decode_next()? {
             None => break,
@@ -464,7 +586,7 @@ fn decode_into_buffer(
                     let mut state = buffer
                         .lock()
                         .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
-                    if state.stop_requested {
+                    if state.stop_requested.load(Ordering::Acquire) {
                         return Ok(());
                     }
                     state.samples.extend(output);
@@ -474,50 +596,20 @@ fn decode_into_buffer(
     }
 
     let tail = resampler.finish();
-    let mut state = buffer
-        .lock()
-        .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
     if !tail.is_empty() {
+        let mut state = buffer
+            .lock()
+            .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
         state.samples.extend(tail);
     }
-    state.finished = true;
+    {
+        let mut state = buffer
+            .lock()
+            .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
+        state.finished = true;
+    }
     tracing::info!("Decoder worker finished");
     Ok(())
-}
-
-fn update_state<F>(shared: &Arc<Mutex<SharedState>>, app: &AppHandle, f: F)
-where
-    F: FnOnce(&mut SharedState),
-{
-    let (snapshot, sleep_inhibitor, should_inhibit) = {
-        let mut state = match shared.lock() {
-            Ok(state) => state,
-            Err(_) => return,
-        };
-        f(&mut state);
-        (
-            state.player_state(),
-            Arc::clone(&state.sleep_inhibitor),
-            should_inhibit_for_status(&state.status),
-        )
-    };
-
-    sync_sleep_inhibitor(&sleep_inhibitor, should_inhibit);
-    let _ = app.emit(PLAYER_STATE_EVENT, snapshot);
-}
-
-fn should_inhibit_for_status(status: &PlaybackStatus) -> bool {
-    matches!(status, PlaybackStatus::Loading | PlaybackStatus::Playing)
-}
-
-fn sync_sleep_inhibitor(sleep_inhibitor: &SleepInhibitor, should_inhibit: bool) {
-    if let Err(error) = sleep_inhibitor.set_active(should_inhibit) {
-        tracing::warn!(
-            error = %error,
-            should_inhibit,
-            "Failed to update desktop sleep inhibitor"
-        );
-    }
 }
 
 fn emit_error(app: &AppHandle, message: String) {
@@ -538,10 +630,74 @@ fn clear_engine_error(shared: &Arc<Mutex<SharedState>>) {
     }
 }
 
+/// Holds the receiver ends of the callback→engine event channels.
+struct EventReceivers {
+    position: mpsc::Receiver<u64>,
+    state: mpsc::Receiver<PlayerState>,
+    track_ended: mpsc::Receiver<TrackEndedEvent>,
+}
+
+fn sync_sleep_inhibitor(sleep_inhibitor: &SleepInhibitor, should_inhibit: bool) {
+    if let Err(error) = sleep_inhibitor.set_active(should_inhibit) {
+        tracing::warn!(
+            error = %error,
+            should_inhibit,
+            "Failed to update desktop sleep inhibitor"
+        );
+    }
+}
+
+/// Drain event channels from the cpal callback and forward them to Tauri.
+/// Called periodically from the engine thread.
+fn drain_events(
+    shared: &Arc<Mutex<SharedState>>,
+    ctx: &AudioCallbackCtx,
+    events: &EventReceivers,
+    app: &AppHandle,
+) {
+    while let Ok(pos_ms) = events.position.try_recv() {
+        let _ = app.emit(PLAYER_POSITION_EVENT, pos_ms);
+    }
+    while let Ok(event) = events.track_ended.try_recv() {
+        // Clear SharedState track metadata and release the sleep inhibitor.
+        if let Ok(mut state) = shared.lock() {
+            state.clear_track(ctx);
+            sync_sleep_inhibitor(&state.sleep_inhibitor, false);
+        }
+        let _ = app.emit(PLAYER_TRACK_ENDED_EVENT, event);
+        // Emit the updated player state.
+        let _ = app.emit(
+            PLAYER_STATE_EVENT,
+            PlayerState {
+                status: PlaybackStatus::Stopped,
+                recording_id: None,
+                source_id: None,
+                title: None,
+                artist: None,
+                duration_ms: None,
+                position_ms: ctx.position_ms(),
+                volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+            },
+        );
+    }
+    while let Ok(state) = events.state.try_recv() {
+        let inhibit = should_inhibit_for_status(&state.status);
+        if let Ok(s) = shared.lock() {
+            sync_sleep_inhibitor(&s.sleep_inhibitor, inhibit);
+        }
+        let _ = app.emit(PLAYER_STATE_EVENT, state);
+    }
+}
+
+fn should_inhibit_for_status(status: &PlaybackStatus) -> bool {
+    matches!(status, PlaybackStatus::Loading | PlaybackStatus::Playing)
+}
+
 fn ensure_output_stream(
     host: &cpal::Host,
     stream: &mut Option<cpal::Stream>,
     shared: &Arc<Mutex<SharedState>>,
+    ctx: &Arc<AudioCallbackCtx>,
     app: &AppHandle,
 ) -> Result<()> {
     if stream.is_some() {
@@ -559,13 +715,13 @@ fn ensure_output_stream(
         "Using output device"
     );
 
-    if let Ok(mut state) = shared.lock() {
-        state.output_sample_rate = stream_config.sample_rate.0;
-        state.output_channels = stream_config.channels;
-    }
+    ctx.output_sample_rate
+        .store(stream_config.sample_rate.0, Ordering::Relaxed);
+    ctx.output_channels
+        .store(stream_config.channels, Ordering::Relaxed);
 
     let output_stream =
-        build_output_stream(&device, &supported_config, Arc::clone(shared), app.clone())?;
+        build_output_stream(&device, &supported_config, Arc::clone(ctx), app.clone())?;
     output_stream
         .play()
         .context("Failed to start output stream")?;
@@ -604,46 +760,43 @@ fn select_output_device(host: &cpal::Host) -> Result<(cpal::Device, cpal::Suppor
 fn build_output_stream(
     device: &cpal::Device,
     supported_config: &cpal::SupportedStreamConfig,
-    shared: Arc<Mutex<SharedState>>,
+    ctx: Arc<AudioCallbackCtx>,
     app: AppHandle,
 ) -> Result<cpal::Stream> {
     let config = supported_config.config();
 
     match supported_config.sample_format() {
         cpal::SampleFormat::F32 => {
-            let shared = Arc::clone(&shared);
-            let app_for_data = app.clone();
+            let ctx_ref = Arc::clone(&ctx);
             let app_for_err = app.clone();
             device
                 .build_output_stream(
                     &config,
-                    move |data: &mut [f32], _| write_output_data_f32(data, &shared, &app_for_data),
+                    move |data: &mut [f32], _| write_output_data_f32(data, &ctx_ref),
                     move |error| emit_error(&app_for_err, format!("Audio stream error: {error}")),
                     None,
                 )
                 .context("Failed to build f32 output stream")
         }
         cpal::SampleFormat::I16 => {
-            let shared = Arc::clone(&shared);
-            let app_for_data = app.clone();
+            let ctx_ref = Arc::clone(&ctx);
             let app_for_err = app.clone();
             device
                 .build_output_stream(
                     &config,
-                    move |data: &mut [i16], _| write_output_data_i16(data, &shared, &app_for_data),
+                    move |data: &mut [i16], _| write_output_data_i16(data, &ctx_ref),
                     move |error| emit_error(&app_for_err, format!("Audio stream error: {error}")),
                     None,
                 )
                 .context("Failed to build i16 output stream")
         }
         cpal::SampleFormat::U16 => {
-            let shared = Arc::clone(&shared);
-            let app_for_data = app.clone();
+            let ctx_ref = Arc::clone(&ctx);
             let app_for_err = app;
             device
                 .build_output_stream(
                     &config,
-                    move |data: &mut [u16], _| write_output_data_u16(data, &shared, &app_for_data),
+                    move |data: &mut [u16], _| write_output_data_u16(data, &ctx_ref),
                     move |error| emit_error(&app_for_err, format!("Audio stream error: {error}")),
                     None,
                 )
@@ -653,154 +806,190 @@ fn build_output_stream(
     }
 }
 
-fn write_output_data_f32(output: &mut [f32], shared: &Arc<Mutex<SharedState>>, app: &AppHandle) {
-    write_output_data(output, shared, app, |sample| sample);
+fn write_output_data_f32(output: &mut [f32], ctx: &Arc<AudioCallbackCtx>) {
+    write_output_data(output, ctx, |sample| sample);
 }
 
-fn write_output_data_i16(output: &mut [i16], shared: &Arc<Mutex<SharedState>>, app: &AppHandle) {
-    write_output_data(output, shared, app, |sample| {
+fn write_output_data_i16(output: &mut [i16], ctx: &Arc<AudioCallbackCtx>) {
+    write_output_data(output, ctx, |sample| {
         (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
     });
 }
 
-fn write_output_data_u16(output: &mut [u16], shared: &Arc<Mutex<SharedState>>, app: &AppHandle) {
-    write_output_data(output, shared, app, |sample| {
+fn write_output_data_u16(output: &mut [u16], ctx: &Arc<AudioCallbackCtx>) {
+    write_output_data(output, ctx, |sample| {
         (((sample.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32) as u16
     });
 }
 
-fn write_output_data<T, F>(
-    output: &mut [T],
-    shared: &Arc<Mutex<SharedState>>,
-    app: &AppHandle,
-    convert: F,
-) where
+fn write_output_data<T, F>(output: &mut [T], ctx: &AudioCallbackCtx, convert: F)
+where
     T: Copy,
     F: Fn(f32) -> T,
 {
-    let mut ended_event = None;
-    let mut snapshot = None;
-    let mut position_event = None;
-    let mut inhibit_change = None;
+    let output_channels = ctx.output_channels.load(Ordering::Relaxed) as usize;
+    if output_channels == 0 {
+        for s in output.iter_mut() {
+            *s = convert(0.0);
+        }
+        return;
+    }
 
-    {
-        let mut state = match shared.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                for sample in output.iter_mut() {
-                    *sample = convert(0.0);
-                }
-                return;
-            }
-        };
+    let mut emitted_pos = false;
 
-        let output_channels = state.output_channels as usize;
-        for frame in output.chunks_mut(output_channels) {
-            let Some((track_buffer, track_duration_ms)) = state
-                .current_track
-                .as_ref()
-                .map(|track| (Arc::clone(&track.buffer), track.duration_ms))
-            else {
-                for sample in frame.iter_mut() {
-                    *sample = convert(0.0);
-                }
-                continue;
-            };
-
-            let mut buffer = match track_buffer.lock() {
-                Ok(buffer) => buffer,
-                Err(_) => {
-                    for sample in frame.iter_mut() {
-                        *sample = convert(0.0);
+    for frame in output.chunks_mut(output_channels) {
+        let vol = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
+        let status = ctx.status.load(Ordering::Relaxed);
+        // Try to acquire the current track buffer without blocking.
+        let track_buffer = match ctx.current_track.try_lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(buf) => Arc::clone(buf),
+                None => {
+                    for s in frame.iter_mut() {
+                        *s = convert(0.0);
                     }
                     continue;
                 }
-            };
-
-            if state.status == PlaybackStatus::Paused {
-                for sample in frame.iter_mut() {
-                    *sample = convert(0.0);
+            },
+            Err(_) => {
+                // Contended — play silence rather than blocking the audio thread.
+                for s in frame.iter_mut() {
+                    *s = convert(0.0);
                 }
                 continue;
             }
+        };
 
-            let ready_frames = buffer.buffered_frames(output_channels);
-            if state.status == PlaybackStatus::Loading
-                && (ready_frames >= PREBUFFER_FRAMES || (buffer.finished && ready_frames > 0))
-            {
-                state.status = PlaybackStatus::Playing;
-                snapshot = Some(state.player_state());
-                inhibit_change = Some((Arc::clone(&state.sleep_inhibitor), true));
-            }
-
-            if state.status != PlaybackStatus::Playing {
-                for sample in frame.iter_mut() {
-                    *sample = convert(0.0);
+        let mut buffer = match track_buffer.try_lock() {
+            Ok(buf) => buf,
+            Err(_) => {
+                for s in frame.iter_mut() {
+                    *s = convert(0.0);
                 }
                 continue;
             }
+        };
 
-            if ready_frames == 0 {
-                if buffer.finished {
-                    ended_event = match (
-                        state.current_recording_id.clone(),
-                        state.current_source_id.clone(),
-                    ) {
-                        (Some(recording_id), Some(source_id)) => Some(TrackEndedEvent {
-                            recording_id,
-                            source_id,
-                            position_ms: track_duration_ms,
-                        }),
-                        _ => None,
-                    };
-                    // Drop the TrackBuffer guard before calling clear_track, which
-                    // internally calls stop_decoder → TrackBuffer::lock().  Holding
-                    // the guard here while re-entering the same lock causes a
-                    // self-deadlock on the cpal output thread.
-                    drop(buffer);
-                    state.clear_track();
-                    snapshot = Some(state.player_state());
-                    inhibit_change = Some((Arc::clone(&state.sleep_inhibitor), false));
-                    for sample in frame.iter_mut() {
-                        *sample = convert(0.0);
-                    }
-                    break;
-                }
-
-                state.status = PlaybackStatus::Loading;
-                snapshot = Some(state.player_state());
-                inhibit_change = Some((Arc::clone(&state.sleep_inhibitor), true));
-                for sample in frame.iter_mut() {
-                    *sample = convert(0.0);
-                }
-                continue;
+        if status == STATUS_PAUSED {
+            for s in frame.iter_mut() {
+                *s = convert(0.0);
             }
-
-            for sample in frame.iter_mut() {
-                let raw_sample = buffer.samples.pop_front().unwrap_or(0.0) * state.volume;
-                *sample = convert(raw_sample);
-            }
-
-            state.output_frame_position = state.output_frame_position.saturating_add(1);
-            let new_position_ms = state.position_ms();
-            if new_position_ms >= state.last_position_emit_ms.saturating_add(250) {
-                state.last_position_emit_ms = new_position_ms;
-                position_event = Some(new_position_ms);
-            }
+            continue;
         }
-    }
 
-    if let Some((sleep_inhibitor, should_inhibit)) = inhibit_change {
-        sync_sleep_inhibitor(&sleep_inhibitor, should_inhibit);
-    }
-    if let Some(position_ms) = position_event {
-        let _ = app.emit(PLAYER_POSITION_EVENT, position_ms);
-    }
-    if let Some(event) = ended_event {
-        let _ = app.emit(PLAYER_TRACK_ENDED_EVENT, event);
-    }
-    if let Some(player_state) = snapshot {
-        let _ = app.emit(PLAYER_STATE_EVENT, player_state);
+        let ready_frames = buffer.buffered_frames(output_channels);
+
+        // Transition from Loading → Playing once we have enough data.
+        if status == STATUS_LOADING
+            && (ready_frames >= PREBUFFER_FRAMES || (buffer.finished && ready_frames > 0))
+        {
+            drop(buffer);
+            ctx.status.store(STATUS_PLAYING, Ordering::Release);
+            let _ = ctx.state_tx.send(PlayerState {
+                status: PlaybackStatus::Playing,
+                recording_id: ctx
+                    .current_recording_id
+                    .try_lock()
+                    .ok()
+                    .and_then(|r| r.clone()),
+                source_id: ctx
+                    .current_source_id
+                    .try_lock()
+                    .ok()
+                    .and_then(|r| r.clone()),
+                title: None,
+                artist: None,
+                duration_ms: Some(ctx.track_duration_ms.load(Ordering::Relaxed)).filter(|&d| d > 0),
+                position_ms: ctx.position_ms(),
+                volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+            });
+            for s in frame.iter_mut() {
+                *s = convert(0.0);
+            }
+            continue;
+        }
+
+        if status == STATUS_PLAYING && ready_frames == 0 {
+            if buffer.finished {
+                // Track ended naturally – notify engine thread and clear state.
+                let ended = TrackEndedEvent {
+                    recording_id: ctx
+                        .current_recording_id
+                        .try_lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                        .unwrap_or_default(),
+                    source_id: ctx
+                        .current_source_id
+                        .try_lock()
+                        .ok()
+                        .and_then(|g| g.clone())
+                        .unwrap_or_default(),
+                    position_ms: ctx.position_ms(),
+                };
+                // We're holding the TrackBuffer lock, but stop_requested is
+                // an AtomicBool so the decoder can check it independently.
+                buffer.stop_requested.store(true, Ordering::Release);
+                drop(buffer);
+                // Clear callback-side track state.
+                ctx.status.store(STATUS_STOPPED, Ordering::Release);
+                if let Ok(mut t) = ctx.current_track.try_lock() {
+                    *t = None;
+                }
+                if let Ok(mut id) = ctx.current_recording_id.try_lock() {
+                    *id = None;
+                }
+                if let Ok(mut id) = ctx.current_source_id.try_lock() {
+                    *id = None;
+                }
+                ctx.track_duration_ms.store(0, Ordering::Relaxed);
+                let _ = ctx.track_ended_tx.send(ended);
+                for s in frame.iter_mut() {
+                    *s = convert(0.0);
+                }
+                break;
+            }
+
+            // Buffer underrun – go back to Loading.
+            drop(buffer);
+            ctx.status.store(STATUS_LOADING, Ordering::Release);
+            let _ = ctx.state_tx.send(PlayerState {
+                status: PlaybackStatus::Loading,
+                recording_id: None,
+                source_id: None,
+                title: None,
+                artist: None,
+                duration_ms: None,
+                position_ms: ctx.position_ms(),
+                volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+            });
+            for s in frame.iter_mut() {
+                *s = convert(0.0);
+            }
+            continue;
+        }
+
+        // Read and convert samples.
+        for s in frame.iter_mut() {
+            let raw = buffer.samples.pop_front().unwrap_or(0.0) * vol;
+            *s = convert(raw);
+        }
+
+        let prev = ctx.output_frame_position.fetch_add(1, Ordering::Relaxed);
+        let new_position_ms = (prev + 1).saturating_mul(1000)
+            / u64::from(ctx.output_sample_rate.load(Ordering::Relaxed));
+        if !emitted_pos
+            && new_position_ms
+                >= ctx
+                    .last_position_emit_ms
+                    .load(Ordering::Relaxed)
+                    .saturating_add(250)
+        {
+            ctx.last_position_emit_ms
+                .store(new_position_ms, Ordering::Relaxed);
+            let _ = ctx.position_tx.send(new_position_ms);
+            emitted_pos = true;
+        }
     }
 }
 
