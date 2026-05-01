@@ -160,9 +160,10 @@ type Props = {
   onBack: () => void;
   onForward: () => void;
   onClose: () => void;
+  onSourceContextMenu?: (e: React.MouseEvent<HTMLDivElement>, filePath: string) => void;
 };
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [artist, setArtist] = useState<ArtistDetail | null>(null);
@@ -486,7 +487,11 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
               <p className="empty-browser-state">No sources.</p>
             ) : (
               recording.sources.map((source) => (
-                <div key={source.id} className="entity-detail-source">
+                <div
+                  key={source.id}
+                  className="entity-detail-source"
+                  onContextMenu={source.file_path ? (e) => onSourceContextMenu?.(e, source.file_path!) : undefined}
+                >
                   <div className="entity-detail-source-header">
                     <span className="entity-detail-badge">{source.source_type}</span>
                     {source.format && <span className="entity-detail-badge">{source.format}</span>}

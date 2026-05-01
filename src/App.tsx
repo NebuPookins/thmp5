@@ -1376,6 +1376,12 @@ function App() {
     setContextMenu({ kind: "recording", x: e.clientX, y: e.clientY, path: path ?? "", recording });
   }
 
+  function openEntitySourceContextMenu(e: React.MouseEvent, filePath: string) {
+    e.preventDefault();
+    // recording field is unused for "source" kind context menus
+    setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: filePath, recording: {} as RecordingRow });
+  }
+
   function enqueueRecording(recording: RecordingRow) {
     if (!recording.primary_source_id) {
       setError(`No playable local file is available for "${recording.title}".`);
@@ -2011,6 +2017,7 @@ function App() {
                   onBack={() => dispatchNav({ type: "back" })}
                   onForward={() => dispatchNav({ type: "forward" })}
                   onClose={() => dispatchNav({ type: "close" })}
+                  onSourceContextMenu={openEntitySourceContextMenu}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">
