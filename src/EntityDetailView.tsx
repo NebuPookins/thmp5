@@ -67,6 +67,8 @@ type TrackDetail = {
   recording_title: string;
   artist_credit_name: string | null;
   primary_artist_id: string | null;
+  has_source: boolean;
+  primary_source_id: string | null;
 };
 
 type MediumDetail = {
@@ -185,9 +187,10 @@ type Props = {
   onForward: () => void;
   onClose: () => void;
   onSourceContextMenu?: (e: React.MouseEvent<HTMLDivElement>, filePath: string) => void;
+  onEnqueueTrack?: (track: TrackDetail) => void;
 };
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [artist, setArtist] = useState<ArtistDetail | null>(null);
@@ -421,6 +424,7 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                   <table className="entity-detail-track-table">
                     <thead>
                       <tr>
+                        <th className="source-indicator-col">Src</th>
                         <th>#</th>
                         <th>Title</th>
                         <th>Artist</th>
@@ -430,6 +434,17 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                     <tbody>
                       {medium.tracks.map((track) => (
                         <tr key={track.id}>
+                          <td className="source-indicator-col">
+                            {track.has_source ? (
+                              <span
+                                className="source-indicator source-present"
+                                title="Has source — click to add to queue"
+                                onClick={() => onEnqueueTrack?.(track)}
+                              >✓</span>
+                            ) : (
+                              <span className="source-indicator source-missing" title="No source available">✗</span>
+                            )}
+                          </td>
                           <td>{track.position}</td>
                           <td>{recordingLink(track.recording_id, track.title ?? track.recording_title)}</td>
                           <td>

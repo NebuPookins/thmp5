@@ -2101,11 +2101,19 @@ pub async fn get_release_group_detail(
                 "SELECT t.id, t.position, t.title, t.duration_ms,
                         r.id AS recording_id, r.title AS recording_title,
                         COALESCE(ra.credited_as, a.name) AS artist_credit_name,
-                        a.id AS primary_artist_id
+                        a.id AS primary_artist_id,
+                        CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END AS has_source,
+                        s.id AS primary_source_id
                  FROM track t
                  JOIN recording r ON r.id = t.recording_id
                  LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
                  LEFT JOIN artist a ON a.id = ra.artist_id
+                 LEFT JOIN source s ON s.id = (
+                     SELECT s2.id FROM source s2
+                     WHERE s2.recording_id = r.id
+                     ORDER BY CASE s2.source_type WHEN 'local_file' THEN 0 ELSE 1 END, s2.file_path
+                     LIMIT 1
+                 )
                  WHERE t.medium_id = ?
                  ORDER BY t.position",
             )
@@ -2116,15 +2124,20 @@ pub async fn get_release_group_detail(
 
             let tracks = track_rows
                 .into_iter()
-                .map(|trow| crate::models::TrackDetail {
-                    id: trow.get("id"),
-                    position: trow.get("position"),
-                    title: trow.get("title"),
-                    duration_ms: trow.get("duration_ms"),
-                    recording_id: trow.get("recording_id"),
-                    recording_title: trow.get("recording_title"),
-                    artist_credit_name: trow.get("artist_credit_name"),
-                    primary_artist_id: trow.get("primary_artist_id"),
+                .map(|trow| {
+                    let has_source: i64 = trow.get("has_source");
+                    crate::models::TrackDetail {
+                        id: trow.get("id"),
+                        position: trow.get("position"),
+                        title: trow.get("title"),
+                        duration_ms: trow.get("duration_ms"),
+                        recording_id: trow.get("recording_id"),
+                        recording_title: trow.get("recording_title"),
+                        artist_credit_name: trow.get("artist_credit_name"),
+                        primary_artist_id: trow.get("primary_artist_id"),
+                        has_source: has_source != 0,
+                        primary_source_id: trow.get("primary_source_id"),
+                    }
                 })
                 .collect();
 

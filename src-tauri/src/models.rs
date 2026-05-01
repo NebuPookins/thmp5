@@ -397,6 +397,8 @@ pub struct TrackDetail {
     pub recording_title: String,
     pub artist_credit_name: Option<String>,
     pub primary_artist_id: Option<String>,
+    pub has_source: bool,
+    pub primary_source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

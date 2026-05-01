@@ -2018,6 +2018,34 @@ function App() {
                   onForward={() => dispatchNav({ type: "forward" })}
                   onClose={() => dispatchNav({ type: "close" })}
                   onSourceContextMenu={openEntitySourceContextMenu}
+                  onEnqueueTrack={(track) => {
+                    if (!track.has_source || !track.primary_source_id) {
+                      setError(`No playable source available for "${track.recording_title}".`);
+                      return;
+                    }
+                    setError(null);
+                    const item: RecordingRow = {
+                      id: track.recording_id,
+                      title: track.recording_title,
+                      duration_ms: track.duration_ms,
+                      primary_artist_id: track.primary_artist_id,
+                      artist_credit_name: track.artist_credit_name,
+                      primary_source_id: track.primary_source_id,
+                      primary_source_path: null,
+                      genre: null,
+                      rating: null,
+                      play_count: 0,
+                      last_played: null,
+                      tags: [],
+                      source_paths: [],
+                      releases: [],
+                    };
+                    if (!currentTrack && playerState.status === "stopped") {
+                      setCurrentTrack(item);
+                    } else {
+                      setQueue((q) => [...q, item]);
+                    }
+                  }}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">

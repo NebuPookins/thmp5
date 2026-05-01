@@ -368,3 +368,33 @@
   font-size: 0.85rem;
   line-height: 1.5;
 }
+
+/* ── Source indicator column ──────────────────────────────────────────── */
+
+.source-indicator-col {
+  width: 36px;
+  text-align: center;
+}
+
+.source-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: default;
+}
+
+.source-present {
+  color: #4ade80;
+  cursor: pointer;
+  transition: filter 120ms ease;
+}
+
+.source-present:hover {
+  filter: brightness(1.4);
+}
+
+.source-missing {
+  color: rgba(149, 173, 198, 0.3);
+}
