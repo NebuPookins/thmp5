@@ -15,7 +15,7 @@ use crate::models::{
 use crate::query::{self, LimitUnit};
 use crate::AppState;
 use serde::Serialize;
-use sqlx::{Acquire, Row, Sqlite, Transaction};
+use sqlx::{Acquire, Row, Sqlite, SqliteConnection, Transaction};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Emitter;
@@ -1966,6 +1966,63 @@ pub async fn get_artist_detail(
     })
 }
 
+/// For a release, read `track_total` from file tags for sources that have a NULL
+/// value in the database (e.g. imported before the column existed).  Returns true
+/// if any rows were updated so the caller can re-run its completeness query.
+async fn backfill_track_totals_for_release(
+    conn: &mut SqliteConnection,
+    release_id: &str,
+) -> Result<bool, String> {
+    let candidates = sqlx::query(
+        "SELECT s.id, s.file_path
+         FROM source s
+         JOIN track t ON t.recording_id = s.recording_id
+         JOIN medium m ON m.id = t.medium_id
+         WHERE m.release_id = ?
+           AND s.source_type = 'local_file'
+           AND s.file_path IS NOT NULL
+           AND s.track_total IS NULL",
+    )
+    .bind(release_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let mut updated = 0u32;
+    for row in &candidates {
+        let path: String = row.get("file_path");
+        let sid: String = row.get("id");
+        match crate::library::scanner::read_metadata(std::path::Path::new(&path)) {
+            Ok(result) => {
+                if let Some(tt) = result.meta.track_total {
+                    let n = sqlx::query("UPDATE source SET track_total = ? WHERE id = ?")
+                        .bind(tt as i64)
+                        .bind(&sid)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .rows_affected();
+                    if n > 0 {
+                        updated += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read tags for track_total backfill ({}): {e:#}",
+                    path
+                );
+            }
+        }
+    }
+
+    Ok(updated > 0)
+}
+
 #[tauri::command]
 pub async fn get_release_group_detail(
     state: tauri::State<'_, AppState>,
@@ -2079,6 +2136,149 @@ pub async fn get_release_group_detail(
             });
         }
 
+        // Determine release completeness.
+        let completeness: crate::models::ReleaseCompleteness = {
+            let stats = sqlx::query(
+                "WITH release_source_stats AS (
+                    SELECT
+                        t.id AS track_id,
+                        MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
+                        MAX(s.track_total) AS source_track_total
+                    FROM medium m
+                    JOIN track t ON t.medium_id = m.id
+                    LEFT JOIN source s ON s.recording_id = t.recording_id
+                    WHERE m.release_id = ?
+                    GROUP BY t.id
+                )
+                SELECT
+                    COUNT(DISTINCT source_track_total) AS distinct_track_totals,
+                    MAX(source_track_total) AS consensus_track_total,
+                    COUNT(*) AS total_tracks,
+                    COALESCE(SUM(has_source), 0) AS tracks_with_sources
+                FROM release_source_stats",
+            )
+            .bind(&release_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let mut distinct: i64 = stats.get("distinct_track_totals");
+            let mut consensus: Option<i64> = stats.get("consensus_track_total");
+            let total_tracks: i64 = stats.get("total_tracks");
+            let with_sources: i64 = stats.get("tracks_with_sources");
+
+            // If no sources have track_total stored but the release has tracks,
+            // try to backfill from file tags (supports sources imported before
+            // the track_total column existed).
+            if distinct == 0 && total_tracks > 0 {
+                if backfill_track_totals_for_release(&mut *conn, &release_id).await? {
+                    let stats2 = sqlx::query(
+                        "WITH release_source_stats AS (
+                            SELECT
+                                t.id AS track_id,
+                                MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
+                                MAX(s.track_total) AS source_track_total
+                            FROM medium m
+                            JOIN track t ON t.medium_id = m.id
+                            LEFT JOIN source s ON s.recording_id = t.recording_id
+                            WHERE m.release_id = ?
+                            GROUP BY t.id
+                        )
+                        SELECT
+                            COUNT(DISTINCT source_track_total) AS distinct_track_totals,
+                            MAX(source_track_total) AS consensus_track_total,
+                            COALESCE(SUM(has_source), 0) AS tracks_with_sources
+                        FROM release_source_stats",
+                    )
+                    .bind(&release_id)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    distinct = stats2.get("distinct_track_totals");
+                    consensus = stats2.get("consensus_track_total");
+                }
+            }
+
+            match (total_tracks, distinct, consensus) {
+                (0, _, _) => crate::models::ReleaseCompleteness::Unknown {
+                    reason: "No tracks on this release.".to_string(),
+                },
+                (_, 0, _) => crate::models::ReleaseCompleteness::Unknown {
+                    reason: "No source files provide track_total information.".to_string(),
+                },
+                (_, 1, Some(0)) => crate::models::ReleaseCompleteness::Unknown {
+                    reason: "Track total is zero.".to_string(),
+                },
+                (_, 1, _) if with_sources >= consensus.unwrap_or(0) => {
+                    crate::models::ReleaseCompleteness::Complete
+                }
+                (_, 1, _) => {
+                    let missing = sqlx::query(
+                        "SELECT t.position AS track_position,
+                                m.position AS disc_position,
+                                COALESCE(t.title, r.title) AS title,
+                                r.id AS recording_id
+                         FROM medium m
+                         JOIN track t ON t.medium_id = m.id
+                         JOIN recording r ON r.id = t.recording_id
+                         WHERE m.release_id = ?
+                           AND NOT EXISTS (SELECT 1 FROM source s WHERE s.recording_id = r.id)
+                         ORDER BY m.position, t.position",
+                    )
+                    .bind(&release_id)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|row| crate::models::MissingTrackDetail {
+                        disc_position: row.get("disc_position"),
+                        track_position: row.get("track_position"),
+                        title: row.get("title"),
+                        recording_id: row.get("recording_id"),
+                    })
+                    .collect();
+
+                    crate::models::ReleaseCompleteness::Incomplete {
+                        missing_tracks: missing,
+                    }
+                }
+                (_, _, _) => {
+                    let disagree = sqlx::query(
+                        "SELECT s.track_total, COUNT(DISTINCT s.id) AS cnt
+                         FROM medium m
+                         JOIN track t ON t.medium_id = m.id
+                         JOIN source s ON s.recording_id = t.recording_id
+                         WHERE m.release_id = ? AND s.track_total IS NOT NULL
+                         GROUP BY s.track_total
+                         ORDER BY s.track_total",
+                    )
+                    .bind(&release_id)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                    let mut parts: Vec<String> = Vec::new();
+                    for row in &disagree {
+                        let val: i64 = row.get("track_total");
+                        let cnt: i64 = row.get("cnt");
+                        parts.push(format!(
+                            "{} from {} source{}",
+                            val,
+                            cnt,
+                            if cnt == 1 { "" } else { "s" }
+                        ));
+                    }
+                    crate::models::ReleaseCompleteness::Unknown {
+                        reason: format!(
+                            "Sources disagree on total track count: {}",
+                            parts.join(", ")
+                        ),
+                    }
+                }
+            }
+        };
+
         releases.push(crate::models::ReleaseDetail {
             id: release_id,
             title: rel_row.get("release_title"),
@@ -2087,6 +2287,7 @@ pub async fn get_release_group_detail(
             label: rel_row.get("label"),
             catalog_number: rel_row.get("catalog_number"),
             mediums,
+            completeness,
         });
     }
 

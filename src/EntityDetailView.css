@@ -301,3 +301,70 @@
   font-family: "IBM Plex Mono", "Cascadia Code", monospace;
   font-size: 0.78rem;
 }
+
+/* ── Completeness icons ─────────────────────────────────────────────────── */
+
+.completeness-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  margin-right: 6px;
+  cursor: default;
+}
+
+.completeness-complete {
+  background: rgba(60, 200, 100, 0.15);
+  color: #4ade80;
+}
+
+.completeness-incomplete {
+  background: rgba(255, 160, 50, 0.15);
+  color: #fbbf24;
+}
+
+.completeness-unknown {
+  background: rgba(149, 173, 198, 0.12);
+  color: #8fa5c2;
+}
+
+/* ── Completeness reason ────────────────────────────────────────────────── */
+
+.completeness-reason {
+  font-style: italic;
+  color: #8fa5c2;
+  margin-bottom: 8px;
+}
+
+/* ── Missing tracks list ────────────────────────────────────────────────── */
+
+.missing-tracks {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(255, 160, 50, 0.06);
+  border: 1px solid rgba(255, 160, 50, 0.12);
+}
+
+.missing-tracks-label {
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.missing-tracks-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 12px;
+}
+
+.missing-track-item {
+  font-size: 0.85rem;
+  line-height: 1.5;
+}

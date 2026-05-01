@@ -297,6 +297,7 @@ pub async fn rescan_source(
              fingerprint = ?,
              file_size = ?,
              file_mtime_ms = ?,
+             track_total = ?,
              replay_gain_track_db = ?,
              replay_gain_track_peak = ?,
              replay_gain_album_db = ?,
@@ -310,6 +311,7 @@ pub async fn rescan_source(
     .bind(fingerprint_str)
     .bind(file_size)
     .bind(file_mtime_ms)
+    .bind(blocking.meta.track_total.map(|v| v as i64))
     .bind(blocking.meta.replay_gain_track_db)
     .bind(blocking.meta.replay_gain_track_peak)
     .bind(blocking.meta.replay_gain_album_db)
@@ -657,10 +659,10 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
     sqlx::query(
         "INSERT INTO source (
             id, recording_id, source_type, file_path, file_hash, format, duration_ms,
-            fingerprint, file_size, file_mtime_ms,
+            fingerprint, file_size, file_mtime_ms, track_total,
             replay_gain_track_db, replay_gain_track_peak,
             replay_gain_album_db, replay_gain_album_peak
-         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(file_path) DO UPDATE SET
             recording_id = excluded.recording_id,
             file_hash = excluded.file_hash,
@@ -669,6 +671,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
             fingerprint = excluded.fingerprint,
             file_size = excluded.file_size,
             file_mtime_ms = excluded.file_mtime_ms,
+            track_total = excluded.track_total,
             replay_gain_track_db = excluded.replay_gain_track_db,
             replay_gain_track_peak = excluded.replay_gain_track_peak,
             replay_gain_album_db = excluded.replay_gain_album_db,
@@ -683,6 +686,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
     .bind(fingerprint_str)
     .bind(file_size)
     .bind(file_mtime_ms)
+    .bind(meta.track_total.map(|v| v as i64))
     .bind(meta.replay_gain_track_db)
     .bind(meta.replay_gain_track_peak)
     .bind(meta.replay_gain_album_db)

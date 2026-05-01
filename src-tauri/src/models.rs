@@ -348,6 +348,18 @@ pub struct ReleaseGroupDetail {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReleaseCompleteness {
+    Complete,
+    Incomplete {
+        missing_tracks: Vec<MissingTrackDetail>,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ReleaseDetail {
     pub id: String,
     pub title: String,
@@ -356,6 +368,15 @@ pub struct ReleaseDetail {
     pub label: Option<String>,
     pub catalog_number: Option<String>,
     pub mediums: Vec<MediumDetail>,
+    pub completeness: ReleaseCompleteness,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MissingTrackDetail {
+    pub disc_position: i64,
+    pub track_position: i64,
+    pub title: String,
+    pub recording_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -76,6 +76,11 @@ type MediumDetail = {
   tracks: TrackDetail[];
 };
 
+type ReleaseCompleteness =
+  | { type: "complete" }
+  | { type: "incomplete"; missing_tracks: MissingTrackDetail[] }
+  | { type: "unknown"; reason: string };
+
 type ReleaseDetail = {
   id: string;
   title: string;
@@ -84,6 +89,14 @@ type ReleaseDetail = {
   label: string | null;
   catalog_number: string | null;
   mediums: MediumDetail[];
+  completeness: ReleaseCompleteness;
+};
+
+type MissingTrackDetail = {
+  disc_position: number;
+  track_position: number;
+  title: string;
+  recording_id: string;
 };
 
 type ReleaseGroupDetail = {
@@ -148,6 +161,17 @@ function formatAlbumRating(value: number | null): string {
 function stars(value: number | null): string {
   if (value === null) return "—";
   return "★".repeat(value) + "☆".repeat(5 - value);
+}
+
+function completenessIcon(c: ReleaseCompleteness) {
+  switch (c.type) {
+    case "complete":
+      return <span className="completeness-icon completeness-complete" title="All tracks have sources">✓</span>;
+    case "incomplete":
+      return <span className="completeness-icon completeness-incomplete" title="Some tracks are missing sources">✗</span>;
+    case "unknown":
+      return <span className="completeness-icon completeness-unknown" title={c.reason}>?</span>;
+  }
 }
 
 // ── Component ───────────────────────────────────────────────────────────────
@@ -363,13 +387,30 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
             <div key={release.id} className="entity-detail-section">
               <div className="entity-detail-section-title-row">
                 <h3 className="entity-detail-section-title">
+                  {completenessIcon(release.completeness)}
                   {release.title}
                   {release.release_date && <> ({formatYear(release.release_date)})</>}
                 </h3>
               </div>
+              {release.completeness.type === "unknown" && (
+                <p className="subtle-text completeness-reason">{release.completeness.reason}</p>
+              )}
               {release.country && <p className="subtle-text">Country: {release.country}</p>}
               {release.label && <p className="subtle-text">Label: {release.label}</p>}
               {release.catalog_number && <p className="subtle-text">Catalog: {release.catalog_number}</p>}
+
+              {release.completeness.type === "incomplete" && release.completeness.missing_tracks.length > 0 && (
+                <div className="missing-tracks">
+                  <span className="subtle-text missing-tracks-label">Missing sources:</span>
+                  <div className="missing-tracks-list">
+                    {release.completeness.missing_tracks.map((mt) => (
+                      <span key={`${mt.disc_position}-${mt.track_position}`} className="missing-track-item">
+                        {recordingLink(mt.recording_id, `Disc ${mt.disc_position}, Track ${mt.track_position} — ${mt.title}`)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {release.mediums.map((medium) => (
                 <div key={medium.id} className="entity-detail-medium">
