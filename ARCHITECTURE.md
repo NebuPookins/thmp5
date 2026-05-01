@@ -459,7 +459,7 @@ src/
 28. [ ] Export playlist to M3U / JSON
 
 ### Audio Engine — Lock-free hot path (architectural debt)
-29. [ ] Replace `Mutex<SharedState>` access inside the cpal audio callback with lock-free
+29. [X] Replace `Mutex<SharedState>` access inside the cpal audio callback with lock-free
         atomics, eliminating the possibility of blocking on the real-time thread:
         - `status` → `Arc<AtomicU8>` (PlaybackStatus as u8)
         - `volume` → `Arc<AtomicU32>` (f32 bits via `f32::to_bits` / `f32::from_bits`)
