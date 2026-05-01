@@ -684,6 +684,13 @@ fn list_all_tags_with_lofty(path: &Path) -> Result<Vec<crate::models::SourceTagI
             value: v.to_string(),
         });
     }
+    if let Some(v) = tag.disk_total() {
+        tags.push(crate::models::SourceTagInfo {
+            frame_id: "TPOS".into(),
+            field_name: "disc_total".into(),
+            value: v.to_string(),
+        });
+    }
 
     // Extended fields via individual lookups using get_string
     // (ItemKey enum is not publicly accessible in this lofty version)
