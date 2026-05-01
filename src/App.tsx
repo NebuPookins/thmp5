@@ -1,4 +1,4 @@
-import { FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -377,6 +377,35 @@ function applyAggregateRatings<T extends { id: string; rating: number | null }>(
   ));
 }
 
+// ── Detail view navigation stack ──────────────────────────────────────────────
+
+type NavState = { stack: DetailNav[]; index: number };
+
+type NavAction =
+  | { type: "navigate"; nav: DetailNav }
+  | { type: "back" }
+  | { type: "forward" }
+  | { type: "close" };
+
+function navReducer(state: NavState | null, action: NavAction): NavState | null {
+  switch (action.type) {
+    case "navigate":
+      if (!state) return { stack: [action.nav], index: 0 };
+      return {
+        stack: [...state.stack.slice(0, state.index + 1), action.nav],
+        index: state.index + 1,
+      };
+    case "back":
+      if (!state || state.index <= 0) return state;
+      return { ...state, index: state.index - 1 };
+    case "forward":
+      if (!state || state.index >= state.stack.length - 1) return state;
+      return { ...state, index: state.index + 1 };
+    case "close":
+      return null;
+  }
+}
+
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
@@ -439,7 +468,10 @@ function App() {
   const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
-  const [detailView, setDetailView] = useState<DetailNav | null>(null);
+  const [navState, dispatchNav] = useReducer(navReducer, null);
+  const detailView = navState ? navState.stack[navState.index] : null;
+  const canGoBack = navState ? navState.index > 0 : false;
+  const canGoForward = navState ? navState.index < navState.stack.length - 1 : false;
   const [pendingJobs, setPendingJobs] = useState(0);
   const [currentJobType, setCurrentJobType] = useState("");
   const releaseGroupSearchInFlightRef = useRef(false);
@@ -1973,8 +2005,12 @@ function App() {
               {detailView ? (
                 <EntityDetailView
                   nav={detailView}
-                  onNavigate={(nav) => setDetailView(nav)}
-                  onClose={() => setDetailView(null)}
+                  canGoBack={canGoBack}
+                  canGoForward={canGoForward}
+                  onNavigate={(nav) => dispatchNav({ type: "navigate", nav })}
+                  onBack={() => dispatchNav({ type: "back" })}
+                  onForward={() => dispatchNav({ type: "forward" })}
+                  onClose={() => dispatchNav({ type: "close" })}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">
@@ -2752,7 +2788,7 @@ function App() {
                     className="ctx-menu-item"
                     type="button"
                     onClick={() => {
-                      setDetailView({ type: "recording", id: contextMenu.recording.id });
+                      dispatchNav({ type: "navigate", nav: { type: "recording", id: contextMenu.recording.id } });
                       setContextMenu(null);
                     }}
                   >
@@ -2865,7 +2901,7 @@ function App() {
                     className="ctx-menu-item"
                     type="button"
                     onClick={() => {
-                      setDetailView({ type: "artist", id: contextMenu.artist_id });
+                      dispatchNav({ type: "navigate", nav: { type: "artist", id: contextMenu.artist_id } });
                       setContextMenu(null);
                     }}
                   >
@@ -2893,7 +2929,7 @@ function App() {
                     className="ctx-menu-item"
                     type="button"
                     onClick={() => {
-                      setDetailView({ type: "release_group", id: contextMenu.release_group_id });
+                      dispatchNav({ type: "navigate", nav: { type: "release_group", id: contextMenu.release_group_id } });
                       setContextMenu(null);
                     }}
                   >

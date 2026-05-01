@@ -154,11 +154,15 @@ function stars(value: number | null): string {
 
 type Props = {
   nav: DetailNav;
+  canGoBack: boolean;
+  canGoForward: boolean;
   onNavigate: (nav: DetailNav) => void;
+  onBack: () => void;
+  onForward: () => void;
   onClose: () => void;
 };
 
-export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [artist, setArtist] = useState<ArtistDetail | null>(null);
@@ -195,6 +199,15 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
 
   useEffect(() => { void load(); }, [load]);
 
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); onBack(); }
+      if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); onForward(); }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onBack, onForward]);
+
   function artistLink(id: string, name: string) {
     return (
       <button className="entity-link" onClick={() => onNavigate({ type: "artist", id })} type="button">
@@ -226,6 +239,10 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
       <section className="entity-detail-panel">
         <div className="entity-detail-header">
           <span className="panel-label">{nav.type.replace("_", " ")} detail</span>
+          <span className="entity-detail-nav">
+            <button className="nav-btn" disabled={!canGoBack} onClick={onBack} type="button" title="Back (Alt+Left)">◀</button>
+            <button className="nav-btn" disabled={!canGoForward} onClick={onForward} type="button" title="Forward (Alt+Right)">▶</button>
+          </span>
           <button className="modal-close-btn" onClick={onClose} type="button">✕</button>
         </div>
         <div className="entity-detail-body">
@@ -240,6 +257,10 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
       <section className="entity-detail-panel">
         <div className="entity-detail-header">
           <span className="panel-label">{nav.type.replace("_", " ")} detail</span>
+          <span className="entity-detail-nav">
+            <button className="nav-btn" disabled={!canGoBack} onClick={onBack} type="button" title="Back (Alt+Left)">◀</button>
+            <button className="nav-btn" disabled={!canGoForward} onClick={onForward} type="button" title="Forward (Alt+Right)">▶</button>
+          </span>
           <button className="modal-close-btn" onClick={onClose} type="button">✕</button>
         </div>
         <div className="entity-detail-body">
@@ -256,6 +277,10 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
       <section className="entity-detail-panel">
         <div className="entity-detail-header">
           <span className="panel-label">Artist detail</span>
+          <span className="entity-detail-nav">
+            <button className="nav-btn" disabled={!canGoBack} onClick={onBack} type="button" title="Back (Alt+Left)">◀</button>
+            <button className="nav-btn" disabled={!canGoForward} onClick={onForward} type="button" title="Forward (Alt+Right)">▶</button>
+          </span>
           <button className="modal-close-btn" onClick={onClose} type="button">✕</button>
         </div>
         <div className="entity-detail-body">
@@ -309,6 +334,10 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
       <section className="entity-detail-panel">
         <div className="entity-detail-header">
           <span className="panel-label">Album detail</span>
+          <span className="entity-detail-nav">
+            <button className="nav-btn" disabled={!canGoBack} onClick={onBack} type="button" title="Back (Alt+Left)">◀</button>
+            <button className="nav-btn" disabled={!canGoForward} onClick={onForward} type="button" title="Forward (Alt+Right)">▶</button>
+          </span>
           <button className="modal-close-btn" onClick={onClose} type="button">✕</button>
         </div>
         <div className="entity-detail-body">
@@ -387,6 +416,10 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
       <section className="entity-detail-panel">
         <div className="entity-detail-header">
           <span className="panel-label">Recording detail</span>
+          <span className="entity-detail-nav">
+            <button className="nav-btn" disabled={!canGoBack} onClick={onBack} type="button" title="Back (Alt+Left)">◀</button>
+            <button className="nav-btn" disabled={!canGoForward} onClick={onForward} type="button" title="Forward (Alt+Right)">▶</button>
+          </span>
           <button className="modal-close-btn" onClick={onClose} type="button">✕</button>
         </div>
         <div className="entity-detail-body">
@@ -506,7 +539,11 @@ export default function EntityDetailView({ nav, onNavigate, onClose }: Props) {
     <section className="entity-detail-panel">
       <div className="entity-detail-header">
         <span className="panel-label">Detail</span>
-        <button className="modal-close-btn" onClick={onClose} type="button">✕</button>
+        <span className="entity-detail-nav">
+            <button className="nav-btn" disabled={!canGoBack} onClick={onBack} type="button" title="Back (Alt+Left)">◀</button>
+            <button className="nav-btn" disabled={!canGoForward} onClick={onForward} type="button" title="Forward (Alt+Right)">▶</button>
+          </span>
+          <button className="modal-close-btn" onClick={onClose} type="button">✕</button>
       </div>
       <div className="entity-detail-body">
         <p className="empty-browser-state">Unknown entity type.</p>

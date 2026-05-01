@@ -16,6 +16,36 @@
   flex-shrink: 0;
 }
 
+.entity-detail-nav {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+.nav-btn {
+  background: none;
+  border: 1px solid rgba(149, 173, 198, 0.15);
+  color: #b9c9dc;
+  cursor: pointer;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  border-radius: 4px;
+  line-height: 1.4;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.nav-btn:hover:not(:disabled) {
+  background: rgba(73, 135, 255, 0.15);
+  color: #d6e4f0;
+  border-color: rgba(73, 135, 255, 0.3);
+}
+
+.nav-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
 .entity-detail-body {
   flex: 1;
   overflow-y: auto;
