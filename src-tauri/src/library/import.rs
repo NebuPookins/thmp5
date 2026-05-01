@@ -204,13 +204,23 @@ pub async fn rescan_source(
     let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
     let artist_changed = current_artist_id.as_deref() != Some(&artist_id);
 
+    let album_artist_name = blocking
+        .meta
+        .album_artist
+        .as_deref()
+        .or(blocking.meta.artist.as_deref())
+        .unwrap_or("Unknown Artist")
+        .to_string();
+    let album_artist_id = get_or_create_artist(&mut tx, &album_artist_name).await?;
+
     let album_title = blocking
         .meta
         .album
         .as_deref()
         .unwrap_or("Unknown Album")
         .to_string();
-    let release_group_id = get_or_create_release_group(&mut tx, &album_title, &artist_id).await?;
+    let release_group_id =
+        get_or_create_release_group(&mut tx, &album_title, &album_artist_id).await?;
     let release_date = blocking.meta.year.map(|y| y.to_string());
     let release_id = get_or_create_release(
         &mut tx,
@@ -585,6 +595,16 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         .to_string();
     let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
 
+    // The release group artist uses album_artist if available — tracks with
+    // different per-track artists but the same album artist belong to one album.
+    let album_artist_name = meta
+        .album_artist
+        .as_deref()
+        .or(meta.artist.as_deref())
+        .unwrap_or("Unknown Artist")
+        .to_string();
+    let album_artist_id = get_or_create_artist(&mut tx, &album_artist_name).await?;
+
     // ── 8. Find or create Recording ───────────────────────────────────────────
     let recording_id = if let Some(ref rec_id) = existing_recording_id {
         // Re-import of a file that already existed — update the existing recording
@@ -634,7 +654,8 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
 
     // ── 9. ReleaseGroup / Release / Medium ────────────────────────────────────
     let album_title = meta.album.as_deref().unwrap_or("Unknown Album").to_string();
-    let release_group_id = get_or_create_release_group(&mut tx, &album_title, &artist_id).await?;
+    let release_group_id =
+        get_or_create_release_group(&mut tx, &album_title, &album_artist_id).await?;
 
     let release_date = meta.year.map(|y| y.to_string());
     let release_id = get_or_create_release(
@@ -662,7 +683,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
             fingerprint, file_size, file_mtime_ms, track_total,
             replay_gain_track_db, replay_gain_track_peak,
             replay_gain_album_db, replay_gain_album_peak
-         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(file_path) DO UPDATE SET
             recording_id = excluded.recording_id,
             file_hash = excluded.file_hash,
@@ -1064,4 +1085,91 @@ fn file_identity(path: &Path) -> Result<(i64, i64)> {
     let file_mtime_ms = i64::try_from(modified.duration_since(UNIX_EPOCH)?.as_millis())
         .context("File modification time out of range")?;
     Ok((file_size, file_mtime_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_pool;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_album_artist_groups_tracks_together() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+
+        let meta1 = TrackMetadata {
+            title: Some("Song A".into()),
+            artist: Some("Track Artist A".into()),
+            album_artist: Some("Album Artist".into()),
+            album: Some("Same Album".into()),
+            year: Some(2024),
+            track_number: Some(1),
+            track_total: Some(2),
+            disc_number: Some(1),
+            duration_ms: 200000,
+            format: "mp3".into(),
+            genre: None,
+            bpm: None,
+            comment: None,
+            replay_gain_track_db: None,
+            replay_gain_track_peak: None,
+            replay_gain_album_db: None,
+            replay_gain_album_peak: None,
+        };
+
+        let meta2 = TrackMetadata {
+            title: Some("Song B".into()),
+            artist: Some("Track Artist B".into()),
+            track_number: Some(2),
+            ..meta1.clone()
+        };
+
+        let prepared1 = PreparedImport {
+            path: PathBuf::from("/tmp/test1.mp3"),
+            path_str: "/tmp/test1.mp3".to_string(),
+            existing_source_id: None,
+            hash: "a".repeat(64),
+            meta: meta1,
+            warnings: vec![],
+            file_size: 5000000,
+            file_mtime_ms: 1000000,
+            fp: None,
+            acoustid_match: None,
+        };
+
+        let prepared2 = PreparedImport {
+            path: PathBuf::from("/tmp/test2.mp3"),
+            path_str: "/tmp/test2.mp3".to_string(),
+            existing_source_id: None,
+            hash: "b".repeat(64),
+            meta: meta2,
+            warnings: vec![],
+            file_size: 6000000,
+            file_mtime_ms: 2000000,
+            fp: None,
+            acoustid_match: None,
+        };
+
+        store_prepared_import(&pool, prepared1).await.unwrap();
+        store_prepared_import(&pool, prepared2).await.unwrap();
+
+        // Both tracks should share exactly one release_group.
+        let mut conn = pool.acquire("test_query".to_string()).await.unwrap();
+        let rg_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT rg.id)
+             FROM release_group rg
+             JOIN release_group_artist rga ON rga.release_group_id = rg.id
+             JOIN artist a ON a.id = rga.artist_id
+             WHERE a.name = 'Album Artist'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            rg_count, 1,
+            "Both tracks should be grouped into one release group"
+        );
+    }
 }

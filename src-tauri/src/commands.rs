@@ -2226,8 +2226,10 @@ pub async fn get_release_group_detail(
                 (_, 1, _) if with_sources >= consensus.unwrap_or(0) => {
                     crate::models::ReleaseCompleteness::Complete
                 }
-                (_, 1, _) => {
-                    let missing = sqlx::query(
+                (_, 1, _) if with_sources < total_tracks => {
+                    use nonempty::NonEmpty;
+
+                    let missing_vec: Vec<crate::models::MissingTrackDetail> = sqlx::query(
                         "SELECT t.position AS track_position,
                                 m.position AS disc_position,
                                 COALESCE(t.title, r.title) AS title,
@@ -2248,9 +2250,66 @@ pub async fn get_release_group_detail(
                         disc_position: row.get("disc_position"),
                         track_position: row.get("track_position"),
                         title: row.get("title"),
-                        recording_id: row.get("recording_id"),
+                        recording_id: Some(row.get("recording_id")),
                     })
                     .collect();
+
+                    let missing = NonEmpty::from_vec(missing_vec).unwrap_or_else(|| {
+                        panic!(
+                            "incomplete arm reached but no missing tracks found. \
+                             release_id={release_id}, total_tracks={total_tracks}, \
+                             with_sources={with_sources}, consensus={consensus:?}, distinct={distinct}"
+                        )
+                    });
+
+                    crate::models::ReleaseCompleteness::Incomplete {
+                        missing_tracks: missing,
+                    }
+                }
+                (_, 1, _) => {
+                    use nonempty::NonEmpty;
+
+                    let consensus_val = consensus.unwrap_or(0);
+
+                    let missing_vec: Vec<crate::models::MissingTrackDetail> = sqlx::query(
+                        "WITH RECURSIVE positions(n) AS (
+                            SELECT 1
+                            UNION ALL
+                            SELECT n + 1 FROM positions WHERE n < ?
+                        )
+                        SELECT m.position AS disc_position,
+                               p.n AS track_position
+                        FROM medium m
+                        CROSS JOIN positions p
+                        WHERE m.release_id = ? AND p.n <= ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM track t
+                              WHERE t.medium_id = m.id AND t.position = p.n
+                          )
+                        ORDER BY m.position, p.n",
+                    )
+                    .bind(consensus_val)
+                    .bind(&release_id)
+                    .bind(consensus_val)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|row| crate::models::MissingTrackDetail {
+                        disc_position: row.get("disc_position"),
+                        track_position: row.get("track_position"),
+                        title: String::new(),
+                        recording_id: None,
+                    })
+                    .collect();
+
+                    let missing = NonEmpty::from_vec(missing_vec).unwrap_or_else(|| {
+                        panic!(
+                            "phantom-track arm reached but no missing positions found. \
+                             release_id={release_id}, total_tracks={total_tracks}, \
+                             with_sources={with_sources}, consensus={consensus:?}, distinct={distinct}"
+                        )
+                    });
 
                     crate::models::ReleaseCompleteness::Incomplete {
                         missing_tracks: missing,

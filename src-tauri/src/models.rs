@@ -1,3 +1,4 @@
+use nonempty::NonEmpty;
 use serde::{Deserialize, Serialize};
 
 // ── IPC response types (serialized to frontend) ──────────────────────────────
@@ -352,7 +353,7 @@ pub struct ReleaseGroupDetail {
 pub enum ReleaseCompleteness {
     Complete,
     Incomplete {
-        missing_tracks: Vec<MissingTrackDetail>,
+        missing_tracks: NonEmpty<MissingTrackDetail>,
     },
     Unknown {
         reason: String,
@@ -376,7 +377,7 @@ pub struct MissingTrackDetail {
     pub disc_position: i64,
     pub track_position: i64,
     pub title: String,
-    pub recording_id: String,
+    pub recording_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

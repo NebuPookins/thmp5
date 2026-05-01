@@ -98,7 +98,7 @@ type MissingTrackDetail = {
   disc_position: number;
   track_position: number;
   title: string;
-  recording_id: string;
+  recording_id: string | null;
 };
 
 type ReleaseGroupDetail = {
@@ -170,7 +170,11 @@ function completenessIcon(c: ReleaseCompleteness) {
     case "complete":
       return <span className="completeness-icon completeness-complete" title="All tracks have sources">✓</span>;
     case "incomplete":
-      return <span className="completeness-icon completeness-incomplete" title="Some tracks are missing sources">✗</span>;
+      const missing = c.missing_tracks.map(mt => {
+        const base = `Disc ${mt.disc_position}, Track ${mt.track_position}`;
+        return mt.title ? `${base} — ${mt.title}` : base;
+      }).join(", ");
+      return <span className="completeness-icon completeness-incomplete" title={`Missing: ${missing}`}>✗</span>;
     case "unknown":
       return <span className="completeness-icon completeness-unknown" title={c.reason}>?</span>;
   }
@@ -408,7 +412,10 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                   <div className="missing-tracks-list">
                     {release.completeness.missing_tracks.map((mt) => (
                       <span key={`${mt.disc_position}-${mt.track_position}`} className="missing-track-item">
-                        {recordingLink(mt.recording_id, `Disc ${mt.disc_position}, Track ${mt.track_position} — ${mt.title}`)}
+                        {mt.recording_id
+                          ? recordingLink(mt.recording_id, `Disc ${mt.disc_position}, Track ${mt.track_position}${mt.title ? ` — ${mt.title}` : ""}`)
+                          : <span>{`Disc ${mt.disc_position}, Track ${mt.track_position}`}</span>
+                        }
                       </span>
                     ))}
                   </div>
