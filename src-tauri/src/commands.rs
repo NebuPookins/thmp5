@@ -6,9 +6,10 @@ use crate::library::import::{
 };
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
-    FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats,
-    InitialSetupRequest, LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow,
-    QueueSettingsUpdate, RatingUpdateRequest, RecordingDetail, RecordingRatingUpdateResult,
+    FixMergedRecordingsStats, GuestAppearanceReleaseGroup, GuestAppearanceTrack, Id3FrameDebugInfo,
+    Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest, LibrarySummary,
+    PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
+    RatingUpdateRequest, RecordingArtistInfo, RecordingDetail, RecordingRatingUpdateResult,
     RecordingRow, ReleaseGroupDetail, ReleaseGroupRow, ReleaseInfo, SaveSmartPlaylistRequest,
     SeekRequest, SmartPlaylistResult, SourceDetail, VolumeRequest,
 };
@@ -66,6 +67,15 @@ const RECORDING_CTES: &str = "
       SELECT recording_id, file_path FROM source
       WHERE source_type = 'local_file' AND file_path IS NOT NULL
       ORDER BY recording_id, file_path
+    )
+    GROUP BY recording_id
+  ),
+  artists_agg AS (
+    SELECT recording_id, GROUP_CONCAT(artist_id, char(0)) AS artist_ids_raw
+    FROM (
+      SELECT recording_id, artist_id
+      FROM recording_artist
+      ORDER BY recording_id, position
     )
     GROUP BY recording_id
   ),
@@ -856,6 +866,16 @@ fn parse_recording_row(row: &sqlx::sqlite::SqliteRow) -> RecordingRow {
             })
             .unwrap_or_default()
         },
+        artist_ids: {
+            let raw: Option<String> = row.get("artist_ids_raw");
+            raw.map(|r| {
+                r.split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+        },
         source_paths: {
             let raw: Option<String> = row.get("source_paths_raw");
             raw.map(|r| {
@@ -942,6 +962,7 @@ async fn fetch_all_recordings_from_db(db: &crate::db::DbPool) -> Result<Vec<Reco
             sp.file_path                     AS primary_source_path,
             ta.tags_raw,
             spa.source_paths_raw,
+            aa.artist_ids_raw,
             ragg.releases_raw
          FROM recording r
          LEFT JOIN recording_artist ra  ON ra.recording_id = r.id AND ra.position = 0
@@ -952,6 +973,7 @@ async fn fetch_all_recordings_from_db(db: &crate::db::DbPool) -> Result<Vec<Reco
          LEFT JOIN source ps             ON ps.file_path = sp.file_path
          LEFT JOIN tags_agg ta           ON ta.recording_id = r.id
          LEFT JOIN source_paths_agg spa  ON spa.recording_id = r.id
+         LEFT JOIN artists_agg aa        ON aa.recording_id = r.id
          LEFT JOIN releases_agg ragg     ON ragg.recording_id = r.id
          ORDER BY lower(a.sort_name), lower(r.title)"
     ))
@@ -1099,7 +1121,17 @@ pub async fn list_release_groups(
              ON m.release_id = rel.id
          LEFT JOIN track t
              ON t.medium_id = m.id
-         WHERE (? IS NULL OR a.id = ?)
+         WHERE (
+               ? IS NULL
+               OR a.id = ?
+               OR EXISTS (
+                   SELECT 1 FROM recording_artist ra2
+                   JOIN track t2 ON t2.recording_id = ra2.recording_id
+                   JOIN medium m2 ON m2.id = t2.medium_id
+                   JOIN release rel2 ON rel2.id = m2.release_id
+                   WHERE rel2.release_group_id = rg.id AND ra2.artist_id = ?
+               )
+           )
            AND (
                ? IS NULL
                OR lower(rg.title) LIKE '%' || lower(?) || '%'
@@ -1108,6 +1140,7 @@ pub async fn list_release_groups(
          GROUP BY rg.id
          ORDER BY lower(COALESCE(a.sort_name, a.name, '')), lower(rg.title)",
     )
+    .bind(artist_filter)
     .bind(artist_filter)
     .bind(artist_filter)
     .bind(search_filter)
@@ -1263,6 +1296,7 @@ pub async fn evaluate_smart_playlist(
             sp.file_path                     AS primary_source_path,
             ta.tags_raw,
             spa.source_paths_raw,
+            aa.artist_ids_raw,
             ragg.releases_raw
          FROM recording r
          LEFT JOIN recording_artist ra  ON ra.recording_id = r.id AND ra.position = 0
@@ -1273,6 +1307,7 @@ pub async fn evaluate_smart_playlist(
          LEFT JOIN source ps             ON ps.file_path = sp.file_path
          LEFT JOIN tags_agg ta           ON ta.recording_id = r.id
          LEFT JOIN source_paths_agg spa  ON spa.recording_id = r.id
+         LEFT JOIN artists_agg aa        ON aa.recording_id = r.id
          LEFT JOIN releases_agg ragg     ON ragg.recording_id = r.id
          WHERE r.id IN (
              SELECT spv.id FROM smart_playlist_view spv WHERE {}
@@ -1309,6 +1344,16 @@ pub async fn evaluate_smart_playlist(
             primary_source_path: row.get("primary_source_path"),
             tags: {
                 let raw: Option<String> = row.get("tags_raw");
+                raw.map(|r| {
+                    r.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default()
+            },
+            artist_ids: {
+                let raw: Option<String> = row.get("artist_ids_raw");
                 raw.map(|r| {
                     r.split('\0')
                         .filter(|s| !s.is_empty())
@@ -1951,6 +1996,88 @@ pub async fn get_artist_detail(
         })
         .collect();
 
+    // Guest appearances — release groups where this artist appears as a
+    // secondary artist (e.g. via TXXX=ARTISTS).
+    let ga_rg_rows = sqlx::query(
+        "SELECT rg.id, rg.title, rg.rg_type,
+                MIN(rel.release_date) AS release_date,
+                COALESCE(rg.artist_credit_text, rga.credited_as, a2.name) AS artist_credit_name,
+                a2.id AS primary_artist_id
+         FROM recording_artist ra
+         JOIN track t ON t.recording_id = ra.recording_id
+         JOIN medium m ON m.id = t.medium_id
+         JOIN release rel ON rel.id = m.release_id
+         JOIN release_group rg ON rg.id = rel.release_group_id
+         LEFT JOIN release_group_artist rga ON rga.release_group_id = rg.id AND rga.position = 0
+         LEFT JOIN artist a2 ON a2.id = rga.artist_id
+         WHERE ra.artist_id = ?
+           AND ra.position > 0
+           AND NOT EXISTS (
+               SELECT 1 FROM release_group_artist rga2
+               WHERE rga2.release_group_id = rg.id
+                 AND rga2.artist_id = ra.artist_id
+                 AND rga2.position = 0
+           )
+         GROUP BY rg.id
+         ORDER BY rg.title",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut guest_appearances = Vec::new();
+    for rg_row in ga_rg_rows {
+        let rg_id: String = rg_row.get("id");
+
+        let track_rows = sqlx::query(
+            "SELECT t.recording_id, r.title AS recording_title,
+                    t.position AS track_position,
+                    m.position AS disc_position
+             FROM recording_artist ra
+             JOIN track t ON t.recording_id = ra.recording_id
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             JOIN recording r ON r.id = t.recording_id
+             WHERE ra.artist_id = ?
+               AND ra.position > 0
+               AND rg.id = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM release_group_artist rga2
+                   WHERE rga2.release_group_id = rg.id
+                     AND rga2.artist_id = ra.artist_id
+                     AND rga2.position = 0
+               )
+             ORDER BY m.position, t.position",
+        )
+        .bind(&id)
+        .bind(&rg_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let tracks = track_rows
+            .into_iter()
+            .map(|trow| GuestAppearanceTrack {
+                recording_id: trow.get("recording_id"),
+                recording_title: trow.get("recording_title"),
+                track_position: trow.get("track_position"),
+                disc_position: trow.get("disc_position"),
+            })
+            .collect();
+
+        guest_appearances.push(GuestAppearanceReleaseGroup {
+            id: rg_id,
+            title: rg_row.get("title"),
+            rg_type: rg_row.get("rg_type"),
+            release_date: rg_row.get("release_date"),
+            primary_artist_id: rg_row.get("primary_artist_id"),
+            artist_credit_name: rg_row.get("artist_credit_name"),
+            tracks,
+        });
+    }
+
     Ok(ArtistDetail {
         id: artist_row.get("id"),
         name: artist_row.get("name"),
@@ -1963,6 +2090,7 @@ pub async fn get_artist_detail(
             .unwrap_or(0),
         release_group_count: release_groups.len() as i64,
         release_groups,
+        guest_appearances,
     })
 }
 
@@ -2439,6 +2567,31 @@ pub async fn get_recording_detail(
         })
         .collect();
 
+    // All artists for this recording
+    let artist_rows = sqlx::query(
+        "SELECT a.id AS artist_id, a.name,
+                ra.position, ra.role, ra.credited_as
+         FROM recording_artist ra
+         JOIN artist a ON a.id = ra.artist_id
+         WHERE ra.recording_id = ?
+         ORDER BY ra.position",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let artists = artist_rows
+        .into_iter()
+        .map(|rrow| RecordingArtistInfo {
+            artist_id: rrow.get("artist_id"),
+            name: rrow.get("name"),
+            position: rrow.get("position"),
+            role: rrow.get("role"),
+            credited_as: rrow.get("credited_as"),
+        })
+        .collect();
+
     // Sources for this recording
     let source_rows = sqlx::query(
         "SELECT s.id, s.source_type, s.file_path, s.format, s.duration_ms,
@@ -2495,6 +2648,7 @@ pub async fn get_recording_detail(
         rating: row.get("rating"),
         play_count: row.get::<Option<i64>, _>("play_count").unwrap_or(0),
         last_played: row.get("last_played"),
+        artists,
         releases,
         sources,
     })

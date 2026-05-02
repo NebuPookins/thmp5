@@ -151,6 +151,7 @@ pub struct RecordingRow {
     pub primary_source_id: Option<String>,
     pub primary_source_path: Option<String>,
     pub tags: Vec<String>,
+    pub artist_ids: Vec<String>,
     pub source_paths: Vec<String>,
     pub releases: Vec<ReleaseInfo>,
 }
@@ -257,6 +258,8 @@ pub struct TrackMetadata {
     pub replay_gain_track_peak: Option<f64>,
     pub replay_gain_album_db: Option<f64>,
     pub replay_gain_album_peak: Option<f64>,
+    /// TXXX=ARTISTS — semicolon-separated list of additional artists.
+    pub artists: Option<String>,
 }
 
 #[derive(Debug)]
@@ -321,6 +324,7 @@ pub struct ArtistDetail {
     pub recording_count: i64,
     pub release_group_count: i64,
     pub release_groups: Vec<ArtistReleaseGroup>,
+    pub guest_appearances: Vec<GuestAppearanceReleaseGroup>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -333,6 +337,25 @@ pub struct ArtistReleaseGroup {
     pub rating: Option<f64>,
     pub primary_artist_id: Option<String>,
     pub artist_credit_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GuestAppearanceTrack {
+    pub recording_id: String,
+    pub recording_title: String,
+    pub track_position: Option<i64>,
+    pub disc_position: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GuestAppearanceReleaseGroup {
+    pub id: String,
+    pub title: String,
+    pub rg_type: Option<String>,
+    pub release_date: Option<String>,
+    pub primary_artist_id: Option<String>,
+    pub artist_credit_name: Option<String>,
+    pub tracks: Vec<GuestAppearanceTrack>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -418,8 +441,18 @@ pub struct RecordingDetail {
     pub rating: Option<i64>,
     pub play_count: i64,
     pub last_played: Option<String>,
+    pub artists: Vec<RecordingArtistInfo>,
     pub releases: Vec<ReleaseInfo>,
     pub sources: Vec<SourceDetail>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingArtistInfo {
+    pub artist_id: String,
+    pub name: String,
+    pub position: i64,
+    pub role: String,
+    pub credited_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

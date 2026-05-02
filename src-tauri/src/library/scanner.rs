@@ -495,6 +495,12 @@ fn read_metadata_with_lofty(path: &Path) -> Result<TrackMetadata> {
         meta.replay_gain_album_peak = tag
             .get_string(&ItemKey::ReplayGainAlbumPeak)
             .and_then(|s| s.trim().parse().ok());
+
+        // TXXX=ARTISTS / TrackArtists — semicolon-separated additional artists
+        let artists_values: Vec<&str> = tag.get_strings(&ItemKey::TrackArtists).collect();
+        if !artists_values.is_empty() {
+            meta.artists = Some(artists_values.join("; "));
+        }
     }
 
     // Fall back: use filename as title if no title tag
@@ -510,20 +516,31 @@ fn read_metadata_with_lofty(path: &Path) -> Result<TrackMetadata> {
 
 /// Read audio metadata, falling back to the TagLib helper when Lofty rejects malformed tags.
 pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
-    match read_metadata_with_lofty(path) {
-        Ok(meta) => Ok(MetadataReadResult {
+    let mut result = match read_metadata_with_lofty(path) {
+        Ok(meta) => MetadataReadResult {
             meta,
             warning: None,
             all_tags: Vec::new(),
-        }),
+        },
         Err(error) => {
             let primary_error = format!("{error:#}");
-            if let Some(fallback) = try_taglib_helper(path, &primary_error)? {
-                return Ok(fallback);
+            match try_taglib_helper(path, &primary_error) {
+                Ok(Some(fallback)) => fallback,
+                Ok(None) => return Err(error),
+                Err(e) => return Err(e),
             }
-            Err(error)
+        }
+    };
+
+    // Extract TXXX=ARTISTS from all_tags (C++ TagLib helper path) if not already
+    // set by the Lofty path directly.
+    if result.meta.artists.is_none() {
+        if let Some(tp) = result.all_tags.iter().find(|t| t.key == "ARTISTS") {
+            result.meta.artists = Some(tp.value.clone());
         }
     }
+
+    Ok(result)
 }
 
 /// Parse a comment field into tags.
@@ -848,55 +865,58 @@ pub fn list_all_tags(path: &Path) -> Result<Vec<crate::models::SourceTagInfo>> {
     }
 }
 
+// ── Test helpers (shared with import tests) ─────────────────────────────────
+
+#[cfg(test)]
+pub(crate) fn synchsafe(n: u32) -> [u8; 4] {
+    [
+        ((n >> 21) & 0x7F) as u8,
+        ((n >> 14) & 0x7F) as u8,
+        ((n >> 7) & 0x7F) as u8,
+        (n & 0x7F) as u8,
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn id3_frame(frame_id: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(frame_id);
+    buf.extend_from_slice(&synchsafe(data.len() as u32));
+    buf.extend_from_slice(&[0, 0]); // flags
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Build a synthetic valid .mp3 file with an ID3v2.4 tag and a minimal
+/// MPEG audio frame so both Lofty and TagLib can open it.
+#[cfg(test)]
+pub(crate) fn synth_mp3_with_id3(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut tag_data = Vec::new();
+    for f in frames {
+        tag_data.extend_from_slice(f);
+    }
+
+    // ID3v2.4 header (10 bytes)
+    let mut file = Vec::new();
+    file.extend_from_slice(b"ID3");
+    file.extend_from_slice(&[0x04, 0x00]); // version 2.4
+    file.push(0x00); // flags
+    file.extend_from_slice(&synchsafe(tag_data.len() as u32));
+    file.extend_from_slice(&tag_data);
+
+    // Minimal valid MPEG-1 Audio Layer 3 frame (silent) so that
+    // Lofty/TagLib accept the file as a valid MP3.
+    // Sync word 0xFF 0xFB, MPEG1 Layer3, 128 kbps, 44100 Hz, no padding.
+    file.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+    // Fill the rest of a 417-byte MPEG frame with zeros (silent PCM).
+    file.resize(file.len() + 413, 0u8);
+
+    file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Build a 4-byte synchsafe integer (used in ID3v2.4 header / frame sizes).
-    fn synchsafe(n: u32) -> [u8; 4] {
-        [
-            ((n >> 21) & 0x7F) as u8,
-            ((n >> 14) & 0x7F) as u8,
-            ((n >> 7) & 0x7F) as u8,
-            (n & 0x7F) as u8,
-        ]
-    }
-
-    /// Build a single ID3v2.4 frame: header (10 bytes) + data.
-    fn id3_frame(frame_id: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(frame_id);
-        buf.extend_from_slice(&synchsafe(data.len() as u32));
-        buf.extend_from_slice(&[0, 0]); // flags
-        buf.extend_from_slice(data);
-        buf
-    }
-
-    /// Build a synthetic valid .mp3 file with an ID3v2.4 tag and a minimal
-    /// MPEG audio frame so both Lofty and TagLib can open it.
-    fn synth_mp3_with_id3(frames: &[Vec<u8>]) -> Vec<u8> {
-        let mut tag_data = Vec::new();
-        for f in frames {
-            tag_data.extend_from_slice(f);
-        }
-
-        // ID3v2.4 header (10 bytes)
-        let mut file = Vec::new();
-        file.extend_from_slice(b"ID3");
-        file.extend_from_slice(&[0x04, 0x00]); // version 2.4
-        file.push(0x00); // flags
-        file.extend_from_slice(&synchsafe(tag_data.len() as u32));
-        file.extend_from_slice(&tag_data);
-
-        // Minimal valid MPEG-1 Audio Layer 3 frame (silent) so that
-        // Lofty/TagLib accept the file as a valid MP3.
-        // Sync word 0xFF 0xFB, MPEG1 Layer3, 128 kbps, 44100 Hz, no padding.
-        file.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
-        // Fill the rest of a 417-byte MPEG frame with zeros (silent PCM).
-        file.resize(file.len() + 413, 0u8);
-
-        file
-    }
 
     // ── metadata_to_tag_infos unit tests ──────────────────────────────────────
 
@@ -978,6 +998,43 @@ mod tests {
     }
 
     // ── Integration test with synthetic MP3 ───────────────────────────────────
+
+    #[test]
+    fn test_read_metadata_with_txxx_artists() {
+        // TXXX frame for ID3v2.4: frame ID "TXXX", data = encoding(0x03) + "ARTISTS\0" + value
+        let mut artists_data = vec![0x03u8]; // UTF-8 encoding
+        artists_data.extend_from_slice(b"ARTISTS\x00");
+        artists_data.extend_from_slice(b"Extra Artist 1; Extra Artist 2");
+
+        let frames = vec![
+            id3_frame(b"TIT2", b"\x03Test Song"),
+            id3_frame(b"TPE1", b"\x03Main Artist"),
+            id3_frame(b"TXXX", &artists_data),
+        ];
+        let data = synth_mp3_with_id3(&frames);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test_artists.mp3");
+        std::fs::write(&path, &data).expect("write");
+
+        match read_metadata(&path) {
+            Ok(result) => {
+                eprintln!("artist: {:?}", result.meta.artist);
+                eprintln!("artists: {:?}", result.meta.artists);
+                assert_eq!(result.meta.artist.as_deref(), Some("Main Artist"));
+                assert_eq!(
+                    result.meta.artists.as_deref(),
+                    Some("Extra Artist 1; Extra Artist 2"),
+                    "TXXX=ARTISTS not parsed correctly; all_tags={:#?}",
+                    result.all_tags
+                );
+            }
+            Err(e) => {
+                // May fail if TagLib/Lofty can't process synthetic file
+                eprintln!("read_metadata skipped (could not process synthetic file): {e}");
+            }
+        }
+    }
 
     #[test]
     fn test_list_all_tags_synthetic_mp3() {

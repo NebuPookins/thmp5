@@ -44,6 +44,23 @@ type ArtistReleaseGroup = {
   artist_credit_name: string | null;
 };
 
+type GuestAppearanceTrack = {
+  recording_id: string;
+  recording_title: string;
+  track_position: number | null;
+  disc_position: number | null;
+};
+
+type GuestAppearanceReleaseGroup = {
+  id: string;
+  title: string;
+  rg_type: string | null;
+  release_date: string | null;
+  primary_artist_id: string | null;
+  artist_credit_name: string | null;
+  tracks: GuestAppearanceTrack[];
+};
+
 type ArtistDetail = {
   id: string;
   name: string;
@@ -54,6 +71,7 @@ type ArtistDetail = {
   recording_count: number;
   release_group_count: number;
   release_groups: ArtistReleaseGroup[];
+  guest_appearances: GuestAppearanceReleaseGroup[];
 };
 
 // ── Release group detail types ──────────────────────────────────────────────
@@ -115,6 +133,14 @@ type ReleaseGroupDetail = {
 
 // ── Recording detail types ──────────────────────────────────────────────────
 
+type RecordingArtistInfo = {
+  artist_id: string;
+  name: string;
+  position: number;
+  role: string;
+  credited_as: string | null;
+};
+
 type RecordingDetail = {
   id: string;
   title: string;
@@ -130,6 +156,7 @@ type RecordingDetail = {
   rating: number | null;
   play_count: number;
   last_played: string | null;
+  artists: RecordingArtistInfo[];
   releases: ReleaseInfo[];
   sources: SourceDetail[];
 };
@@ -354,6 +381,43 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
               </div>
             )}
           </div>
+
+          {artist.guest_appearances.length > 0 && (
+            <div className="entity-detail-section">
+              <h3 className="entity-detail-section-title">Guest appearances ({artist.guest_appearances.length})</h3>
+              {artist.guest_appearances.map((ga) => (
+                <div key={ga.id} className="entity-detail-list" style={{ marginBottom: 8 }}>
+                  <div className="entity-detail-list-item">
+                    <div className="entity-detail-list-item-main">
+                      {releaseGroupLink(ga.id, ga.title)}
+                      {ga.rg_type && <span className="entity-detail-badge">{ga.rg_type}</span>}
+                    </div>
+                    <div className="entity-detail-list-item-meta">
+                      {ga.artist_credit_name && ga.primary_artist_id && (
+                        <span>by {artistLink(ga.primary_artist_id, ga.artist_credit_name)}</span>
+                      )}
+                      {ga.release_date && <span> · {formatYear(ga.release_date)}</span>}
+                    </div>
+                  </div>
+                  <div className="entity-detail-section" style={{ paddingLeft: 16, marginTop: 4 }}>
+                    {ga.tracks.map((track) => {
+                      const pos = track.disc_position != null
+                        ? `Disc ${track.disc_position}, Track ${track.track_position ?? "—"}`
+                        : track.track_position != null
+                          ? `Track ${track.track_position}`
+                          : null;
+                      return (
+                        <div key={track.recording_id} className="entity-detail-list-item" style={{ padding: "2px 0" }}>
+                          {pos && <span className="subtle-text">{pos}: </span>}
+                          {recordingLink(track.recording_id, track.recording_title)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </section>
     );
@@ -493,6 +557,17 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
               <p>{artistLink(recording.primary_artist_id, recording.artist_credit_name)}</p>
             ) : (
               <p className="subtle-text">Unknown Artist</p>
+            )}
+            {recording.artists.length > 1 && (
+              <p className="subtle-text">
+                with {recording.artists.filter(a => a.position > 0).map((a, i, arr) => (
+                  <span key={a.artist_id}>
+                    {artistLink(a.artist_id, a.credited_as ?? a.name)}
+                    {a.role !== "main" && <span> ({a.role})</span>}
+                    {i < arr.length - 1 && <span>, </span>}
+                  </span>
+                ))}
+              </p>
             )}
             <div className="entity-detail-stats">
               <span>{formatDuration(recording.duration_ms)}</span>

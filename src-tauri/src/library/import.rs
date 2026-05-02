@@ -116,18 +116,8 @@ pub async fn rescan_source(
     .context("Failed to load source for rescan")?
     .ok_or_else(|| anyhow::anyhow!("Source not found for path: {}", path.display()))?;
 
-    let current_artist_id: Option<String> = sqlx::query_scalar(
-        "SELECT ra.artist_id
-         FROM recording_artist ra
-         WHERE ra.recording_id = ? AND ra.position = 0",
-    )
-    .bind(&existing_source.1)
-    .fetch_optional(&mut *conn)
-    .await
-    .context("Failed to load current artist for rescan")?;
-    drop(conn);
-
     let (source_id, recording_id) = existing_source;
+    drop(conn);
     let (file_size, file_mtime_ms) = file_identity(path).context("Failed to read file metadata")?;
 
     struct BlockingResult {
@@ -202,7 +192,6 @@ pub async fn rescan_source(
         .unwrap_or("Unknown Artist")
         .to_string();
     let artist_id = get_or_create_artist(&mut tx, &artist_name).await?;
-    let artist_changed = current_artist_id.as_deref() != Some(&artist_id);
 
     let album_artist_name = blocking
         .meta
@@ -274,13 +263,40 @@ pub async fn rescan_source(
 
     sync_tags_from_comment(&mut tx, &recording_id, blocking.meta.comment.as_deref()).await?;
 
-    if artist_changed {
-        sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
-            .bind(&recording_id)
-            .execute(&mut *tx)
-            .await
-            .context("Failed to replace recording artist during source rescan")?;
-        insert_recording_artist(&mut tx, &recording_id, &artist_id, 0, "main").await?;
+    // Replace recording artist (handles artist metadata changes and TXXX=ARTISTS).
+    sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
+        .bind(&recording_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to replace recording artist during source rescan")?;
+    insert_recording_artist(&mut tx, &recording_id, &artist_id, 0, "main").await?;
+
+    // Additional artists from TXXX=ARTISTS
+    if let Some(artists_str) = &blocking.meta.artists {
+        let primary_artist_lower = artist_name.to_lowercase();
+        let next_pos = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(position) FROM recording_artist WHERE recording_id = ?",
+        )
+        .bind(&recording_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+        .unwrap_or(0)
+            + 1;
+
+        for (i, name) in artists_str
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .enumerate()
+        {
+            if name.to_lowercase() == primary_artist_lower {
+                continue;
+            }
+            let aid = get_or_create_artist(&mut tx, name).await?;
+            insert_recording_artist(&mut tx, &recording_id, &aid, next_pos + i as i64, "main")
+                .await?;
+        }
     }
 
     if let Some(track_id) = existing_track_id {
@@ -651,6 +667,34 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         find_or_create_recording(&mut tx, &meta, &artist_id, acoustid_match.as_ref()).await?
     };
     sync_tags_from_comment(&mut tx, &recording_id, meta.comment.as_deref()).await?;
+
+    // ── 8b. Additional artists from TXXX=ARTISTS ──────────────────────────
+    if let Some(artists_str) = &meta.artists {
+        let primary_artist_lower = artist_name.to_lowercase();
+        let next_pos = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(position) FROM recording_artist WHERE recording_id = ?",
+        )
+        .bind(&recording_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+        .unwrap_or(0)
+            + 1;
+
+        for (i, name) in artists_str
+            .split(';')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .enumerate()
+        {
+            if name.to_lowercase() == primary_artist_lower {
+                continue;
+            }
+            let aid = get_or_create_artist(&mut tx, name).await?;
+            insert_recording_artist(&mut tx, &recording_id, &aid, next_pos + i as i64, "main")
+                .await?;
+        }
+    }
 
     // ── 9. ReleaseGroup / Release / Medium ────────────────────────────────────
     let album_title = meta.album.as_deref().unwrap_or("Unknown Album").to_string();
@@ -1117,6 +1161,7 @@ mod tests {
             replay_gain_track_peak: None,
             replay_gain_album_db: None,
             replay_gain_album_peak: None,
+            artists: None,
         };
 
         let meta2 = TrackMetadata {
@@ -1170,6 +1215,211 @@ mod tests {
         assert_eq!(
             rg_count, 1,
             "Both tracks should be grouped into one release group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rescan_source_picks_up_txxx_artists() {
+        let tmp = TempDir::new().unwrap();
+
+        // Build a synthetic MP3 with TXXX=ARTISTS
+        let mut artists_frame_data = vec![0x03u8]; // UTF-8 encoding
+        artists_frame_data.extend_from_slice(b"ARTISTS\x00");
+        artists_frame_data.extend_from_slice(b"Extra Artist 1; Extra Artist 2");
+
+        let frames = vec![
+            crate::library::scanner::id3_frame(b"TIT2", b"\x03Test Song"),
+            crate::library::scanner::id3_frame(b"TPE1", b"\x03Main Artist"),
+            crate::library::scanner::id3_frame(b"TXXX", &artists_frame_data),
+        ];
+        let mp3_data = crate::library::scanner::synth_mp3_with_id3(&frames);
+        let file_path = tmp.path().join("test.mp3");
+        std::fs::write(&file_path, &mp3_data).unwrap();
+
+        // Create test DB
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+
+        let path_str = file_path.to_string_lossy().to_string();
+        let (file_size, file_mtime_ms) = file_identity(&file_path).unwrap();
+        let hash = file_sha256(&file_path).unwrap();
+
+        // Step 1: Import with artists: None (simulating old code that didn't
+        // parse TXXX=ARTISTS, so only the primary artist gets stored).
+        let meta = TrackMetadata {
+            title: Some("Test Song".into()),
+            artist: Some("Main Artist".into()),
+            album: Some("Test Album".into()),
+            duration_ms: 200000,
+            format: "mp3".into(),
+            track_number: Some(1),
+            track_total: Some(1),
+            disc_number: Some(1),
+            artists: None,
+            ..Default::default()
+        };
+
+        let prepared = PreparedImport {
+            path: file_path.clone(),
+            path_str: path_str.clone(),
+            existing_source_id: None,
+            hash: hash.clone(),
+            meta,
+            warnings: vec![],
+            file_size,
+            file_mtime_ms,
+            fp: None,
+            acoustid_match: None,
+        };
+
+        store_prepared_import(&pool, prepared).await.unwrap();
+
+        // Verify only the primary artist exists after import
+        let mut conn = pool.acquire("test.verify.initial").await.unwrap();
+        let initial_artists: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT a.name, ra.position
+             FROM recording_artist ra
+             JOIN artist a ON a.id = ra.artist_id
+             WHERE ra.recording_id = (
+                 SELECT recording_id FROM source WHERE file_path = ? AND source_type = 'local_file'
+             )
+             ORDER BY ra.position",
+        )
+        .bind(&path_str)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            initial_artists.len(),
+            1,
+            "Should have only the primary artist before rescan"
+        );
+        assert_eq!(initial_artists[0].0, "Main Artist");
+        assert_eq!(initial_artists[0].1, 0);
+        drop(conn);
+
+        // Step 2: Rescan — should now read TXXX=ARTISTS and add extra artists
+        let serializer = tokio::sync::Semaphore::new(1);
+        rescan_source(&pool, &file_path, None, &serializer, true)
+            .await
+            .unwrap();
+
+        // Verify all three artists now exist
+        let mut conn = pool.acquire("test.verify.after").await.unwrap();
+        let artists_after: Vec<String> = sqlx::query_scalar(
+            "SELECT a.name
+             FROM recording_artist ra
+             JOIN artist a ON a.id = ra.artist_id
+             WHERE ra.recording_id = (
+                 SELECT recording_id FROM source WHERE file_path = ? AND source_type = 'local_file'
+             )
+             ORDER BY ra.position",
+        )
+        .bind(&path_str)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            artists_after,
+            vec!["Main Artist", "Extra Artist 1", "Extra Artist 2"],
+            "Rescan should have added TXXX=ARTISTS artists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guest_appearances_exclude_album_artist() {
+        // When an artist appears in both TXXX=ARTISTS AND as the album artist
+        // (release_group_artist.position = 0), they should NOT show up as a
+        // "guest appearance" — they're the album's primary artist.
+
+        let tmp = TempDir::new().unwrap();
+
+        // Build a synthetic MP3 with album_artist matching TXXX=ARTISTS value
+        // TIT2 = "Test Song", TPE1 = "Track Artist", TPE2 = "Album Artist",
+        // TXXX=ARTISTS = "Album Artist"
+        let mut artists_data = vec![0x03u8];
+        artists_data.extend_from_slice(b"ARTISTS\x00");
+        artists_data.extend_from_slice(b"Album Artist");
+
+        let frames = vec![
+            crate::library::scanner::id3_frame(b"TIT2", b"\x03Test Song"),
+            crate::library::scanner::id3_frame(b"TPE1", b"\x03Track Artist"),
+            crate::library::scanner::id3_frame(b"TPE2", b"\x03Album Artist"),
+            crate::library::scanner::id3_frame(b"TXXX", &artists_data),
+        ];
+        let mp3_data = crate::library::scanner::synth_mp3_with_id3(&frames);
+        let file_path = tmp.path().join("test.mp3");
+        std::fs::write(&file_path, &mp3_data).unwrap();
+
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let path_str = file_path.to_string_lossy().to_string();
+        let (file_size, file_mtime_ms) = file_identity(&file_path).unwrap();
+        let hash = file_sha256(&file_path).unwrap();
+
+        let meta = TrackMetadata {
+            title: Some("Test Song".into()),
+            artist: Some("Track Artist".into()),
+            album_artist: Some("Album Artist".into()),
+            album: Some("Test Album".into()),
+            duration_ms: 200000,
+            format: "mp3".into(),
+            track_number: Some(1),
+            track_total: Some(1),
+            disc_number: Some(1),
+            artists: Some("Album Artist".into()),
+            ..Default::default()
+        };
+
+        let prepared = PreparedImport {
+            path: file_path,
+            path_str,
+            existing_source_id: None,
+            hash,
+            meta,
+            warnings: vec![],
+            file_size,
+            file_mtime_ms,
+            fp: None,
+            acoustid_match: None,
+        };
+
+        store_prepared_import(&pool, prepared).await.unwrap();
+
+        // Find the album artist's ID — they should have zero guest appearances
+        // since they are the album artist for the only release group.
+        let mut conn = pool.acquire("test.ga").await.unwrap();
+        let album_artist_id: String =
+            sqlx::query_scalar("SELECT id FROM artist WHERE name = 'Album Artist'")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+
+        // This mirrors the guest-appearance query from get_artist_detail
+        let ga_release_groups: Vec<String> = sqlx::query_scalar(
+            "SELECT rg.id
+             FROM recording_artist ra
+             JOIN track t ON t.recording_id = ra.recording_id
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             WHERE ra.artist_id = ?
+               AND ra.position > 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM release_group_artist rga2
+                   WHERE rga2.release_group_id = rg.id
+                     AND rga2.artist_id = ra.artist_id
+                     AND rga2.position = 0
+               )",
+        )
+        .bind(&album_artist_id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+
+        assert!(
+            ga_release_groups.is_empty(),
+            "Album Artist should not appear in guest appearances when they are the album artist; got {ga_release_groups:?}"
         );
     }
 }

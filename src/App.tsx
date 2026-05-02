@@ -88,6 +88,7 @@ type RecordingRow = {
   primary_source_id: string | null;
   primary_source_path: string | null;
   tags: string[];
+  artist_ids: string[];
   source_paths: string[];
   releases: ReleaseInfo[];
 };
@@ -545,7 +546,10 @@ function App() {
     return recordings
       .filter((recording) => {
         if (selectedArtist) {
-          if (recording.primary_artist_id !== selectedArtist.id) {
+          if (
+            recording.primary_artist_id !== selectedArtist.id &&
+            !recording.artist_ids.includes(selectedArtist.id)
+          ) {
             return false;
           }
         }
@@ -2037,6 +2041,7 @@ function App() {
                       play_count: 0,
                       last_played: null,
                       tags: [],
+                      artist_ids: [],
                       source_paths: [],
                       releases: [],
                     };
