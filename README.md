@@ -6,16 +6,25 @@ thmp: **TH**eoretical **M**usic **P**layer, pronounced like a bass drum kick.
 
 ### What is it?
 
-A desktop application that figures out what kind of music you like, and plays
-that music for you, without forcing you to worry about details such as whether
-or not the music exists as a file on your harddrive.
+A desktop music player that takes heavy inspiration from the
+[MusicBrainz](https://musicbrainz.org) data model to correctly model
+your music collection — something most players get wrong.
 
-You have mp3s on your harddrive? Great, I'll play those. Oh, it looks like a lot
-of these mp3 files are recordings of Daft Punk. It looks like Daft Punk
-released a new single last week, and the song's available on YouTube. I'll play
-that for you next. And it looks like there's a bootleg Daft Punk mashup on
-Soundcloud. I'll queue that one up for you right after this Grooveshark mix I
-found.
+In thmp5, a **recording** (a specific performance of a song) is distinct
+from a **source** (the mp3 file you own, or a YouTube URL you found).
+A recording can have multiple sources, and can appear on multiple
+**releases** (albums, singles, compilations). Multiple **artists** can
+be credited on a single recording with proper join phrases ("feat.",
+"&", etc.). And the model goes further, distinguishing the abstract
+**work** (the song itself) from every recording of it — so a live
+performance and a studio track are linked to the same work even though
+they're different recordings.
+
+The result: ratings, play counts, and smart playlist membership follow
+the music itself, not whichever file happened to be on your hard drive.
+Import your collection, fingerprint it against AcoustID, and thmp5
+builds a unified library that understands your music the same way you
+do.
 
 
 ## Technical Details
@@ -147,3 +156,9 @@ ACOUSTID_API_KEY=your_key_here npm run tauri dev
 ```
 
 Without the key the import pipeline still works — it falls back to tag-based deduplication.
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0. See [`LICENSE`](LICENSE) for details.
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the licensing terms that apply to contributed code.

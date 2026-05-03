@@ -2,8 +2,9 @@
 name = "thmp5"
 version = "0.1.0"
 description = "thmp5 music player"
-authors = []
+authors = ["Nebu Pookins"]
 edition = "2021"
+license = "AGPL-3.0-only"
 
 [lib]
 name = "thmp5_lib"

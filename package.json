@@ -1,7 +1,9 @@
 {
-  "name": "thmp5-scaffold",
+  "name": "thmp5",
   "private": true,
+  "license": "AGPL-3.0-only",
   "version": "0.1.0",
+  "description": "A desktop music player with proper artist, recording, and album data modeling",
   "type": "module",
   "scripts": {
     "dev": "vite",

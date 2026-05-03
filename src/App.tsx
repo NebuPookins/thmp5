@@ -1657,7 +1657,7 @@ function App() {
               id="music-root"
               className="path-input"
               onChange={(event) => setWizardPath(event.currentTarget.value)}
-              placeholder="/home/nebu/Music"
+              placeholder="/home/user/Music"
               value={wizardPath}
             />
 
