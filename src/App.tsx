@@ -2157,8 +2157,18 @@ function App() {
                               {sortColumn === col ? (sortAsc ? " ↑" : " ↓") : ""}
                             </th>
                           ))}
+                          {(["rating", "duration"] as SortColumn[]).map((col) => (
+                            <th
+                              key={col}
+                              className="sortable-th"
+                              onClick={() => handleColumnSort(col)}
+                            >
+                              {col.charAt(0).toUpperCase() + col.slice(1)}
+                              {sortColumn === col ? (sortAsc ? " ↑" : " ↓") : ""}
+                            </th>
+                          ))}
                           <th>Tags</th>
-                          {(["rating", "duration", "plays", "last_played"] as SortColumn[]).map((col) => (
+                          {(["plays", "last_played"] as SortColumn[]).map((col) => (
                             <th
                               key={col}
                               className="sortable-th"
@@ -2221,6 +2231,15 @@ function App() {
                                     }
                                   </td>
                                   <td>{recording.genre ?? "—"}</td>
+                                  <td>
+                                    <RatingStars
+                                      disabled={ratingKeyInFlight === `recording:${recording.id}`}
+                                      onRate={handleRate}
+                                      recordingId={recording.id}
+                                      value={recording.rating}
+                                    />
+                                  </td>
+                                  <td>{formatDuration(recording.duration_ms)}</td>
                                   <td
                                     onClick={(e) => e.stopPropagation()}
                                     onDoubleClick={(e) => e.stopPropagation()}
@@ -2241,15 +2260,6 @@ function App() {
                                       ))}
                                     </div>
                                   </td>
-                                  <td>
-                                    <RatingStars
-                                      disabled={ratingKeyInFlight === `recording:${recording.id}`}
-                                      onRate={handleRate}
-                                      recordingId={recording.id}
-                                      value={recording.rating}
-                                    />
-                                  </td>
-                                  <td>{formatDuration(recording.duration_ms)}</td>
                                   <td>{recording.play_count}</td>
                                   <td>{formatLastPlayed(recording.last_played)}</td>
                                   <td className="source-paths-cell">
