@@ -1067,22 +1067,26 @@ thead th {
 
 .tag-chips {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 4px;
   align-items: center;
+  overflow: hidden;
 }
 
 .tag-chip {
   display: inline-flex;
   align-items: center;
   gap: 3px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   background: #2a2a3a;
   border: 1px solid #444;
   border-radius: 3px;
   padding: 1px 6px;
   font-size: 0.72rem;
   cursor: pointer;
-  white-space: nowrap;
 }
 
 .tag-chip:hover {
