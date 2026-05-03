@@ -469,6 +469,24 @@ function App() {
   const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
+
+  const COLUMN_KEYS = ["title", "artist", "releases", "genre", "rating", "duration", "tags", "plays", "last_played", "sources"] as const;
+  const DEFAULT_COL_WIDTHS: Record<string, number> = {
+    title: 300, artist: 200, releases: 280, genre: 90, rating: 110,
+    duration: 80, tags: 150, plays: 65, last_played: 120, sources: 300,
+  };
+  const [colWidths, setColWidths] = useState<Record<string, number>>(() => {
+    try {
+      const saved = localStorage.getItem("colWidths");
+      if (saved) return { ...DEFAULT_COL_WIDTHS, ...JSON.parse(saved) };
+    } catch { /* ignore */ }
+    return DEFAULT_COL_WIDTHS;
+  });
+  useEffect(() => {
+    const timer = setTimeout(() => localStorage.setItem("colWidths", JSON.stringify(colWidths)), 300);
+    return () => clearTimeout(timer);
+  }, [colWidths]);
+  const activeResize = useRef<{ column: string; startX: number; startWidth: number } | null>(null);
   const [navState, dispatchNav] = useReducer(navReducer, null);
   const detailView = navState ? navState.stack[navState.index] : null;
   const canGoBack = navState ? navState.index > 0 : false;
@@ -670,6 +688,36 @@ function App() {
       setSortColumn(col);
       setSortAsc(true);
     }
+  }
+
+  function onColumnResizeStart(e: React.MouseEvent, column: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    const th = (e.currentTarget as HTMLElement).closest("th");
+    if (!th) return;
+    const rect = th.getBoundingClientRect();
+    activeResize.current = { column, startX: e.clientX, startWidth: rect.width };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!activeResize.current) return;
+      const { column, startX, startWidth } = activeResize.current;
+      const newWidth = Math.round(Math.max(40, startWidth + (e.clientX - startX)));
+      setColWidths((prev) => ({ ...prev, [column]: newWidth }));
+    };
+
+    const onMouseUp = () => {
+      activeResize.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
   }
 
   function enqueueAll(recordings: RecordingRow[]) {
@@ -2145,6 +2193,11 @@ function App() {
                   ) : null}
                   <div className="table-wrap track-table-wrap" ref={trackTableScrollRef}>
                     <table className="recordings-table">
+                      <colgroup>
+                        {COLUMN_KEYS.map((key) => (
+                          <col key={key} style={{ width: colWidths[key] }} />
+                        ))}
+                      </colgroup>
                       <thead>
                         <tr>
                           {(["title", "artist", "releases", "genre"] as SortColumn[]).map((col) => (
@@ -2155,6 +2208,7 @@ function App() {
                             >
                               {col.charAt(0).toUpperCase() + col.slice(1)}
                               {sortColumn === col ? (sortAsc ? " ↑" : " ↓") : ""}
+                              <div className="column-resize-handle" onMouseDown={(e) => onColumnResizeStart(e, col)} />
                             </th>
                           ))}
                           {(["rating", "duration"] as SortColumn[]).map((col) => (
@@ -2165,9 +2219,13 @@ function App() {
                             >
                               {col.charAt(0).toUpperCase() + col.slice(1)}
                               {sortColumn === col ? (sortAsc ? " ↑" : " ↓") : ""}
+                              <div className="column-resize-handle" onMouseDown={(e) => onColumnResizeStart(e, col)} />
                             </th>
                           ))}
-                          <th>Tags</th>
+                          <th>
+                            Tags
+                            <div className="column-resize-handle" onMouseDown={(e) => onColumnResizeStart(e, "tags")} />
+                          </th>
                           {(["plays", "last_played"] as SortColumn[]).map((col) => (
                             <th
                               key={col}
@@ -2176,9 +2234,13 @@ function App() {
                             >
                               {col === "last_played" ? "Last played" : col.charAt(0).toUpperCase() + col.slice(1)}
                               {sortColumn === col ? (sortAsc ? " ↑" : " ↓") : ""}
+                              <div className="column-resize-handle" onMouseDown={(e) => onColumnResizeStart(e, col)} />
                             </th>
                           ))}
-                          <th>Sources</th>
+                          <th>
+                            Sources
+                            <div className="column-resize-handle" onMouseDown={(e) => onColumnResizeStart(e, "sources")} />
+                          </th>
                         </tr>
                       </thead>
                       <tbody>

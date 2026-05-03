@@ -406,6 +406,25 @@ thead th {
   letter-spacing: 0.08em;
 }
 
+.track-table-wrap .recordings-table {
+  table-layout: fixed;
+}
+
+.column-resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 2;
+}
+
+.column-resize-handle:hover,
+.column-resize-handle:active {
+  background: rgba(124, 148, 177, 0.3);
+}
+
 .sortable-th {
   cursor: pointer;
   user-select: none;
