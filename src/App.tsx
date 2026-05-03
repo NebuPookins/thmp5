@@ -2099,6 +2099,7 @@ function App() {
                       setQueue((q) => [...q, item]);
                     }
                   }}
+                  onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">

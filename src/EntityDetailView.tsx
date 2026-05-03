@@ -219,9 +219,10 @@ type Props = {
   onClose: () => void;
   onSourceContextMenu?: (e: React.MouseEvent<HTMLDivElement>, filePath: string) => void;
   onEnqueueTrack?: (track: TrackDetail) => void;
+  onRescanReleaseGroup?: (releaseGroupId: string) => void;
 };
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanReleaseGroup }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [artist, setArtist] = useState<ArtistDetail | null>(null);
@@ -451,6 +452,16 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
               <span>{releaseGroup.releases.length} release{releaseGroup.releases.length !== 1 ? "s" : ""}</span>
               <span className="status-bar-sep">·</span>
               <span className="rating-summary">{formatAlbumRating(releaseGroup.rating)}</span>
+            </div>
+            <div className="entity-detail-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                title="Re-read metadata from all source files in this album"
+                onClick={() => onRescanReleaseGroup?.(releaseGroup.id)}
+              >
+                Rescan all sources
+              </button>
             </div>
           </div>
 

@@ -78,6 +78,12 @@
   color: #8fa5c2;
 }
 
+.entity-detail-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
 /* ── Sections ─────────────────────────────────────────────────────────────── */
 
 .entity-detail-section {
