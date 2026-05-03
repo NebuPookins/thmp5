@@ -700,9 +700,12 @@ fn ensure_output_stream(
     ctx: &Arc<AudioCallbackCtx>,
     app: &AppHandle,
 ) -> Result<()> {
-    if stream.is_some() {
-        return Ok(());
-    }
+    // Rebuild the output stream on every Play/Resume so that device changes after
+    // system suspend/resume,  idle timeouts, or hotplug events are picked up.  cpal
+    // does not expose a "stream is still valid" check, and the error callback on the
+    // old stream is fire-and-forget, so caching a single stream for the app lifetime
+    // silently fails after the audio sink is invalidated overnight.
+    *stream = None;
 
     let (device, supported_config) = select_output_device(host)?;
     let stream_config = supported_config.config();
