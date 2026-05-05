@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./EntityDetailView.css";
 
@@ -99,7 +99,12 @@ type MediumDetail = {
 type ReleaseCompleteness =
   | { type: "complete" }
   | { type: "incomplete"; missing_tracks: MissingTrackDetail[] }
-  | { type: "unknown"; reason: string };
+  | { type: "unknown"; reason: string; disagreement_groups: SourceDisagreementGroup[] };
+
+type SourceDisagreementGroup = {
+  description: string;
+  source_paths: string[];
+};
 
 type ReleaseDetail = {
   id: string;
@@ -220,14 +225,16 @@ type Props = {
   onSourceContextMenu?: (e: React.MouseEvent<HTMLDivElement>, filePath: string) => void;
   onEnqueueTrack?: (track: TrackDetail) => void;
   onRescanReleaseGroup?: (releaseGroupId: string) => void;
+  onRefreshLibrary?: () => void;
 };
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanReleaseGroup }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanReleaseGroup, onRefreshLibrary }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [artist, setArtist] = useState<ArtistDetail | null>(null);
   const [releaseGroup, setReleaseGroup] = useState<ReleaseGroupDetail | null>(null);
   const [recording, setRecording] = useState<RecordingDetail | null>(null);
+  const [showMergePanel, setShowMergePanel] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -462,7 +469,29 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
               >
                 Rescan all sources
               </button>
+              {!showMergePanel && (
+                <button
+                  className="secondary-button"
+                  type="button"
+                  title="Merge this album into another"
+                  onClick={() => setShowMergePanel(true)}
+                >
+                  Merge album…
+                </button>
+              )}
             </div>
+            {showMergePanel && (
+              <MergePanel
+                currentGroupId={releaseGroup.id}
+                currentGroupTitle={releaseGroup.title}
+                onMergeComplete={(targetId) => {
+                  setShowMergePanel(false);
+                  onRefreshLibrary?.();
+                  onNavigate({ type: "release_group", id: targetId });
+                }}
+                onCancel={() => setShowMergePanel(false)}
+              />
+            )}
           </div>
 
           {releaseGroup.releases.map((release) => (
@@ -475,7 +504,17 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                 </h3>
               </div>
               {release.completeness.type === "unknown" && (
-                <p className="subtle-text completeness-reason">{release.completeness.reason}</p>
+                <div className="completeness-disagreement">
+                  <p className="subtle-text completeness-reason">{release.completeness.reason}</p>
+                  {release.completeness.disagreement_groups.map((group, gi) => (
+                    <div key={gi} className="disagreement-group">
+                      <p className="disagreement-group-header">{group.description}:</p>
+                      {group.source_paths.map((path, pi) => (
+                        <p key={pi} className="disagreement-source-path">{path}</p>
+                      ))}
+                    </div>
+                  ))}
+                </div>
               )}
               {release.country && <p className="subtle-text">Country: {release.country}</p>}
               {release.label && <p className="subtle-text">Label: {release.label}</p>}
@@ -703,5 +742,122 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
         <p className="empty-browser-state">Unknown entity type.</p>
       </div>
     </section>
+  );
+}
+
+// ── Merge panel ─────────────────────────────────────────────────────────────
+
+type MergePanelProps = {
+  currentGroupId: string;
+  currentGroupTitle: string;
+  onMergeComplete: (targetGroupId: string) => void;
+  onCancel: () => void;
+};
+
+type SearchResultRow = {
+  id: string;
+  title: string;
+  artist_credit_name: string | null;
+  recording_count: number;
+};
+
+function MergePanel({ currentGroupId, currentGroupTitle, onMergeComplete, onCancel }: MergePanelProps) {
+  const [searchText, setSearchText] = useState("");
+  const [results, setResults] = useState<SearchResultRow[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleSearch = useCallback((value: string) => {
+    setSearchText(value);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!value.trim()) {
+      setResults([]);
+      return;
+    }
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const rows = await invoke<SearchResultRow[]>("list_release_groups", {
+          search: value.trim(),
+        });
+        setResults(rows.filter((r) => r.id !== currentGroupId));
+      } catch {
+        // ignore search errors
+      } finally {
+        setSearching(false);
+      }
+    }, 300);
+  }, [currentGroupId]);
+
+  async function handleSelectTarget(targetId: string, targetTitle: string) {
+    if (!window.confirm(
+      `Merge "${targetTitle}" into "${currentGroupTitle}"?\n\n` +
+      `All tracks from "${targetTitle}" will be moved into "${currentGroupTitle}". ` +
+      `"${targetTitle}" will be deleted.`
+    )) return;
+
+    setMerging(true);
+    setMergeError(null);
+    try {
+      const primaryId = await invoke<string>("merge_release_groups", {
+        primaryId: currentGroupId,
+        duplicateId: targetId,
+      });
+      onMergeComplete(primaryId);
+    } catch (e) {
+      setMergeError(e instanceof Error ? e.message : String(e));
+      setMerging(false);
+    }
+  }
+
+  return (
+    <div className="merge-panel">
+      <p className="merge-panel-title">
+        Merge another album into "{currentGroupTitle}"
+      </p>
+      <input
+        className="merge-search-input"
+        type="text"
+        placeholder="Search for album to merge…"
+        value={searchText}
+        onChange={(e) => handleSearch(e.target.value)}
+        autoFocus
+      />
+      {searching && <p className="subtle-text">Searching…</p>}
+      {mergeError && <div className="error-banner">{mergeError}</div>}
+      {results.length > 0 && (
+        <div className="merge-search-results">
+          {results.map((r) => (
+            <button
+              key={r.id}
+              className="merge-search-result"
+              type="button"
+              disabled={merging}
+              onClick={() => handleSelectTarget(r.id, r.title)}
+            >
+              <span className="merge-search-result-title">{r.title}</span>
+              {r.artist_credit_name && (
+                <span className="subtle-text"> — {r.artist_credit_name}</span>
+              )}
+              <span className="subtle-text"> ({r.recording_count} tracks)</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {results.length === 0 && searchText.trim() && !searching && (
+        <p className="subtle-text">No matching albums found.</p>
+      )}
+      <button
+        className="secondary-button"
+        type="button"
+        disabled={merging}
+        onClick={onCancel}
+        style={{ marginTop: 8 }}
+      >
+        {merging ? "Merging…" : "Cancel"}
+      </button>
+    </div>
   );
 }

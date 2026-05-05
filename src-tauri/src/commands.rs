@@ -17,6 +17,7 @@ use crate::query::{self, LimitUnit};
 use crate::AppState;
 use serde::Serialize;
 use sqlx::{Acquire, Row, Sqlite, SqliteConnection, Transaction};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Emitter;
@@ -1783,6 +1784,159 @@ pub async fn merge_recordings(
     Ok(result)
 }
 
+#[tauri::command]
+pub async fn merge_release_groups(
+    state: tauri::State<'_, AppState>,
+    primary_id: String,
+    duplicate_id: String,
+) -> Result<String, String> {
+    if primary_id == duplicate_id {
+        return Err("Cannot merge a release group with itself".to_string());
+    }
+
+    let mut tx = state
+        .db
+        .raw_pool()
+        .begin()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // ── 1. Transfer release_group_rating if primary has none ──────────────
+    let primary_has_rating: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM release_group_rating WHERE release_group_id = ?",
+    )
+    .bind(&primary_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?
+        > 0;
+
+    if !primary_has_rating {
+        let dup_rating: Option<i64> =
+            sqlx::query_scalar("SELECT stars FROM release_group_rating WHERE release_group_id = ?")
+                .bind(&duplicate_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        if let Some(stars) = dup_rating {
+            sqlx::query(
+                "INSERT OR REPLACE INTO release_group_rating (release_group_id, stars, updated_at)
+                 VALUES (?, ?, datetime('now'))",
+            )
+            .bind(&primary_id)
+            .bind(stars)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // ── 2. Get primary release to merge into ──────────────────────────────
+    let primary_release_id: String =
+        sqlx::query_scalar("SELECT id FROM release WHERE release_group_id = ? LIMIT 1")
+            .bind(&primary_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Primary release group has no releases".to_string())?;
+
+    // Get all releases from the duplicate group (excluding the one that is the same as primary)
+    let dup_release_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM release WHERE release_group_id = ? AND id != ?")
+            .bind(&duplicate_id)
+            .bind(&primary_release_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    // ── 3. Merge mediums from duplicate releases into the primary release ──
+    for dup_release_id in &dup_release_ids {
+        let dup_mediums: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT id, position FROM medium WHERE release_id = ? ORDER BY position",
+        )
+        .bind(dup_release_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        for (dup_medium_id, position) in &dup_mediums {
+            // Find or create a matching medium in the primary release
+            let target_medium_id: String = match sqlx::query_scalar(
+                "SELECT id FROM medium WHERE release_id = ? AND position = ?",
+            )
+            .bind(&primary_release_id)
+            .bind(position)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?
+            {
+                Some(id) => id,
+                None => {
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    sqlx::query(
+                        "INSERT INTO medium (id, release_id, position, format)
+                         VALUES (?, ?, ?, (SELECT format FROM medium WHERE id = ?))",
+                    )
+                    .bind(&new_id)
+                    .bind(&primary_release_id)
+                    .bind(position)
+                    .bind(dup_medium_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    new_id
+                }
+            };
+
+            // Copy tracks from duplicate medium that don't already exist in the target
+            sqlx::query(
+                "INSERT OR IGNORE INTO track (id, medium_id, recording_id, position, title, duration_ms)
+                 SELECT ?, ?, recording_id, position, title, duration_ms
+                 FROM track
+                 WHERE medium_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM track t2
+                       WHERE t2.medium_id = ?
+                         AND t2.recording_id = track.recording_id
+                   )",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&target_medium_id)
+            .bind(dup_medium_id)
+            .bind(&target_medium_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // ── 4. Delete duplicate releases and their group ──────────────────────
+    for dup_release_id in &dup_release_ids {
+        sqlx::query("DELETE FROM release WHERE id = ?")
+            .bind(dup_release_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Delete the duplicate release group (CASCADES to release_group_artist, release_group_rating)
+    sqlx::query("DELETE FROM release_group WHERE id = ?")
+        .bind(&duplicate_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // ── 5. Prune orphaned entities ────────────────────────────────────────
+    prune_empty_library_entities(&mut tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    Ok(primary_id)
+}
+
 async fn prune_empty_library_entities(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DELETE FROM medium
@@ -2344,12 +2498,15 @@ pub async fn get_release_group_detail(
             match (total_tracks, distinct, consensus) {
                 (0, _, _) => crate::models::ReleaseCompleteness::Unknown {
                     reason: "No tracks on this release.".to_string(),
+                    disagreement_groups: Vec::new(),
                 },
                 (_, 0, _) => crate::models::ReleaseCompleteness::Unknown {
                     reason: "No source files provide track_total information.".to_string(),
+                    disagreement_groups: Vec::new(),
                 },
                 (_, 1, Some(0)) => crate::models::ReleaseCompleteness::Unknown {
                     reason: "Track total is zero.".to_string(),
+                    disagreement_groups: Vec::new(),
                 },
                 (_, 1, _) if with_sources >= consensus.unwrap_or(0) => {
                     crate::models::ReleaseCompleteness::Complete
@@ -2444,36 +2601,186 @@ pub async fn get_release_group_detail(
                     }
                 }
                 (_, _, _) => {
-                    let disagree = sqlx::query(
-                        "SELECT s.track_total, COUNT(DISTINCT s.id) AS cnt
+                    let source_data = sqlx::query(
+                        "SELECT s.file_path, s.track_total,
+                                m.position AS disc_position,
+                                (SELECT MAX(m3.position) FROM medium m3
+                                 WHERE m3.release_id = m.release_id) AS disc_total
                          FROM medium m
                          JOIN track t ON t.medium_id = m.id
                          JOIN source s ON s.recording_id = t.recording_id
                          WHERE m.release_id = ? AND s.track_total IS NOT NULL
-                         GROUP BY s.track_total
-                         ORDER BY s.track_total",
+                         ORDER BY s.track_total, m.position, s.file_path",
                     )
                     .bind(&release_id)
                     .fetch_all(&mut *conn)
                     .await
                     .map_err(|e| e.to_string())?;
 
-                    let mut parts: Vec<String> = Vec::new();
-                    for row in &disagree {
-                        let val: i64 = row.get("track_total");
-                        let cnt: i64 = row.get("cnt");
-                        parts.push(format!(
-                            "{} from {} source{}",
-                            val,
-                            cnt,
-                            if cnt == 1 { "" } else { "s" }
-                        ));
+                    let release_disc_total: Option<i64> =
+                        source_data.first().and_then(|r| r.get("disc_total"));
+
+                    struct SourceEntry {
+                        file_path: Option<String>,
+                        track_total: i64,
+                        disc_position: Option<i64>,
                     }
+
+                    let entries: Vec<SourceEntry> = source_data
+                        .iter()
+                        .map(|row| SourceEntry {
+                            file_path: row.get("file_path"),
+                            track_total: row.get("track_total"),
+                            disc_position: row.get("disc_position"),
+                        })
+                        .collect();
+
+                    // Group by track_total
+                    let mut by_tt: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+                    for e in &entries {
+                        if let Some(ref fp) = e.file_path {
+                            by_tt.entry(e.track_total).or_default().push(fp.clone());
+                        }
+                    }
+
+                    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+                    let mut parts: Vec<String> = Vec::new();
+
+                    if let Some(dt) = release_disc_total {
+                        if dt > 1 {
+                            // Multi-disc: merge all track_total groups into one
+                            let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> = BTreeMap::new();
+                            let mut all_paths: Vec<String> = Vec::new();
+                            for e in &entries {
+                                if let Some(ref fp) = e.file_path {
+                                    all_paths.push(fp.clone());
+                                }
+                                if let Some(dp) = e.disc_position {
+                                    *disc_map
+                                        .entry(dp)
+                                        .or_default()
+                                        .entry(e.track_total)
+                                        .or_default() += 1;
+                                }
+                            }
+                            all_paths.sort();
+                            all_paths.dedup();
+
+                            if !disc_map.is_empty() {
+                                let per_disc: Vec<String> = disc_map
+                                    .iter()
+                                    .map(|(_, tts)| {
+                                        let best = tts
+                                            .iter()
+                                            .max_by_key(|&(_, &c)| c)
+                                            .map(|(v, _)| v.to_string())
+                                            .unwrap_or_default();
+                                        best
+                                    })
+                                    .collect();
+
+                                let cnt = all_paths.len();
+                                let desc = format!(
+                                    "{} disc{} with {} track{}",
+                                    dt,
+                                    if dt == 1 { "" } else { "s" },
+                                    per_disc.join("+"),
+                                    if cnt == 1 { "" } else { "s" }
+                                );
+                                let claim_word = if cnt == 1 { "claims" } else { "claim" };
+                                parts.push(format!(
+                                    "{} from {} source{}",
+                                    desc,
+                                    cnt,
+                                    if cnt == 1 { "" } else { "s" }
+                                ));
+                                groups.push((
+                                    format!("{} source {} {}", cnt, claim_word, desc),
+                                    all_paths,
+                                ));
+                            } else {
+                                // Multi-disc release but no disc_position info:
+                                // keep per-track_total groups
+                                for (tt, paths) in &by_tt {
+                                    let cnt = paths.len();
+                                    let claim_word = if cnt == 1 { "claims" } else { "claim" };
+                                    let desc = format!(
+                                        "{} disc with {} track{}",
+                                        dt,
+                                        tt,
+                                        if *tt == 1 { "" } else { "s" }
+                                    );
+                                    parts.push(format!(
+                                        "{} from {} source{}",
+                                        tt,
+                                        cnt,
+                                        if cnt == 1 { "" } else { "s" }
+                                    ));
+                                    groups.push((
+                                        format!("{} source {} {}", cnt, claim_word, desc),
+                                        paths.clone(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            // Single disc: group by track_total
+                            for (tt, paths) in &by_tt {
+                                let cnt = paths.len();
+                                let claim_word = if cnt == 1 { "claims" } else { "claim" };
+                                let desc = format!(
+                                    "1 disc with {} track{}",
+                                    tt,
+                                    if *tt == 1 { "" } else { "s" }
+                                );
+                                parts.push(format!(
+                                    "{} from {} source{}",
+                                    tt,
+                                    cnt,
+                                    if cnt == 1 { "" } else { "s" }
+                                ));
+                                groups.push((
+                                    format!("{} source {} {}", cnt, claim_word, desc),
+                                    paths.clone(),
+                                ));
+                            }
+                        }
+                    } else {
+                        // No disc info: group by track_total
+                        for (tt, paths) in &by_tt {
+                            let cnt = paths.len();
+                            let claim_word = if cnt == 1 { "claims" } else { "claim" };
+                            let desc = format!(
+                                "(no total disc info) {} track{}",
+                                tt,
+                                if *tt == 1 { "" } else { "s" }
+                            );
+                            parts.push(format!(
+                                "{} from {} source{} (no disc info)",
+                                tt,
+                                cnt,
+                                if cnt == 1 { "" } else { "s" }
+                            ));
+                            groups.push((
+                                format!("{} source {} {}", cnt, claim_word, desc),
+                                paths.clone(),
+                            ));
+                        }
+                    }
+
                     crate::models::ReleaseCompleteness::Unknown {
                         reason: format!(
                             "Sources disagree on total track count: {}",
                             parts.join(", ")
                         ),
+                        disagreement_groups: groups
+                            .into_iter()
+                            .map(|(description, source_paths)| {
+                                crate::models::SourceDisagreementGroup {
+                                    description,
+                                    source_paths,
+                                }
+                            })
+                            .collect(),
                     }
                 }
             }

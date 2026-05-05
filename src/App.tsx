@@ -2100,6 +2100,7 @@ function App() {
                     }
                   }}
                   onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
+                  onRefreshLibrary={() => { void loadLibraryData(selectedArtistId, search); }}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">

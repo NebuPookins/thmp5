@@ -380,7 +380,14 @@ pub enum ReleaseCompleteness {
     },
     Unknown {
         reason: String,
+        disagreement_groups: Vec<SourceDisagreementGroup>,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceDisagreementGroup {
+    pub description: String,
+    pub source_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

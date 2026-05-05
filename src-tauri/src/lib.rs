@@ -138,6 +138,7 @@ pub fn run() {
             commands::get_file_issues,
             commands::compare_recordings,
             commands::merge_recordings,
+            commands::merge_release_groups,
             commands::get_artist_detail,
             commands::get_release_group_detail,
             commands::get_recording_detail,

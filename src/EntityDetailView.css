@@ -346,6 +346,37 @@
   margin-bottom: 8px;
 }
 
+/* ── Disagreement groups ───────────────────────────────────────────────── */
+
+.completeness-disagreement {
+  margin-bottom: 10px;
+}
+
+.disagreement-group {
+  margin: 6px 0 10px 12px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(149, 173, 198, 0.04);
+  border: 1px solid rgba(149, 173, 198, 0.08);
+}
+
+.disagreement-group-header {
+  margin: 0 0 4px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #b9c9dc;
+}
+
+.disagreement-source-path {
+  margin: 1px 0;
+  font-size: 0.78rem;
+  font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+  color: #8a9ab0;
+  word-break: break-all;
+  line-height: 1.4;
+  padding-left: 8px;
+}
+
 /* ── Missing tracks list ────────────────────────────────────────────────── */
 
 .missing-tracks {
@@ -403,4 +434,75 @@
 
 .source-missing {
   color: rgba(149, 173, 198, 0.3);
+}
+
+/* ── Merge panel ────────────────────────────────────────────────────────── */
+
+.merge-panel {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(73, 135, 255, 0.06);
+  border: 1px solid rgba(73, 135, 255, 0.15);
+}
+
+.merge-panel-title {
+  margin: 0 0 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #b9c9dc;
+}
+
+.merge-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(149, 173, 198, 0.2);
+  background: rgba(0, 0, 0, 0.2);
+  color: #d6e4f0;
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+
+.merge-search-input:focus {
+  border-color: rgba(73, 135, 255, 0.5);
+}
+
+.merge-search-results {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.merge-search-result {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(149, 173, 198, 0.08);
+  background: rgba(0, 0, 0, 0.15);
+  color: #d6e4f0;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.merge-search-result:hover:not(:disabled) {
+  background: rgba(73, 135, 255, 0.12);
+  border-color: rgba(73, 135, 255, 0.25);
+}
+
+.merge-search-result:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.merge-search-result-title {
+  font-weight: 600;
 }
