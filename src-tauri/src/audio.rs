@@ -53,6 +53,8 @@ pub struct PlayRequest {
     pub file_path: String,
     pub title: Option<String>,
     pub artist: Option<String>,
+    pub normalization_gain: f32,
+    pub normalization_source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +76,12 @@ pub struct PlayerErrorEvent {
 struct AudioCallbackCtx {
     status: AtomicU8,
     volume: AtomicU32,
+    /// Linear gain factor used for loudness normalization (f32 bits).
+    /// Always set per-track in start_playback(); the callback multiplies
+    /// this by `volume` when `normalization_enabled` is true.
+    normalization_gain: AtomicU32,
+    /// Whether to apply normalization_gain on top of the user's volume.
+    normalization_enabled: AtomicBool,
     output_frame_position: AtomicU64,
     last_position_emit_ms: AtomicU64,
     output_sample_rate: AtomicU32,
@@ -102,6 +110,8 @@ impl AudioCallbackCtx {
         Self {
             status: AtomicU8::new(STATUS_STOPPED),
             volume: AtomicU32::new(f32::to_bits(1.0)),
+            normalization_gain: AtomicU32::new(f32::to_bits(1.0)),
+            normalization_enabled: AtomicBool::new(false),
             output_frame_position: AtomicU64::new(0),
             last_position_emit_ms: AtomicU64::new(0),
             output_sample_rate: AtomicU32::new(output_sample_rate),
@@ -132,6 +142,7 @@ enum AudioCommand {
     Resume,
     Seek(u64),
     SetVolume(f32),
+    SetNormalizationEnabled(bool),
     Stop,
 }
 
@@ -218,6 +229,14 @@ impl AudioEngineHandle {
     }
 
     pub fn play(&self, request: PlayRequest) -> Result<()> {
+        // Set eagerly so snapshot() returns the correct value before the
+        // engine thread processes the Play command.
+        self.ctx
+            .normalization_gain
+            .store(request.normalization_gain.to_bits(), Ordering::Relaxed);
+        if let Ok(mut state) = self.shared.lock() {
+            state.normalization_source = request.normalization_source.clone();
+        }
         self.send_command(AudioCommand::Play(request))
     }
 
@@ -235,6 +254,10 @@ impl AudioEngineHandle {
 
     pub fn set_volume(&self, volume: f32) -> Result<()> {
         self.send_command(AudioCommand::SetVolume(volume.clamp(0.0, 1.5)))
+    }
+
+    pub fn set_normalization_enabled(&self, enabled: bool) -> Result<()> {
+        self.send_command(AudioCommand::SetNormalizationEnabled(enabled))
     }
 
     pub fn stop(&self) -> Result<()> {
@@ -261,6 +284,13 @@ impl AudioEngineHandle {
             .map(|s| (s.current_title.clone(), s.current_artist.clone()))
             .unwrap_or((None, None));
 
+        let normalization_source = self
+            .shared
+            .lock()
+            .ok()
+            .map(|s| s.normalization_source.clone())
+            .unwrap_or_default();
+
         PlayerState {
             status,
             recording_id,
@@ -270,6 +300,9 @@ impl AudioEngineHandle {
             duration_ms,
             position_ms,
             volume,
+            normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
+            normalization_gain: f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
+            normalization_source,
         }
     }
 
@@ -291,6 +324,7 @@ struct SharedState {
     current_title: Option<String>,
     current_artist: Option<String>,
     current_file_path: Option<String>,
+    normalization_source: String,
 }
 
 impl SharedState {
@@ -301,6 +335,7 @@ impl SharedState {
             current_title: None,
             current_artist: None,
             current_file_path: None,
+            normalization_source: String::from("None"),
         }
     }
 
@@ -333,6 +368,7 @@ impl SharedState {
         self.current_title = None;
         self.current_artist = None;
         self.current_file_path = None;
+        self.normalization_source = String::from("None");
     }
 }
 
@@ -397,6 +433,7 @@ fn handle_command(
                 let state = shared
                     .lock()
                     .map_err(|_| anyhow!("Audio state lock poisoned"))?;
+                let norm_gain = f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed));
                 PlayRequest {
                     recording_id: ctx
                         .current_recording_id
@@ -416,6 +453,8 @@ fn handle_command(
                         .ok_or_else(|| anyhow!("No active track to seek"))?,
                     title: state.current_title.clone(),
                     artist: state.current_artist.clone(),
+                    normalization_gain: norm_gain,
+                    normalization_source: state.normalization_source.clone(),
                 }
             };
 
@@ -425,6 +464,10 @@ fn handle_command(
             let clamped = volume.clamp(0.0, 1.5);
             tracing::info!(volume = clamped, "Updating playback volume");
             ctx.volume.store(clamped.to_bits(), Ordering::Relaxed);
+        }
+        AudioCommand::SetNormalizationEnabled(enabled) => {
+            tracing::info!(enabled, "Toggling loudness normalization");
+            ctx.normalization_enabled.store(enabled, Ordering::Relaxed);
         }
         AudioCommand::Stop => {
             tracing::info!("Stopping playback");
@@ -467,6 +510,8 @@ fn start_playback(
 
     // Set up the callback context before spawning the decoder.
     ctx.status.store(STATUS_LOADING, Ordering::Release);
+    ctx.normalization_gain
+        .store(request.normalization_gain.to_bits(), Ordering::Relaxed);
     {
         let mut guard = ctx.current_track.lock().unwrap();
         *guard = Some(Arc::clone(&buffer));
@@ -491,6 +536,7 @@ fn start_playback(
         state.current_title = request.title.clone();
         state.current_artist = request.artist.clone();
         state.current_file_path = Some(request.file_path.clone());
+        state.normalization_source = request.normalization_source.clone();
     }
 
     spawn_decoder_thread(
@@ -677,6 +723,9 @@ fn drain_events(
                 duration_ms: None,
                 position_ms: ctx.position_ms(),
                 volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+                normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
+                normalization_gain: f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
+                normalization_source: String::new(),
             },
         );
     }
@@ -841,7 +890,15 @@ where
     let mut emitted_pos = false;
 
     for frame in output.chunks_mut(output_channels) {
-        let vol = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
+        let vol = {
+            let user_vol = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
+            if ctx.normalization_enabled.load(Ordering::Relaxed) {
+                let norm = f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed));
+                user_vol * norm
+            } else {
+                user_vol
+            }
+        };
         let status = ctx.status.load(Ordering::Relaxed);
         // Try to acquire the current track buffer without blocking.
         let track_buffer = match ctx.current_track.try_lock() {
@@ -905,6 +962,9 @@ where
                 duration_ms: Some(ctx.track_duration_ms.load(Ordering::Relaxed)).filter(|&d| d > 0),
                 position_ms: ctx.position_ms(),
                 volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+                normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
+                normalization_gain: f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
+                normalization_source: String::new(),
             });
             for s in frame.iter_mut() {
                 *s = convert(0.0);
@@ -965,6 +1025,9 @@ where
                 duration_ms: None,
                 position_ms: ctx.position_ms(),
                 volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+                normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
+                normalization_gain: f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
+                normalization_source: String::new(),
             });
             for s in frame.iter_mut() {
                 *s = convert(0.0);
@@ -1396,6 +1459,57 @@ impl Default for PlayerState {
             duration_ms: None,
             position_ms: 0,
             volume: 1.0,
+            normalization_enabled: false,
+            normalization_gain: 1.0,
+            normalization_source: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_callback_ctx_normalization_defaults() {
+        let (ptx, _prx) = mpsc::channel();
+        let (stx, _srx) = mpsc::channel();
+        let (ttx, _trx) = mpsc::channel();
+        let ctx = AudioCallbackCtx::new(44100, 2, ptx, stx, ttx);
+        assert_eq!(
+            f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
+            1.0
+        );
+        assert!(!ctx.normalization_enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_shared_state_normalization_source_default() {
+        let inhibitor = Arc::new(SleepInhibitor::new("test", "test"));
+        let state = SharedState::new(inhibitor);
+        assert_eq!(state.normalization_source, "None");
+    }
+
+    #[test]
+    fn test_shared_state_clear_track_resets_normalization_source() {
+        let inhibitor = Arc::new(SleepInhibitor::new("test", "test"));
+        let mut state = SharedState::new(inhibitor);
+        state.normalization_source = "ReplayGain".into();
+
+        let (ptx, _prx) = mpsc::channel();
+        let (stx, _srx) = mpsc::channel();
+        let (ttx, _trx) = mpsc::channel();
+        let ctx = AudioCallbackCtx::new(44100, 2, ptx, stx, ttx);
+
+        state.clear_track(&ctx);
+        assert_eq!(state.normalization_source, "None");
+    }
+
+    #[test]
+    fn test_player_state_default_normalization_fields() {
+        let state = PlayerState::default();
+        assert!(!state.normalization_enabled);
+        assert_eq!(state.normalization_gain, 1.0);
+        assert_eq!(state.normalization_source, "");
     }
 }

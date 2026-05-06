@@ -23,6 +23,9 @@ pub struct PlayerState {
     pub duration_ms: Option<u64>,
     pub position_ms: u64,
     pub volume: f32,
+    pub normalization_enabled: bool,
+    pub normalization_gain: f32,
+    pub normalization_source: String,
 }
 
 #[derive(Debug, Deserialize)]

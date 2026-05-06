@@ -126,6 +126,7 @@ pub fn run() {
             commands::resume,
             commands::seek,
             commands::set_volume,
+            commands::set_normalization_enabled,
             commands::stop,
             commands::get_cover_art,
             commands::get_waveform,

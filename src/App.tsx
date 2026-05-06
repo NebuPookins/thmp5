@@ -151,6 +151,9 @@ type PlayerState = {
   duration_ms: number | null;
   position_ms: number;
   volume: number;
+  normalization_enabled: boolean;
+  normalization_gain: number;
+  normalization_source: string;
 };
 
 type PlayerErrorEvent = {
@@ -180,7 +183,16 @@ const DEFAULT_PLAYER_STATE: PlayerState = {
   duration_ms: null,
   position_ms: 0,
   volume: 1,
+  normalization_enabled: false,
+  normalization_gain: 1,
+  normalization_source: "",
 };
+
+function formatNormGain(gain: number): string {
+  if (gain <= 0) return "0 dB";
+  const db = 20 * Math.log10(gain);
+  return `${db >= 0 ? "+" : ""}${db.toFixed(1)} dB`;
+}
 
 function formatDuration(durationMs: number | null): string {
   if (!durationMs || durationMs <= 0) {
@@ -1625,6 +1637,19 @@ function App() {
     }
   }
 
+  async function handleNormalizationToggle() {
+    const next = !playerState.normalization_enabled;
+    try {
+      setPlayerState((current) => ({
+        ...current,
+        normalization_enabled: next,
+      }));
+      await invoke<PlayerState>("set_normalization_enabled", { enabled: next });
+    } catch (normError) {
+      setError(normError instanceof Error ? normError.message : String(normError));
+    }
+  }
+
   const handleRate = useCallback((recordingId: string, stars: number | null) => {
     void updateRecordingRating(recordingId, stars);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1813,6 +1838,25 @@ function App() {
             value={playerState.volume}
           />
           <span>{Math.round(playerState.volume * 100)}%</span>
+        </div>
+
+        <div className="topbar-norm" title={playerState.normalization_source ? `Normalization: ${formatNormGain(playerState.normalization_gain)} from ${playerState.normalization_source}` : ""}>
+          <label className="toggle-switch">
+            <input
+              type="checkbox"
+              checked={playerState.normalization_enabled}
+              onChange={() => { void handleNormalizationToggle(); }}
+            />
+            <span className="toggle-slider"></span>
+          </label>
+          {playerState.normalization_enabled ? (
+            <span className="norm-info">
+              {formatNormGain(playerState.normalization_gain)}
+              {playerState.normalization_source ? (
+                <span className="norm-source">{playerState.normalization_source}</span>
+              ) : null}
+            </span>
+          ) : null}
         </div>
 
         <button

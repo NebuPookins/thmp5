@@ -670,6 +670,28 @@ pub fn debug_id3_text_frame(request: Id3FrameDebugRequest) -> Result<Id3FrameDeb
     .map_err(|e| e.to_string())
 }
 
+/// Compute a linear gain factor from ReplayGain track gain (preferred) or
+/// RMS-based loudness (lufs) for loudness normalization.
+/// Returns 1.0 and `"None"` if neither measurement is available.
+/// The result is clamped to [0.1, 10.0] to prevent extreme values.
+fn compute_normalization_gain(
+    replay_gain_db: Option<f64>,
+    lufs: Option<f64>,
+) -> (f32, &'static str) {
+    let (gain, source) = if let Some(db) = replay_gain_db {
+        // ReplayGain is already the desired gain adjustment in dB.
+        (10.0_f64.powf(db / 20.0), "ReplayGain")
+    } else if let Some(loudness) = lufs {
+        // Target loudness in dB FS (RMS-based measurement).
+        const TARGET_LOUDNESS_DB: f64 = -16.0;
+        let gain_db = TARGET_LOUDNESS_DB - loudness;
+        (10.0_f64.powf(gain_db / 20.0), "LUFS")
+    } else {
+        (1.0, "None")
+    };
+    (gain.clamp(0.1, 10.0) as f32, source)
+}
+
 #[tauri::command]
 pub async fn play(
     state: tauri::State<'_, AppState>,
@@ -690,7 +712,9 @@ pub async fn play(
             s.file_path           AS file_path,
             r.id                  AS recording_id,
             r.title               AS title,
-            COALESCE(ra.credited_as, a.name) AS artist
+            COALESCE(ra.credited_as, a.name) AS artist,
+            s.replay_gain_track_db,
+            s.lufs
          FROM source s
          JOIN recording r ON r.id = s.recording_id
          LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
@@ -710,6 +734,12 @@ pub async fn play(
     let recording_id: String = row.get("recording_id");
     let title: Option<String> = row.get("title");
     let artist: Option<String> = row.get("artist");
+    let replay_gain_track_db: Option<f64> = row.get("replay_gain_track_db");
+    let lufs: Option<f64> = row.get("lufs");
+
+    // Compute the linear normalization gain and source label.
+    let (mut normalization_gain, mut normalization_source) =
+        compute_normalization_gain(replay_gain_track_db, lufs);
 
     // If the file is missing, try to fall back to another source for the same recording.
     if !std::path::Path::new(&file_path).exists() {
@@ -720,7 +750,7 @@ pub async fn play(
         );
 
         let alts = sqlx::query(
-            "SELECT s.id, s.file_path FROM source s
+            "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs FROM source s
              WHERE s.recording_id = ?
                AND s.id != ?
                AND s.source_type = 'local_file'
@@ -733,17 +763,19 @@ pub async fn play(
         .await
         .map_err(|e| e.to_string())?;
 
-        let mut found_alt: Option<(String, String)> = None;
+        let mut found_alt: Option<(String, String, Option<f64>, Option<f64>)> = None;
         for alt in &alts {
             let alt_id: String = alt.get("id");
             let alt_path: String = alt.get("file_path");
             if std::path::Path::new(&alt_path).exists() {
-                found_alt = Some((alt_id, alt_path));
+                let alt_rg: Option<f64> = alt.get("replay_gain_track_db");
+                let alt_lufs: Option<f64> = alt.get("lufs");
+                found_alt = Some((alt_id, alt_path, alt_rg, alt_lufs));
                 break;
             }
         }
 
-        if let Some((alt_id, alt_path)) = found_alt {
+        if let Some((alt_id, alt_path, alt_rg, alt_lufs)) = found_alt {
             // Remove the stale source row silently.
             sqlx::query("DELETE FROM source WHERE id = ?")
                 .bind(&source_id)
@@ -759,6 +791,10 @@ pub async fn play(
             );
             source_id = alt_id;
             file_path = alt_path;
+            // Update normalization gain from the alternative source.
+            let (alt_gain, alt_src) = compute_normalization_gain(alt_rg, alt_lufs);
+            normalization_gain = alt_gain;
+            normalization_source = alt_src;
         } else {
             return Err(format!(
                 "File not found and no working alternative source exists: {}",
@@ -782,9 +818,24 @@ pub async fn play(
             file_path,
             title,
             artist,
+            normalization_gain,
+            normalization_source: normalization_source.to_string(),
         })
         .map_err(|e| e.to_string())?;
 
+    Ok(state.player.snapshot())
+}
+
+#[tauri::command]
+pub fn set_normalization_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<PlayerState, String> {
+    tracing::info!(enabled, "Set normalization enabled command received");
+    state
+        .player
+        .set_normalization_enabled(enabled)
+        .map_err(|e| e.to_string())?;
     Ok(state.player.snapshot())
 }
 
@@ -2959,4 +3010,72 @@ pub async fn get_recording_detail(
         releases,
         sources,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_normalization_gain_replaygain() {
+        let (gain, source) = compute_normalization_gain(Some(-6.0), None);
+        let expected = 10.0_f64.powf(-6.0 / 20.0) as f32;
+        assert!((gain - expected).abs() < f32::EPSILON);
+        assert_eq!(source, "ReplayGain");
+    }
+
+    #[test]
+    fn test_compute_normalization_gain_lufs() {
+        // -16 LUFS = reference level, should give 0 dB gain → 1.0x
+        let (gain, source) = compute_normalization_gain(None, Some(-16.0));
+        assert!((gain - 1.0).abs() < f32::EPSILON);
+        assert_eq!(source, "LUFS");
+    }
+
+    #[test]
+    fn test_compute_normalization_gain_lufs_offset() {
+        // -20 LUFS is quieter than reference, should get +4 dB → ~1.58x
+        let (gain, source) = compute_normalization_gain(None, Some(-20.0));
+        let expected = 10.0_f64.powf(4.0 / 20.0) as f32;
+        assert!((gain - expected).abs() < 0.001);
+        assert_eq!(source, "LUFS");
+    }
+
+    #[test]
+    fn test_compute_normalization_gain_none() {
+        let (gain, source) = compute_normalization_gain(None, None);
+        assert!((gain - 1.0).abs() < f32::EPSILON);
+        assert_eq!(source, "None");
+    }
+
+    #[test]
+    fn test_compute_normalization_gain_replaygain_over_lufs() {
+        // When both are present, ReplayGain takes priority
+        let (gain, source) = compute_normalization_gain(Some(-6.0), Some(-20.0));
+        let expected = 10.0_f64.powf(-6.0 / 20.0) as f32;
+        assert!((gain - expected).abs() < f32::EPSILON);
+        assert_eq!(source, "ReplayGain");
+    }
+
+    #[test]
+    fn test_compute_normalization_gain_clamp_low() {
+        // +20 dB → 10.0x, but let's test negative: -40 dB → 0.01x, clamped to 0.1
+        let (gain, _) = compute_normalization_gain(Some(-120.0), None);
+        assert!((gain - 0.1).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_normalization_gain_clamp_high() {
+        // +40 dB → 100x, clamped to 10.0
+        let (gain, _) = compute_normalization_gain(Some(40.0), None);
+        assert!((gain - 10.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_normalization_gain_zero_db() {
+        // 0 dB → 1.0x
+        let (gain, source) = compute_normalization_gain(Some(0.0), None);
+        assert!((gain - 1.0).abs() < f32::EPSILON);
+        assert_eq!(source, "ReplayGain");
+    }
 }
