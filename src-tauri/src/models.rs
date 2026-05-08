@@ -483,3 +483,19 @@ pub struct SourceTagInfo {
     pub field_name: String,
     pub value: String,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompoundArtistCheck {
+    pub is_compound: bool,
+    pub evidence_count: usize,
+    pub total_sources_checked: usize,
+    pub individual_artist_names: Vec<String>,
+    pub source_examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtistFixStats {
+    pub recordings_updated: usize,
+    pub release_groups_updated: usize,
+    pub compound_artist_deleted: bool,
+}

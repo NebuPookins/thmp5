@@ -836,7 +836,10 @@ async fn find_or_create_recording(
 // "Get or create" helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn get_or_create_artist(tx: &mut Transaction<'_, Sqlite>, name: &str) -> Result<String> {
+pub(crate) async fn get_or_create_artist(
+    tx: &mut Transaction<'_, Sqlite>,
+    name: &str,
+) -> Result<String> {
     let name_lower = name.to_lowercase();
     if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM artist WHERE lower(name) = ?")
         .bind(&name_lower)

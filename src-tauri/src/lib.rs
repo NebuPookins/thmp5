@@ -143,6 +143,8 @@ pub fn run() {
             commands::get_artist_detail,
             commands::get_release_group_detail,
             commands::get_recording_detail,
+            commands::check_artist_compound,
+            commands::apply_artist_fix,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

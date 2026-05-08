@@ -5,13 +5,13 @@ use crate::library::import::{
     import_paths as do_import, prune_library, rescan_source as do_rescan_source,
 };
 use crate::models::{
-    AppBootstrap, AppConfig, ArtistDetail, ArtistRow, DbPoolDebugSnapshot, ExternalCommand,
-    FixMergedRecordingsStats, GuestAppearanceReleaseGroup, GuestAppearanceTrack, Id3FrameDebugInfo,
-    Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest, LibrarySummary,
-    PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
-    RatingUpdateRequest, RecordingArtistInfo, RecordingDetail, RecordingRatingUpdateResult,
-    RecordingRow, ReleaseGroupDetail, ReleaseGroupRow, ReleaseInfo, SaveSmartPlaylistRequest,
-    SeekRequest, SmartPlaylistResult, SourceDetail, VolumeRequest,
+    AppBootstrap, AppConfig, ArtistDetail, ArtistFixStats, ArtistRow, CompoundArtistCheck,
+    DbPoolDebugSnapshot, ExternalCommand, FixMergedRecordingsStats, GuestAppearanceReleaseGroup,
+    GuestAppearanceTrack, Id3FrameDebugInfo, Id3FrameDebugRequest, ImportProgress, ImportStats,
+    InitialSetupRequest, LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow,
+    QueueSettingsUpdate, RatingUpdateRequest, RecordingArtistInfo, RecordingDetail,
+    RecordingRatingUpdateResult, RecordingRow, ReleaseGroupDetail, ReleaseGroupRow, ReleaseInfo,
+    SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult, SourceDetail, VolumeRequest,
 };
 use crate::query::{self, LimitUnit};
 use crate::AppState;
@@ -3010,6 +3010,42 @@ pub async fn get_recording_detail(
         releases,
         sources,
     })
+}
+
+// ── Artist fix commands ──────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn check_artist_compound(
+    state: tauri::State<'_, AppState>,
+    artist_id: String,
+) -> Result<CompoundArtistCheck, String> {
+    crate::library::artist_fixes::check_artist_compound(&state.db, &artist_id).await
+}
+
+#[tauri::command]
+pub async fn apply_artist_fix(
+    state: tauri::State<'_, AppState>,
+    artist_id: String,
+    individual_artist_names: Vec<String>,
+) -> Result<ArtistFixStats, String> {
+    let _permit = state
+        .write_serializer
+        .acquire()
+        .await
+        .map_err(|e| format!("Failed to acquire write lock: {e}"))?;
+
+    let result = crate::library::artist_fixes::apply_artist_fix(
+        &state.db,
+        &artist_id,
+        &individual_artist_names,
+    )
+    .await;
+
+    drop(_permit);
+
+    *state.recordings_cache.write().await = None;
+
+    result
 }
 
 #[cfg(test)]

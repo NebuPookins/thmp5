@@ -160,6 +160,20 @@ type PlayerErrorEvent = {
   message: string;
 };
 
+type CompoundArtistCheck = {
+  is_compound: boolean;
+  evidence_count: number;
+  total_sources_checked: number;
+  individual_artist_names: string[];
+  source_examples: string[];
+};
+
+type ArtistFixStats = {
+  recordings_updated: number;
+  release_groups_updated: number;
+  compound_artist_deleted: boolean;
+};
+
 type FileIssue = {
   file_path: string;
   kind: "import_error" | "playback_error";
@@ -463,6 +477,12 @@ function App() {
   const [newCmdName, setNewCmdName] = useState("");
   const [newCmdTemplate, setNewCmdTemplate] = useState("");
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [artistFixModal, setArtistFixModal] = useState<{ artistId: string; artistName: string } | null>(null);
+  const [artistFixCheckResult, setArtistFixCheckResult] = useState<CompoundArtistCheck | null>(null);
+  const [artistFixChecking, setArtistFixChecking] = useState(false);
+  const [artistFixStats, setArtistFixStats] = useState<ArtistFixStats | null>(null);
+  const [artistFixApplying, setArtistFixApplying] = useState(false);
+  const [artistFixError, setArtistFixError] = useState<string | null>(null);
   const [compareAnchor, setCompareAnchor] = useState<RecordingRow | null>(null);
   const [comparisonModal, setComparisonModal] = useState<{
     recA: RecordingRow;
@@ -2928,6 +2948,139 @@ function App() {
         );
       })()}
 
+      {artistFixModal && (() => {
+        const { artistId, artistName } = artistFixModal;
+        function closeModal() {
+          setArtistFixModal(null);
+          setArtistFixCheckResult(null);
+          setArtistFixStats(null);
+          setArtistFixError(null);
+        }
+        async function runChecks() {
+          setArtistFixChecking(true);
+          setArtistFixCheckResult(null);
+          setArtistFixStats(null);
+          setArtistFixError(null);
+          try {
+            const result = await invoke<CompoundArtistCheck>("check_artist_compound", { artistId });
+            setArtistFixCheckResult(result);
+          } catch (e) {
+            setArtistFixError(String(e));
+          } finally {
+            setArtistFixChecking(false);
+          }
+        }
+        async function applyFix() {
+          if (!artistFixCheckResult?.individual_artist_names) return;
+          setArtistFixApplying(true);
+          setArtistFixError(null);
+          try {
+            const stats = await invoke<ArtistFixStats>("apply_artist_fix", {
+              artistId,
+              individualArtistNames: artistFixCheckResult.individual_artist_names,
+            });
+            setArtistFixStats(stats);
+            setArtistFixCheckResult(null);
+            void loadLibraryData();
+          } catch (e) {
+            setArtistFixError(String(e));
+          } finally {
+            setArtistFixApplying(false);
+          }
+        }
+        return (
+          <div
+            className="modal-overlay"
+            onClick={() => closeModal()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2>Fix Issues: {artistName}</h2>
+                <button className="modal-close-btn" onClick={() => closeModal()} type="button">×</button>
+              </div>
+              <div className="modal-section">
+                {/* Error */}
+                {artistFixError && (
+                  <p className="check-error">Error: {artistFixError}</p>
+                )}
+
+                {/* Initial state — no checks run yet */}
+                {!artistFixChecking && !artistFixCheckResult && !artistFixStats && !artistFixError && (
+                  <>
+                    <p className="check-empty">
+                      Run checks to identify potential issues with this artist.
+                    </p>
+                    <div className="check-actions">
+                      <button className="check-run-btn" type="button" onClick={() => void runChecks()}>
+                        Run Checks
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {/* Checking in progress */}
+                {artistFixChecking && (
+                  <p className="check-running">Running checks…</p>
+                )}
+
+                {/* Check complete: not compound */}
+                {artistFixCheckResult && !artistFixCheckResult.is_compound && (
+                  <div className="check-status check-pass-banner">
+                    ✓ All checks passed — no issues found
+                  </div>
+                )}
+
+                {/* Check complete: compound artist detected */}
+                {artistFixCheckResult && artistFixCheckResult.is_compound && (
+                  <>
+                    <div className="check-status check-fail-banner">
+                      ✗ Artist appears to be a collaboration
+                    </div>
+                    <p className="check-meta">
+                      Checked {artistFixCheckResult.total_sources_checked} source file{artistFixCheckResult.total_sources_checked !== 1 ? "s" : ""}.
+                      Found evidence in {artistFixCheckResult.evidence_count} file{artistFixCheckResult.evidence_count !== 1 ? "s" : ""}.
+                    </p>
+                    <div className="check-section">
+                      <span className="modal-section-label">Individual artists detected</span>
+                      <ul className="check-detail-list">
+                        {artistFixCheckResult.individual_artist_names.map((name) => (
+                          <li key={name} className="check-detail-item">{name}</li>
+                        ))}
+                      </ul>
+                    </div>
+                    <div className="check-actions">
+                      <button
+                        className="check-fix-btn"
+                        type="button"
+                        disabled={artistFixApplying}
+                        onClick={() => void applyFix()}
+                      >
+                        {artistFixApplying ? "Applying fix…" : "Apply Fix: Split into individual artists"}
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {/* Fix applied */}
+                {artistFixStats && (
+                  <div className="check-success">
+                    <p className="check-success-title">✓ Fix applied successfully</p>
+                    <ul className="check-stats-list">
+                      <li>Recordings updated: {artistFixStats.recordings_updated}</li>
+                      <li>Release groups updated: {artistFixStats.release_groups_updated}</li>
+                      <li>Compound artist deleted: {artistFixStats.compound_artist_deleted ? "Yes" : "No"}</li>
+                    </ul>
+                    <p className="check-reload-note">The library will refresh automatically.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {contextMenu && (
         <>
           <div
@@ -3064,6 +3217,18 @@ function App() {
                     }}
                   >
                     View details
+                  </button>
+                </li>
+                <li>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      setArtistFixModal({ artistId: contextMenu.artist_id, artistName: contextMenu.artist_name });
+                      setContextMenu(null);
+                    }}
+                  >
+                    Fix issues with artist…
                   </button>
                 </li>
                 <li>
