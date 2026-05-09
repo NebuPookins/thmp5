@@ -176,8 +176,10 @@ type ArtistFixStats = {
 
 type FileIssue = {
   file_path: string;
-  kind: "import_error" | "playback_error";
+  kind: "import_error" | "playback_error" | "orphan_source";
   message: string;
+  source_id?: string;
+  recording_id?: string;
 };
 
 type QueueItem = RecordingRow;
@@ -462,6 +464,7 @@ function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"options" | "issues">("options");
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
+  const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [_allTags, setAllTags] = useState<string[]>([]);
@@ -879,7 +882,22 @@ function App() {
     void loadBootstrap();
   }, []);
 
-  // Reload the file issue list whenever the issues tab is visible.
+  // After bootstrap, run the orphan-source check and refresh issue list.
+  // Also re-check any time the issues tab opens.
+  useEffect(() => {
+    if (!bootstrap) return;
+    void (async () => {
+      try {
+        await invoke("find_orphan_sources");
+      } catch { /* best-effort */ }
+      try {
+        const issues = await invoke<FileIssue[]>("get_file_issues");
+        setFileIssues(issues);
+      } catch { /* best-effort */ }
+    })();
+  }, [bootstrap]);
+
+  // Reload the file issue list whenever the issues tab becomes visible.
   useEffect(() => {
     if (!isModalOpen || settingsTab !== "issues") return;
     invoke<FileIssue[]>("get_file_issues")
@@ -2698,8 +2716,26 @@ function App() {
                       <li key={i} className="issue-item">
                         <div className="issue-item-header">
                           <span className={`issue-kind issue-kind-${issue.kind}`}>
-                            {issue.kind === "import_error" ? "Import" : "Playback"}
+                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : "Playback"}
                           </span>
+                          {issue.kind === "orphan_source" ? (
+                            <button
+                              className="fix-orphan-btn"
+                              type="button"
+                              disabled={fixingOrphans.has(issue.source_id!)}
+                              onClick={() => {
+                                const sid = issue.source_id!;
+                                setFixingOrphans(prev => new Set(prev).add(sid));
+                                void (async () => {
+                                  await invoke("fix_orphan_source", { sourceId: sid });
+                                  setFileIssues(prev => prev.filter(fi => fi.source_id !== sid));
+                                  setFixingOrphans(prev => { const n = new Set(prev); n.delete(sid); return n; });
+                                })();
+                              }}
+                            >
+                              {fixingOrphans.has(issue.source_id!) ? "Fixing…" : "Fix"}
+                            </button>
+                          ) : null}
                         </div>
                         <span className="issue-path" title={issue.file_path}>
                           {issue.file_path}
@@ -3325,6 +3361,19 @@ function App() {
           <>
             <span className="status-bar-sep">·</span>
             <span>{currentJobType === "delete" ? "Deleting" : "Processing"} {pendingJobs} job{pendingJobs !== 1 ? "s" : ""}</span>
+          </>
+        ) : null}
+        {fileIssues.length > 0 ? (
+          <>
+            <span className="status-bar-sep">·</span>
+            <button
+              className="status-bar-warning"
+              onClick={() => { setSettingsTab("issues"); setIsModalOpen(true); }}
+              type="button"
+              title={`${fileIssues.length} file issue${fileIssues.length !== 1 ? "s" : ""}`}
+            >
+              ⚠ {fileIssues.length}
+            </button>
           </>
         ) : null}
       </footer>

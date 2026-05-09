@@ -1257,6 +1257,34 @@ thead th {
   margin: 0;
 }
 
+.issue-kind-orphan_source {
+  background: rgba(240, 196, 50, 0.18);
+  color: #f0c050;
+}
+
+.fix-orphan-btn {
+  margin-left: auto;
+  font-size: 0.72rem;
+  padding: 2px 10px;
+  border: 1px solid rgba(76, 175, 125, 0.4);
+  border-radius: 6px;
+  background: rgba(76, 175, 125, 0.12);
+  color: #81c784;
+  cursor: pointer;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.fix-orphan-btn:hover {
+  background: rgba(76, 175, 125, 0.25);
+  border-color: rgba(76, 175, 125, 0.7);
+}
+
+.fix-orphan-btn:active {
+  background: rgba(76, 175, 125, 0.35);
+}
+
 
 .tag-chips {
   display: flex;
@@ -1362,6 +1390,23 @@ thead th {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #6a87a6;
+}
+
+.status-bar-warning {
+  background: none;
+  border: 1px solid rgba(240, 196, 50, 0.35);
+  border-radius: 6px;
+  color: #f0c050;
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 1px 8px;
+  letter-spacing: 0.04em;
+  transition: background 0.15s;
+}
+
+.status-bar-warning:hover {
+  background: rgba(240, 196, 50, 0.12);
 }
 
 /* ── Active tag filter ───────────────────────────────────────────────────────── */

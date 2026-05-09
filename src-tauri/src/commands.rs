@@ -661,6 +661,96 @@ pub fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssu
     Ok(state.file_issues.all())
 }
 
+/// Query the database for sources whose recording has no track entries and
+/// push each one into the in-memory issue log.
+#[tauri::command]
+pub async fn find_orphan_sources(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<FileIssue>, String> {
+    let pool = state.db.raw_pool();
+    let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT s.id, s.recording_id, s.file_path, r.title
+         FROM source s
+         JOIN recording r ON r.id = s.recording_id
+         WHERE s.source_type = 'local_file'
+           AND s.file_path IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM track t WHERE t.recording_id = s.recording_id)",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to query orphan sources: {e}"))?;
+
+    let file_issues = state.file_issues.clone();
+    let mut result = Vec::new();
+    for (source_id, recording_id, file_path, title) in &rows {
+        let msg = format!(
+            "Recording \"{}\" has no album track — source is orphaned",
+            title.as_deref().unwrap_or("unknown")
+        );
+        file_issues.push_orphan_source(file_path, &msg, source_id, recording_id);
+        result.push(FileIssue {
+            file_path: file_path.clone(),
+            kind: crate::file_issues::FileIssueKind::OrphanSource,
+            message: msg,
+            source_id: Some(source_id.clone()),
+            recording_id: Some(recording_id.clone()),
+        });
+    }
+    Ok(result)
+}
+
+/// Fix an orphan source by re-scanning its file metadata and re-creating the
+/// album structure (release-group / release / medium / track) so the recording
+/// becomes visible in the library.
+#[tauri::command]
+pub async fn fix_orphan_source(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+) -> Result<(), String> {
+    let pool = state.db.raw_pool();
+    let file_path: Option<String> = sqlx::query_scalar("SELECT file_path FROM source WHERE id = ?")
+        .bind(&source_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Failed to look up source: {e}"))?
+        .flatten();
+
+    let file_path = file_path.ok_or_else(|| format!("Source {source_id} not found"))?;
+    let source_path = std::path::Path::new(&file_path);
+    if !source_path.is_file() {
+        return Err(format!("Source file is missing: {}", source_path.display()));
+    }
+
+    state
+        .pending_jobs
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    emit_job_update(&app, &state, "rescan");
+
+    do_rescan_source(
+        &state.db,
+        source_path,
+        state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
+        false,
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "Failed to fix orphan source {}:\n{e:#}",
+            source_path.display()
+        )
+    })?;
+
+    state
+        .pending_jobs
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    emit_job_update(&app, &state, "rescan");
+
+    *state.recordings_cache.write().await = None;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn debug_id3_text_frame(request: Id3FrameDebugRequest) -> Result<Id3FrameDebugInfo, String> {
     crate::library::scanner::debug_id3_text_frame(

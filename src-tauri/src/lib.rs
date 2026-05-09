@@ -91,6 +91,51 @@ pub fn run() {
                     .spawn_scan(pool.clone(), root_path, acoustid_api_key.clone());
             }
 
+            // Background worker: detect orphan sources on startup.
+            let orphan_pool = pool.clone();
+            let orphan_issues = state.file_issues.clone();
+            tauri::async_runtime::spawn(async move {
+                let raw_pool = orphan_pool.raw_pool().clone();
+                let rows = match sqlx::query_as::<_, (String, String, String, Option<String>)>(
+                    "SELECT s.id, s.recording_id, s.file_path, r.title
+                     FROM source s
+                     JOIN recording r ON r.id = s.recording_id
+                     WHERE s.source_type = 'local_file'
+                       AND s.file_path IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM track t WHERE t.recording_id = s.recording_id)",
+                )
+                .fetch_all(&raw_pool)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::warn!("Orphan source check failed: {e}");
+                        return;
+                    }
+                };
+                for (source_id, recording_id, file_path, title) in &rows {
+                    tracing::info!(
+                        source_id = %source_id,
+                        recording_id = %recording_id,
+                        path = %file_path,
+                        "Orphan source detected during startup scan"
+                    );
+                    orphan_issues.push_orphan_source(
+                        file_path,
+                        format!(
+                            "Recording \"{}\" has no album track — source is orphaned",
+                            title.as_deref().unwrap_or("unknown")
+                        ),
+                        source_id,
+                        recording_id,
+                    );
+                }
+                let count = rows.len();
+                if count > 0 {
+                    tracing::info!("Found {count} orphan source(s) on startup");
+                }
+            });
+
             app.manage(state);
             Ok(())
         })
@@ -137,6 +182,8 @@ pub fn run() {
             commands::delete_playlist,
             commands::delete_recording,
             commands::get_file_issues,
+            commands::find_orphan_sources,
+            commands::fix_orphan_source,
             commands::compare_recordings,
             commands::merge_recordings,
             commands::merge_release_groups,
