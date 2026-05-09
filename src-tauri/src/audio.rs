@@ -1220,11 +1220,15 @@ impl LocalFileSource {
             pending: Vec::new(),
         };
 
-        // M4A/AAC and some other formats don't expose sample_rate/channels in the container
-        // metadata — those values live inside the codec's private data and only become known
-        // after the first packet is decoded.  Prime the source by decoding one packet so that
-        // sample_rate and channels are always valid by the time open() returns.
-        if source.sample_rate == 0 || source.channels == 0 {
+        // Always decode one packet to discover the real sample_rate / channels from the
+        // decoder output rather than from container metadata.  This is essential for codecs
+        // where the container and codec disagree: for example, HE-AAC (SBR) files report
+        // the post-SBR rate (e.g. 44100) in the container, but symphonia's AAC decoder
+        // only decodes the core at half that rate (e.g. 22050).
+        //
+        // Non-Symphonia decoders (Opus) set their effective rate/channels explicitly above
+        // and don't need priming.
+        if matches!(source.decoder, AudioDecoder::Symphonia(_)) {
             source.prime_spec()?;
         }
 
@@ -1243,12 +1247,11 @@ impl LocalFileSource {
                 AudioDecoder::Symphonia(dec) => match dec.decode(&packet) {
                     Ok(decoded) => {
                         let spec = *decoded.spec();
-                        if self.sample_rate == 0 {
-                            self.sample_rate = spec.rate;
-                        }
-                        if self.channels == 0 {
-                            self.channels = spec.channels.count() as u16;
-                        }
+                        // Always use the decoded spec — container metadata may be wrong
+                        // (e.g. HE-AAC reports post-SBR rate 44100 but decoder outputs
+                        // at the core rate 22050).  Trust what the decoder actually produces.
+                        self.sample_rate = spec.rate;
+                        self.channels = spec.channels.count() as u16;
                         append_audio_buffer(decoded, &mut self.pending);
                         return Ok(());
                     }
@@ -1511,5 +1514,59 @@ mod tests {
         assert!(!state.normalization_enabled);
         assert_eq!(state.normalization_gain, 1.0);
         assert_eq!(state.normalization_source, "");
+    }
+
+    /// Verify that `sample_rate` in the source matches what the decoder actually
+    /// produces from the bitstream, not necessarily what the container metadata
+    /// reports.  This is a regression test for HE-AAC (SBR), where the container
+    /// says 44100 Hz (post-SBR output) but symphonia's AAC decoder only decodes
+    /// the core at 22050 Hz.  Using the container rate causes 2× playback speed.
+    #[test]
+    fn test_source_sample_rate_matches_decoded_spec() {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/he-aac.m4a"
+        ));
+        if !path.exists() {
+            eprintln!(
+                "skipping: HE-AAC test fixture not found at {}",
+                path.display()
+            );
+            return;
+        }
+
+        let mut source = LocalFileSource::open(path).expect("open HE-AAC fixture");
+        assert!(
+            source.sample_rate > 0,
+            "sample_rate must be set from decoded spec"
+        );
+        assert!(
+            source.channels > 0,
+            "channels must be set from decoded spec"
+        );
+
+        // Decode one more packet to get the decoded spec independently.
+        let packet = source
+            .format
+            .next_packet()
+            .expect("read packet from HE-AAC file");
+        let decoded = match &mut source.decoder {
+            AudioDecoder::Symphonia(dec) => dec.decode(&packet).expect("decode packet"),
+            _ => panic!("HE-AAC file should use Symphonia decoder"),
+        };
+        let spec = *decoded.spec();
+
+        assert_eq!(
+            source.sample_rate, spec.rate,
+            "source sample_rate must equal decoded spec rate, \
+             not container metadata (HE-AAC file has container rate 44100, \
+             decoder core rate {})",
+            spec.rate,
+        );
+        assert_eq!(
+            source.channels as u16,
+            spec.channels.count() as u16,
+            "source channels must equal decoded spec channel count"
+        );
     }
 }
