@@ -1110,16 +1110,24 @@ async fn prune_empty_library_entities(tx: &mut Transaction<'_, Sqlite>) -> Resul
     .await?;
 
     sqlx::query(
+        "DELETE FROM release_group_artist
+         WHERE artist_id IN (
+             SELECT id FROM artist
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM recording_artist
+                 WHERE recording_artist.artist_id = artist.id
+             )
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
         "DELETE FROM artist
          WHERE NOT EXISTS (
              SELECT 1
              FROM recording_artist
              WHERE recording_artist.artist_id = artist.id
-         )
-           AND NOT EXISTS (
-             SELECT 1
-             FROM release_group_artist
-             WHERE release_group_artist.artist_id = artist.id
          )",
     )
     .execute(&mut **tx)
