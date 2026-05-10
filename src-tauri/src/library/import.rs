@@ -806,6 +806,27 @@ async fn find_or_create_recording(
                 .await?
         {
             tracing::debug!(acoustid = %aid.acoustid, recording_id = %id, "AcoustID hit");
+
+            // Update the recording's primary artist from this source's TPE1.
+            // When a new source file matches an existing recording via AcoustID,
+            // the recording may have been created from a different source whose
+            // TPE1 was missing or set to a generic album-artist value (e.g.
+            // "Various Artists").  We replace position 0 (the primary artist)
+            // while preserving any additional positions (featuring artists etc).
+            sqlx::query(
+                "INSERT INTO recording_artist (recording_id, artist_id, position, role, credited_as)
+                 VALUES (?, ?, 0, 'main', NULL)
+                 ON CONFLICT(recording_id, position) DO UPDATE
+                 SET artist_id = excluded.artist_id,
+                     role      = excluded.role,
+                     credited_as = excluded.credited_as",
+            )
+                .bind(&id)
+                .bind(artist_id)
+                .execute(&mut **tx)
+                .await
+                .context("Failed to update primary recording artist on AcoustID match")?;
+
             return Ok(id);
         }
     }
@@ -1218,6 +1239,126 @@ mod tests {
         assert_eq!(
             rg_count, 1,
             "Both tracks should be grouped into one release group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acoustid_match_updates_primary_artist() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+
+        // Two sources with the same AcoustID but different TPE1:
+        //  - Source 1: TPE1 = "Various Artists" (generic album-artist value)
+        //  - Source 2: TPE1 = "Track Artist" (the real track performer)
+        //
+        // After import, the recording's primary artist should come from
+        // source 2's TPE1 (updated via the AcoustID-match path).
+
+        let meta1 = TrackMetadata {
+            title: Some("Song".into()),
+            artist: Some("Various Artists".into()),
+            album_artist: Some("Various Artists".into()),
+            album: Some("Compilation".into()),
+            year: Some(2024),
+            track_number: Some(1),
+            track_total: Some(2),
+            disc_number: Some(1),
+            duration_ms: 200000,
+            format: "mp3".into(),
+            ..Default::default()
+        };
+
+        let meta2 = TrackMetadata {
+            title: Some("Song".into()),
+            artist: Some("Track Artist".into()),
+            album_artist: Some("Various Artists".into()),
+            album: Some("Compilation".into()),
+            track_number: Some(2),
+            ..Default::default()
+        };
+
+        let prepared1 = PreparedImport {
+            path: PathBuf::from("/tmp/acoustid_test_1.mp3"),
+            path_str: "/tmp/acoustid_test_1.mp3".to_string(),
+            existing_source_id: None,
+            hash: "aaa".repeat(64),
+            meta: meta1,
+            warnings: vec![],
+            file_size: 5000000,
+            file_mtime_ms: 1000000,
+            fp: None,
+            acoustid_match: Some(AcoustIdMatch {
+                acoustid: "test_fp_for_artist_update".to_string(),
+                score: 1.0,
+                recording_mbid: None,
+            }),
+        };
+
+        let prepared2 = PreparedImport {
+            path: PathBuf::from("/tmp/acoustid_test_2.mp3"),
+            path_str: "/tmp/acoustid_test_2.mp3".to_string(),
+            existing_source_id: None,
+            hash: "bbb".repeat(64),
+            meta: meta2,
+            warnings: vec![],
+            file_size: 6000000,
+            file_mtime_ms: 2000000,
+            fp: None,
+            acoustid_match: Some(AcoustIdMatch {
+                acoustid: "test_fp_for_artist_update".to_string(),
+                score: 1.0,
+                recording_mbid: None,
+            }),
+        };
+
+        store_prepared_import(&pool, prepared1).await.unwrap();
+        store_prepared_import(&pool, prepared2).await.unwrap();
+
+        // Both sources should share one recording (AcoustID match).
+        let mut conn = pool.acquire("test".to_string()).await.unwrap();
+        let recording_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT recording_id) FROM source")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            recording_count, 1,
+            "Both sources should share one recording via AcoustID match"
+        );
+
+        // The recording's primary artist should be source 2's TPE1,
+        // updated via the AcoustID-match path. It should NOT remain
+        // "Various Artists" from source 1.
+        let artist_name: String = sqlx::query_scalar(
+            "SELECT a.name
+             FROM recording_artist ra
+             JOIN artist a ON a.id = ra.artist_id
+             WHERE ra.position = 0
+               AND ra.recording_id = (SELECT recording_id FROM source LIMIT 1)",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            artist_name, "Track Artist",
+            "AcoustID match should update primary artist from new source's TPE1"
+        );
+
+        // The album artist should remain the original album artist ("Various Artists"),
+        // since release-group-level metadata is not affected by recording-level changes.
+        let album_artist_name: String = sqlx::query_scalar(
+            "SELECT a.name
+             FROM release_group_artist rga
+             JOIN artist a ON a.id = rga.artist_id
+             WHERE rga.position = 0",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            album_artist_name, "Various Artists",
+            "Album artist should remain unchanged"
         );
     }
 
