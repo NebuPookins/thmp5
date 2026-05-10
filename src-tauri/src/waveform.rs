@@ -1,4 +1,4 @@
-use crate::audio_probe::{open_wave_mp3_payload, probe_media_source};
+use crate::audio_probe::{id3v2_end_offset, open_wave_mp3_payload, probe_media_source};
 use anyhow::{anyhow, Context, Result};
 #[cfg(feature = "opus")]
 use opus::Decoder as OpusDecoder;
@@ -21,15 +21,40 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
     let probed = match probe_media_source(path, file, None) {
         Ok(probed) => probed,
         Err(first_err) => {
-            if let Some(segment) = open_wave_mp3_payload(path)? {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %first_err,
-                    "Retrying waveform probe by decoding MP3 payload from RIFF/WAVE wrapper"
-                );
-                probe_media_source(path, segment, Some("mp3"))?
+            let msg = format!("{first_err:#}");
+            let id3_issue = msg.contains("id3v2") || msg.contains("malformed");
+            let retry = if id3_issue {
+                File::open(path)
+                    .ok()
+                    .and_then(|mut f| {
+                        let offset = id3v2_end_offset(&mut f)?;
+                        use std::io::Seek;
+                        f.seek(std::io::SeekFrom::Start(offset)).ok()?;
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %first_err,
+                            "Retrying waveform probe after skipping malformed ID3v2 header"
+                        );
+                        Some(f)
+                    })
+                    .and_then(|f2| probe_media_source(path, f2, None).ok())
             } else {
-                return Err(first_err);
+                None
+            };
+            match retry {
+                Some(result) => result,
+                None => {
+                    if let Some(segment) = open_wave_mp3_payload(path)? {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %first_err,
+                            "Retrying waveform probe by decoding MP3 payload from RIFF/WAVE wrapper"
+                        );
+                        probe_media_source(path, segment, Some("mp3"))?
+                    } else {
+                        return Err(first_err);
+                    }
+                }
             }
         }
     };

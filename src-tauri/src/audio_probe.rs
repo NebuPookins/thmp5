@@ -103,7 +103,7 @@ impl MediaSource for FileSegment {
     }
 }
 
-fn id3v2_end_offset(file: &mut File) -> Option<u64> {
+pub(crate) fn id3v2_end_offset(file: &mut File) -> Option<u64> {
     let mut header = [0u8; 10];
     file.read_exact(&mut header).ok()?;
     if &header[0..3] != b"ID3" {

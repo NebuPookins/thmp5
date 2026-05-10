@@ -1,4 +1,6 @@
-use crate::audio_probe::{open_wave_mp3_payload, probe_media_source as shared_probe_media_source};
+use crate::audio_probe::{
+    id3v2_end_offset, open_wave_mp3_payload, probe_media_source as shared_probe_media_source,
+};
 use crate::file_issues::FileIssueLog;
 use crate::models::{PlaybackStatus, PlayerState};
 use crate::sleep_inhibitor::SleepInhibitor;
@@ -9,7 +11,7 @@ use opus::Decoder as OpusDecoder;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::Read;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -1059,23 +1061,6 @@ where
     }
 }
 
-/// Reads the 10-byte ID3v2 header from `file` and returns the byte offset of the
-/// first byte after the entire tag (i.e. where the actual audio data begins).
-/// Returns `None` if there is no ID3v2 header at the current file position.
-fn id3v2_end_offset(file: &mut File) -> Option<u64> {
-    let mut header = [0u8; 10];
-    file.read_exact(&mut header).ok()?;
-    if &header[0..3] != b"ID3" {
-        return None;
-    }
-    // Bytes 6–9 encode the tag body size as a syncsafe integer (7 bits per byte).
-    let size = ((header[6] as u64) << 21)
-        | ((header[7] as u64) << 14)
-        | ((header[8] as u64) << 7)
-        | (header[9] as u64);
-    Some(10 + size)
-}
-
 enum AudioDecoder {
     Symphonia(Box<dyn symphonia::core::codecs::Decoder>),
     /// Direct libopus decoder used for OGG/Opus files, which symphonia has no codec support for.
@@ -1108,7 +1093,7 @@ impl LocalFileSource {
                 // Some files have malformed ID3v2 headers (e.g. flag bits not cleared) that
                 // cause symphonia's probe to fail even though the audio data is fine.  Retry
                 // by skipping the ID3v2 block entirely so symphonia sees only raw MP3 frames.
-                let msg = first_err.to_string();
+                let msg = format!("{first_err:#}");
                 if msg.contains("id3v2") || msg.contains("malformed") {
                     tracing::warn!(
                         path = %path.display(),
@@ -1568,5 +1553,35 @@ mod tests {
             spec.channels.count() as u16,
             "source channels must equal decoded spec channel count"
         );
+    }
+
+    /// Verify that a file with a corrupt WXXX frame in the ID3v2 tag can still
+    /// be opened via the retry logic in `LocalFileSource::open()`, which skips
+    /// the malformed ID3v2 header and re-probes from the raw MP3 frames.
+    ///
+    /// Regression test: the retry condition is checked against the full anyhow
+    /// error chain (`format!("{err:#}")`), not just the outermost display
+    /// message (`to_string()`) which omits the underlying symphonia error.
+    #[test]
+    fn test_corrupt_id3v2_wxxx_file_opens() {
+        let home = option_env!("HOME");
+        let path_str = home
+            .map(|h| format!("{h}/Music/!Full Albums/Avicii - 2013 - True/True (07) Avicii - Shame On Me.mp3"))
+            .unwrap_or_default();
+        let path = Path::new(&path_str);
+        if !path.exists() {
+            eprintln!("skipping: test fixture not found at {}", path.display());
+            return;
+        }
+
+        let source_result = LocalFileSource::open(path);
+        assert!(
+            source_result.is_ok(),
+            "LocalFileSource::open() should succeed, got: {:#}",
+            source_result.err().unwrap()
+        );
+        let source = source_result.unwrap();
+        assert!(source.sample_rate > 0, "sample_rate should be set");
+        assert!(source.channels > 0, "channels should be set");
     }
 }
