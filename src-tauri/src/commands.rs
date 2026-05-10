@@ -2784,70 +2784,341 @@ pub async fn get_release_group_detail(
                         }
                     }
 
-                    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-                    let mut parts: Vec<String> = Vec::new();
+                    // Check for multi-disc unanimous per-disc agreement.
+                    // Sources on different discs naturally report different track_total values
+                    // (one per disc), which would make COUNT(DISTINCT) > 1 and enter this
+                    // disagreement arm. If all sources on each disc agree, there's no real
+                    // disagreement — just per-disc differences.
+                    let unanimous_completeness: Option<crate::models::ReleaseCompleteness> = 'check: {
+                        match release_disc_total {
+                            Some(dt) if dt > 1 => dt,
+                            _ => break 'check None,
+                        };
 
-                    if let Some(dt) = release_disc_total {
-                        if dt > 1 {
-                            // Multi-disc: merge all track_total groups into one
-                            let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> = BTreeMap::new();
-                            let mut all_paths: Vec<String> = Vec::new();
-                            for e in &entries {
-                                if let Some(ref fp) = e.file_path {
-                                    all_paths.push(fp.clone());
-                                }
-                                if let Some(dp) = e.disc_position {
-                                    *disc_map
-                                        .entry(dp)
-                                        .or_default()
-                                        .entry(e.track_total)
-                                        .or_default() += 1;
-                                }
+                        let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> = BTreeMap::new();
+                        for e in &entries {
+                            if let Some(dp) = e.disc_position {
+                                *disc_map
+                                    .entry(dp)
+                                    .or_default()
+                                    .entry(e.track_total)
+                                    .or_default() += 1;
                             }
-                            all_paths.sort();
-                            all_paths.dedup();
+                        }
 
-                            if !disc_map.is_empty() {
-                                let per_disc: Vec<String> = disc_map
+                        if disc_map.is_empty() {
+                            break 'check None;
+                        }
+
+                        // If any disc has sources reporting multiple different track_total
+                        // values, this is a genuine disagreement — show the Unknown display.
+                        if !disc_map.values().all(|tts| tts.len() == 1) {
+                            tracing::warn!(
+                                release_id,
+                                ?disc_map,
+                                "multi-disc unanimity: intra-disc disagreement",
+                            );
+                            break 'check None;
+                        }
+
+                        // Compare per-disc source claims against actual DB track counts.
+                        // If claims match DB per disc, use standard completeness logic.
+                        // If sources claim more tracks per disc than the DB has, there
+                        // are phantom tracks (claimed by sources but absent from MusicBrainz).
+                        let disc_actuals: Vec<(i64, i64)> = sqlx::query(
+                            "SELECT m.position, COUNT(t.id) AS track_count
+                             FROM medium m
+                             JOIN track t ON t.medium_id = m.id
+                             WHERE m.release_id = ?
+                             GROUP BY m.position
+                             ORDER BY m.position",
+                        )
+                        .bind(&release_id)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .iter()
+                        .map(|row| (row.get("position"), row.get("track_count")))
+                        .collect();
+
+                        let all_discs_match = disc_actuals.iter().all(|(pos, actual_count)| {
+                            disc_map
+                                .get(pos)
+                                .and_then(|tts| tts.keys().next())
+                                .map(|&claimed| claimed == *actual_count)
+                                .unwrap_or(false)
+                        });
+
+                        if all_discs_match {
+                            // Source claims match DB — standard completeness logic.
+                            if with_sources >= total_tracks {
+                                break 'check Some(crate::models::ReleaseCompleteness::Complete);
+                            }
+
+                            // Some tracks have no source files — report which ones.
+                            use nonempty::NonEmpty;
+                            let missing_vec: Vec<crate::models::MissingTrackDetail> = sqlx::query(
+                                "SELECT t.position AS track_position,
+                                            m.position AS disc_position,
+                                            COALESCE(t.title, r.title) AS title,
+                                            r.id AS recording_id
+                                     FROM medium m
+                                     JOIN track t ON t.medium_id = m.id
+                                     JOIN recording r ON r.id = t.recording_id
+                                     WHERE m.release_id = ?
+                                       AND NOT EXISTS (
+                                           SELECT 1 FROM source s
+                                           WHERE s.recording_id = r.id
+                                       )
+                                     ORDER BY m.position, t.position",
+                            )
+                            .bind(&release_id)
+                            .fetch_all(&mut *conn)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .into_iter()
+                            .map(|row| crate::models::MissingTrackDetail {
+                                disc_position: row.get("disc_position"),
+                                track_position: row.get("track_position"),
+                                title: row.get("title"),
+                                recording_id: Some(row.get("recording_id")),
+                            })
+                            .collect();
+
+                            let missing = NonEmpty::from_vec(missing_vec).unwrap_or_else(|| {
+                                panic!(
+                                    "unanimous multi-disc incomplete reached but no missing \
+                                     tracks. release_id={release_id}, total_tracks={total_tracks}, \
+                                     with_sources={with_sources}"
+                                )
+                            });
+
+                            break 'check Some(crate::models::ReleaseCompleteness::Incomplete {
+                                missing_tracks: missing,
+                            });
+                        }
+
+                        // Source claims differ from DB. If any disc has sources claiming
+                        // *fewer* tracks than the DB, that's an anomalous deficit — bail
+                        // to the disagreement display for investigation.
+                        let has_deficit = disc_actuals.iter().any(|(pos, actual_count)| {
+                            disc_map
+                                .get(pos)
+                                .and_then(|tts| tts.keys().next())
+                                .map(|&claimed| claimed < *actual_count)
+                                .unwrap_or(false)
+                        });
+
+                        if has_deficit {
+                            tracing::warn!(
+                                release_id,
+                                ?disc_map,
+                                ?disc_actuals,
+                                "multi-disc unanimity: source claims below DB count",
+                            );
+                            break 'check None;
+                        }
+
+                        // Phantom tracks: sources claim more tracks per disc than the DB has.
+                        // Build a combined missing list from:
+                        //   1. DB tracks that lack source files (Type A)
+                        //   2. Track positions claimed by sources but absent from DB (Type B)
+                        use nonempty::NonEmpty;
+                        let mut all_missing: Vec<crate::models::MissingTrackDetail> = Vec::new();
+
+                        // Type A: DB tracks without sources
+                        let type_a: Vec<crate::models::MissingTrackDetail> = sqlx::query(
+                            "SELECT t.position AS track_position,
+                                    m.position AS disc_position,
+                                    COALESCE(t.title, r.title) AS title,
+                                    r.id AS recording_id
+                             FROM medium m
+                             JOIN track t ON t.medium_id = m.id
+                             JOIN recording r ON r.id = t.recording_id
+                             WHERE m.release_id = ?
+                               AND NOT EXISTS (SELECT 1 FROM source s WHERE s.recording_id = r.id)
+                             ORDER BY m.position, t.position",
+                        )
+                        .bind(&release_id)
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|row| crate::models::MissingTrackDetail {
+                            disc_position: row.get("disc_position"),
+                            track_position: row.get("track_position"),
+                            title: row.get("title"),
+                            recording_id: Some(row.get("recording_id")),
+                        })
+                        .collect();
+
+                        all_missing.extend(type_a);
+
+                        // Type B: phantom tracks on discs where claimed > actual
+                        for (pos, actual_count) in &disc_actuals {
+                            if let Some(claimed_count) =
+                                disc_map.get(pos).and_then(|tts| tts.keys().next())
+                            {
+                                if *claimed_count > *actual_count {
+                                    let phantom_positions: Vec<i64> = sqlx::query(
+                                        "WITH RECURSIVE positions(n) AS (
+                                            SELECT 1
+                                            UNION ALL
+                                            SELECT n + 1 FROM positions WHERE n < ?
+                                        )
+                                        SELECT p.n AS track_position
+                                        FROM positions p
+                                        WHERE NOT EXISTS (
+                                            SELECT 1 FROM track t
+                                            JOIN medium m2 ON t.medium_id = m2.id
+                                            WHERE m2.release_id = ?
+                                              AND m2.position = ?
+                                              AND t.position = p.n
+                                        )
+                                        ORDER BY p.n",
+                                    )
+                                    .bind(claimed_count)
+                                    .bind(&release_id)
+                                    .bind(pos)
+                                    .fetch_all(&mut *conn)
+                                    .await
+                                    .map_err(|e| e.to_string())?
                                     .iter()
-                                    .map(|(_, tts)| {
-                                        let best = tts
-                                            .iter()
-                                            .max_by_key(|&(_, &c)| c)
-                                            .map(|(v, _)| v.to_string())
-                                            .unwrap_or_default();
-                                        best
-                                    })
+                                    .map(|row| row.get("track_position"))
                                     .collect();
 
-                                let cnt = all_paths.len();
-                                let desc = format!(
-                                    "{} disc{} with {} track{}",
-                                    dt,
-                                    if dt == 1 { "" } else { "s" },
-                                    per_disc.join("+"),
-                                    if cnt == 1 { "" } else { "s" }
-                                );
-                                let claim_word = if cnt == 1 { "claims" } else { "claim" };
-                                parts.push(format!(
-                                    "{} from {} source{}",
-                                    desc,
-                                    cnt,
-                                    if cnt == 1 { "" } else { "s" }
-                                ));
-                                groups.push((
-                                    format!("{} source {} {}", cnt, claim_word, desc),
-                                    all_paths,
-                                ));
+                                    for tp in phantom_positions {
+                                        all_missing.push(crate::models::MissingTrackDetail {
+                                            disc_position: *pos,
+                                            track_position: tp,
+                                            title: String::new(),
+                                            recording_id: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        let missing_count = all_missing.len();
+                        let missing = NonEmpty::from_vec(all_missing).unwrap_or_else(|| {
+                            panic!(
+                                "phantom path reached but no missing tracks. \
+                                 release_id={release_id}, disc_actuals={disc_actuals:?}, \
+                                 disc_map={disc_map:?}"
+                            )
+                        });
+
+                        tracing::warn!(
+                            release_id,
+                            ?disc_map,
+                            ?disc_actuals,
+                            missing_count,
+                            "multi-disc unanimity: phantom tracks detected",
+                        );
+
+                        break 'check Some(crate::models::ReleaseCompleteness::Incomplete {
+                            missing_tracks: missing,
+                        });
+                    };
+
+                    if let Some(c) = unanimous_completeness {
+                        c
+                    } else {
+                        // Genuine disagreement — build the Unknown display with
+                        // grouped source paths so the user can inspect the claims.
+                        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+                        let mut parts: Vec<String> = Vec::new();
+
+                        if let Some(dt) = release_disc_total {
+                            if dt > 1 {
+                                // Multi-disc: merge all track_total groups into one
+                                let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> =
+                                    BTreeMap::new();
+                                let mut all_paths: Vec<String> = Vec::new();
+                                for e in &entries {
+                                    if let Some(ref fp) = e.file_path {
+                                        all_paths.push(fp.clone());
+                                    }
+                                    if let Some(dp) = e.disc_position {
+                                        *disc_map
+                                            .entry(dp)
+                                            .or_default()
+                                            .entry(e.track_total)
+                                            .or_default() += 1;
+                                    }
+                                }
+                                all_paths.sort();
+                                all_paths.dedup();
+
+                                if !disc_map.is_empty() {
+                                    tracing::warn!(
+                                        release_id,
+                                        ?disc_map,
+                                        "multi-disc disagreement display: producing single layout from merged claims",
+                                    );
+
+                                    let per_disc: Vec<String> = disc_map
+                                        .iter()
+                                        .map(|(_, tts)| {
+                                            let best = tts
+                                                .iter()
+                                                .max_by_key(|&(_, &c)| c)
+                                                .map(|(v, _)| v.to_string())
+                                                .unwrap_or_default();
+                                            best
+                                        })
+                                        .collect();
+
+                                    let cnt = all_paths.len();
+                                    let desc = format!(
+                                        "{} disc{} with {} track{}",
+                                        dt,
+                                        if dt == 1 { "" } else { "s" },
+                                        per_disc.join("+"),
+                                        if cnt == 1 { "" } else { "s" }
+                                    );
+                                    let claim_word = if cnt == 1 { "claims" } else { "claim" };
+                                    parts.push(format!(
+                                        "{} from {} source{}",
+                                        desc,
+                                        cnt,
+                                        if cnt == 1 { "" } else { "s" }
+                                    ));
+                                    groups.push((
+                                        format!("{} source {} {}", cnt, claim_word, desc),
+                                        all_paths,
+                                    ));
+                                } else {
+                                    // Multi-disc release but no disc_position info:
+                                    // keep per-track_total groups
+                                    for (tt, paths) in &by_tt {
+                                        let cnt = paths.len();
+                                        let claim_word = if cnt == 1 { "claims" } else { "claim" };
+                                        let desc = format!(
+                                            "{} disc with {} track{}",
+                                            dt,
+                                            tt,
+                                            if *tt == 1 { "" } else { "s" }
+                                        );
+                                        parts.push(format!(
+                                            "{} from {} source{}",
+                                            tt,
+                                            cnt,
+                                            if cnt == 1 { "" } else { "s" }
+                                        ));
+                                        groups.push((
+                                            format!("{} source {} {}", cnt, claim_word, desc),
+                                            paths.clone(),
+                                        ));
+                                    }
+                                }
                             } else {
-                                // Multi-disc release but no disc_position info:
-                                // keep per-track_total groups
+                                // Single disc: group by track_total
                                 for (tt, paths) in &by_tt {
                                     let cnt = paths.len();
                                     let claim_word = if cnt == 1 { "claims" } else { "claim" };
                                     let desc = format!(
-                                        "{} disc with {} track{}",
-                                        dt,
+                                        "1 disc with {} track{}",
                                         tt,
                                         if *tt == 1 { "" } else { "s" }
                                     );
@@ -2864,17 +3135,17 @@ pub async fn get_release_group_detail(
                                 }
                             }
                         } else {
-                            // Single disc: group by track_total
+                            // No disc info: group by track_total
                             for (tt, paths) in &by_tt {
                                 let cnt = paths.len();
                                 let claim_word = if cnt == 1 { "claims" } else { "claim" };
                                 let desc = format!(
-                                    "1 disc with {} track{}",
+                                    "(no total disc info) {} track{}",
                                     tt,
                                     if *tt == 1 { "" } else { "s" }
                                 );
                                 parts.push(format!(
-                                    "{} from {} source{}",
+                                    "{} from {} source{} (no disc info)",
                                     tt,
                                     cnt,
                                     if cnt == 1 { "" } else { "s" }
@@ -2885,43 +3156,22 @@ pub async fn get_release_group_detail(
                                 ));
                             }
                         }
-                    } else {
-                        // No disc info: group by track_total
-                        for (tt, paths) in &by_tt {
-                            let cnt = paths.len();
-                            let claim_word = if cnt == 1 { "claims" } else { "claim" };
-                            let desc = format!(
-                                "(no total disc info) {} track{}",
-                                tt,
-                                if *tt == 1 { "" } else { "s" }
-                            );
-                            parts.push(format!(
-                                "{} from {} source{} (no disc info)",
-                                tt,
-                                cnt,
-                                if cnt == 1 { "" } else { "s" }
-                            ));
-                            groups.push((
-                                format!("{} source {} {}", cnt, claim_word, desc),
-                                paths.clone(),
-                            ));
-                        }
-                    }
 
-                    crate::models::ReleaseCompleteness::Unknown {
-                        reason: format!(
-                            "Sources disagree on total track count: {}",
-                            parts.join(", ")
-                        ),
-                        disagreement_groups: groups
-                            .into_iter()
-                            .map(|(description, source_paths)| {
-                                crate::models::SourceDisagreementGroup {
-                                    description,
-                                    source_paths,
-                                }
-                            })
-                            .collect(),
+                        crate::models::ReleaseCompleteness::Unknown {
+                            reason: format!(
+                                "Sources disagree on total track count: {}",
+                                parts.join(", ")
+                            ),
+                            disagreement_groups: groups
+                                .into_iter()
+                                .map(|(description, source_paths)| {
+                                    crate::models::SourceDisagreementGroup {
+                                        description,
+                                        source_paths,
+                                    }
+                                })
+                                .collect(),
+                        }
                     }
                 }
             }
@@ -3203,5 +3453,554 @@ mod tests {
         let (gain, source) = compute_normalization_gain(Some(0.0), None);
         assert!((gain - 1.0).abs() < f32::EPSILON);
         assert_eq!(source, "ReplayGain");
+    }
+
+    /// Regression: multi-disc releases where each disc has unanimous track_total
+    /// (but different values per disc) should NOT trigger "Sources disagree".
+    /// Previously the unanimous check compared source-claimed track_total against
+    /// DB track count per disc, falsely rejecting unanimous multi-disc layouts.
+    #[tokio::test]
+    async fn test_multi_disc_unanimous_completeness() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = crate::db::init_pool(&db_path).await.unwrap();
+        let mut conn = pool.acquire("test".to_string()).await.unwrap();
+
+        let rg_id = "rg-test-unanimous";
+        let release_id = "rel-test-unanimous";
+
+        sqlx::query("INSERT INTO release_group (id, title) VALUES (?, ?)")
+            .bind(rg_id)
+            .bind("Test RG")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO release (id, release_group_id, title) VALUES (?, ?, ?)")
+            .bind(release_id)
+            .bind(rg_id)
+            .bind("Test Release")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        // Disc 1: 3 tracks, all sources claim track_total=3
+        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('m1', ?, 1)")
+            .bind(release_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        // Disc 2: 2 tracks, all sources claim track_total=2
+        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('m2', ?, 2)")
+            .bind(release_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        for i in 1..=3 {
+            let rec_id = format!("rec-d1-{i}");
+            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
+                .bind(&rec_id)
+                .bind(format!("D1 Track {i}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO track (id, medium_id, recording_id, position) VALUES (?, 'm1', ?, ?)",
+            )
+            .bind(format!("trk-d1-{i}"))
+            .bind(&rec_id)
+            .bind(i)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
+                 VALUES (?, ?, 'local_file', ?, 3)",
+            )
+            .bind(format!("src-d1-{i}"))
+            .bind(&rec_id)
+            .bind(format!("/d1/track{i}.mp3"))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+
+        for i in 1..=2 {
+            let rec_id = format!("rec-d2-{i}");
+            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
+                .bind(&rec_id)
+                .bind(format!("D2 Track {i}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO track (id, medium_id, recording_id, position) VALUES (?, 'm2', ?, ?)",
+            )
+            .bind(format!("trk-d2-{i}"))
+            .bind(&rec_id)
+            .bind(i)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
+                 VALUES (?, ?, 'local_file', ?, 2)",
+            )
+            .bind(format!("src-d2-{i}"))
+            .bind(&rec_id)
+            .bind(format!("/d2/track{i}.mp3"))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+
+        // ── Step 1: Run the same completeness query the command handler uses ──
+        let stats = sqlx::query(
+            "WITH release_source_stats AS (
+                SELECT
+                    t.id AS track_id,
+                    MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
+                    MAX(s.track_total) AS source_track_total
+                FROM medium m
+                JOIN track t ON t.medium_id = m.id
+                LEFT JOIN source s ON s.recording_id = t.recording_id
+                WHERE m.release_id = ?
+                GROUP BY t.id
+            )
+            SELECT
+                COUNT(DISTINCT source_track_total) AS distinct_track_totals,
+                COUNT(*) AS total_tracks,
+                COALESCE(SUM(has_source), 0) AS tracks_with_sources
+            FROM release_source_stats",
+        )
+        .bind(release_id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+
+        let distinct: i64 = stats.get("distinct_track_totals");
+        let total_tracks: i64 = stats.get("total_tracks");
+        let with_sources: i64 = stats.get("tracks_with_sources");
+
+        // distinct=2 because discs report different track_total — this enters
+        // the `(_, _, _)` wildcard arm (the disagreement / multi-disc check).
+        assert_eq!(distinct, 2, "two distinct track_total values across discs");
+        assert_eq!(total_tracks, 5, "5 tracks in DB");
+        assert_eq!(with_sources, 5, "all tracks have sources");
+
+        // ── Step 2: Run the source_data query the wildcard arm uses ──
+        let source_data = sqlx::query(
+            "SELECT s.file_path, s.track_total,
+                    m.position AS disc_position,
+                    (SELECT MAX(m3.position) FROM medium m3
+                     WHERE m3.release_id = m.release_id) AS disc_total
+             FROM medium m
+             JOIN track t ON t.medium_id = m.id
+             JOIN source s ON s.recording_id = t.recording_id
+             WHERE m.release_id = ? AND s.track_total IS NOT NULL
+             ORDER BY s.track_total, m.position, s.file_path",
+        )
+        .bind(release_id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+
+        let release_disc_total: Option<i64> = source_data.first().and_then(|r| r.get("disc_total"));
+        assert_eq!(release_disc_total, Some(2));
+
+        // ── Step 3: Replicate the unanimous per-disc check ──
+        let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> = BTreeMap::new();
+        for row in &source_data {
+            if let Some(dp) = row.get::<Option<i64>, _>("disc_position") {
+                let tt: i64 = row.get("track_total");
+                *disc_map.entry(dp).or_default().entry(tt).or_default() += 1;
+            }
+        }
+
+        assert_eq!(disc_map.len(), 2, "both discs represented");
+        // Every disc has only one track_total claim — sources agree per disc.
+        assert!(
+            disc_map.values().all(|tts| tts.len() == 1),
+            "each disc should have unanimous track_total: {disc_map:?}"
+        );
+
+        // All DB tracks have sources → this should be Complete, not "Sources disagree".
+        assert!(
+            with_sources >= total_tracks,
+            "all tracks have sources, should be Complete not disagreement"
+        );
+    }
+
+    /// Verify that genuine intra-disc disagreement is still detected as disagreement.
+    #[tokio::test]
+    async fn test_multi_disc_intra_disc_disagreement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = crate::db::init_pool(&db_path).await.unwrap();
+        let mut conn = pool.acquire("test".to_string()).await.unwrap();
+
+        let rg_id = "rg-test-disagree";
+        let release_id = "rel-test-disagree";
+
+        sqlx::query("INSERT INTO release_group (id, title) VALUES (?, ?)")
+            .bind(rg_id)
+            .bind("Test RG")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO release (id, release_group_id, title) VALUES (?, ?, ?)")
+            .bind(release_id)
+            .bind(rg_id)
+            .bind("Test Release")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        // Single disc, 2 tracks — one source says track_total=1, the other says 2
+        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('m3', ?, 1)")
+            .bind(release_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        for i in 1..=2 {
+            let rec_id = format!("rec-{i}");
+            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
+                .bind(&rec_id)
+                .bind(format!("Track {i}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO track (id, medium_id, recording_id, position) \
+                 VALUES (?, 'm3', ?, ?)",
+            )
+            .bind(format!("trk-{i}"))
+            .bind(&rec_id)
+            .bind(i)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            let tt = if i == 1 { 1 } else { 2 };
+            sqlx::query(
+                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
+                 VALUES (?, ?, 'local_file', ?, ?)",
+            )
+            .bind(format!("src-{i}"))
+            .bind(&rec_id)
+            .bind(format!("/track{i}.mp3"))
+            .bind(tt)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+
+        let stats = sqlx::query(
+            "WITH release_source_stats AS (
+                SELECT
+                    t.id AS track_id,
+                    MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
+                    MAX(s.track_total) AS source_track_total
+                FROM medium m
+                JOIN track t ON t.medium_id = m.id
+                LEFT JOIN source s ON s.recording_id = t.recording_id
+                WHERE m.release_id = ?
+                GROUP BY t.id
+            )
+            SELECT
+                COUNT(DISTINCT source_track_total) AS distinct_track_totals,
+                COUNT(*) AS total_tracks,
+                COALESCE(SUM(has_source), 0) AS tracks_with_sources
+            FROM release_source_stats",
+        )
+        .bind(release_id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+
+        let distinct: i64 = stats.get("distinct_track_totals");
+        let total_tracks: i64 = stats.get("total_tracks");
+        let with_sources: i64 = stats.get("tracks_with_sources");
+
+        assert_eq!(
+            distinct, 2,
+            "two distinct track_total values = disagreement"
+        );
+        assert_eq!(total_tracks, 2);
+        assert_eq!(with_sources, 2);
+
+        // Single disc → release_disc_total = 1 → unanimous check bail out correctly
+        let source_data = sqlx::query(
+            "SELECT s.file_path, s.track_total,
+                    m.position AS disc_position,
+                    (SELECT MAX(m3.position) FROM medium m3
+                     WHERE m3.release_id = m.release_id) AS disc_total
+             FROM medium m
+             JOIN track t ON t.medium_id = m.id
+             JOIN source s ON s.recording_id = t.recording_id
+             WHERE m.release_id = ? AND s.track_total IS NOT NULL
+             ORDER BY s.track_total, m.position, s.file_path",
+        )
+        .bind(release_id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+
+        let release_disc_total: Option<i64> = source_data.first().and_then(|r| r.get("disc_total"));
+        assert_eq!(
+            release_disc_total,
+            Some(1),
+            "single disc, unanimous check bails out"
+        );
+    }
+
+    /// Regression: multi-disc release where sources unanimously claim more tracks
+    /// per disc than the DB has should produce Incomplete with phantom tracks,
+    /// not "Complete" (which was the false result from `with_sources >= total_tracks`
+    /// ignoring the phantom track).
+    #[tokio::test]
+    async fn test_multi_disc_phantom_tracks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = crate::db::init_pool(&db_path).await.unwrap();
+        let mut conn = pool.acquire("test".to_string()).await.unwrap();
+
+        let rg_id = "rg-phantom";
+        let release_id = "rel-phantom";
+
+        sqlx::query("INSERT INTO release_group (id, title) VALUES (?, ?)")
+            .bind(rg_id)
+            .bind("Test RG")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO release (id, release_group_id, title) VALUES (?, ?, ?)")
+            .bind(release_id)
+            .bind(rg_id)
+            .bind("Test Release")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        // Disc 1: 3 tracks in DB, sources claim track_total=4 (phantom Track 4)
+        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('mp1', ?, 1)")
+            .bind(release_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        // Disc 2: 2 tracks in DB, sources claim track_total=2 (matches)
+        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('mp2', ?, 2)")
+            .bind(release_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        for i in 1..=3 {
+            let rec_id = format!("rec-p1-{i}");
+            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
+                .bind(&rec_id)
+                .bind(format!("P1 Track {i}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO track (id, medium_id, recording_id, position) \
+                 VALUES (?, 'mp1', ?, ?)",
+            )
+            .bind(format!("trk-p1-{i}"))
+            .bind(&rec_id)
+            .bind(i)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
+                 VALUES (?, ?, 'local_file', ?, 4)",
+            )
+            .bind(format!("src-p1-{i}"))
+            .bind(&rec_id)
+            .bind(format!("/p1/track{i}.mp3"))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+
+        for i in 1..=2 {
+            let rec_id = format!("rec-p2-{i}");
+            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
+                .bind(&rec_id)
+                .bind(format!("P2 Track {i}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO track (id, medium_id, recording_id, position) \
+                 VALUES (?, 'mp2', ?, ?)",
+            )
+            .bind(format!("trk-p2-{i}"))
+            .bind(&rec_id)
+            .bind(i)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
+                 VALUES (?, ?, 'local_file', ?, 2)",
+            )
+            .bind(format!("src-p2-{i}"))
+            .bind(&rec_id)
+            .bind(format!("/p2/track{i}.mp3"))
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+
+        // ── Step 1: Completeness query ──
+        let stats = sqlx::query(
+            "WITH release_source_stats AS (
+                SELECT
+                    t.id AS track_id,
+                    MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
+                    MAX(s.track_total) AS source_track_total
+                FROM medium m
+                JOIN track t ON t.medium_id = m.id
+                LEFT JOIN source s ON s.recording_id = t.recording_id
+                WHERE m.release_id = ?
+                GROUP BY t.id
+            )
+            SELECT
+                COUNT(DISTINCT source_track_total) AS distinct_track_totals,
+                COUNT(*) AS total_tracks,
+                COALESCE(SUM(has_source), 0) AS tracks_with_sources
+            FROM release_source_stats",
+        )
+        .bind(release_id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+
+        let distinct: i64 = stats.get("distinct_track_totals");
+        let total_tracks: i64 = stats.get("total_tracks");
+        let with_sources: i64 = stats.get("tracks_with_sources");
+
+        assert_eq!(distinct, 2);
+        assert_eq!(total_tracks, 5, "5 DB tracks");
+        assert_eq!(with_sources, 5, "all DB tracks have sources");
+
+        // ── Step 2: Source_data query ──
+        let source_data = sqlx::query(
+            "SELECT s.file_path, s.track_total,
+                    m.position AS disc_position,
+                    (SELECT MAX(m3.position) FROM medium m3
+                     WHERE m3.release_id = m.release_id) AS disc_total
+             FROM medium m
+             JOIN track t ON t.medium_id = m.id
+             JOIN source s ON s.recording_id = t.recording_id
+             WHERE m.release_id = ? AND s.track_total IS NOT NULL
+             ORDER BY s.track_total, m.position, s.file_path",
+        )
+        .bind(release_id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+
+        let release_disc_total: Option<i64> = source_data.first().and_then(|r| r.get("disc_total"));
+        assert_eq!(release_disc_total, Some(2));
+
+        // ── Step 3: Replicate unanimous check ──
+        let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> = BTreeMap::new();
+        for row in &source_data {
+            if let Some(dp) = row.get::<Option<i64>, _>("disc_position") {
+                let tt: i64 = row.get("track_total");
+                *disc_map.entry(dp).or_default().entry(tt).or_default() += 1;
+            }
+        }
+
+        assert_eq!(disc_map.len(), 2);
+        assert!(
+            disc_map.values().all(|tts| tts.len() == 1),
+            "unanimous per disc"
+        );
+
+        // ── Step 4: Per-disc actuals comparison ──
+        let disc_actuals: Vec<(i64, i64)> = sqlx::query(
+            "SELECT m.position, COUNT(t.id) AS track_count
+             FROM medium m
+             JOIN track t ON t.medium_id = m.id
+             WHERE m.release_id = ?
+             GROUP BY m.position
+             ORDER BY m.position",
+        )
+        .bind(release_id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get("position"), row.get("track_count")))
+        .collect();
+
+        // Disc 1: claimed=4, actual=3 → mismatch.  Disc 2: claimed=2, actual=2 → match.
+        let all_match = disc_actuals.iter().all(|(pos, actual_count)| {
+            disc_map
+                .get(pos)
+                .and_then(|tts| tts.keys().next())
+                .map(|&claimed| claimed == *actual_count)
+                .unwrap_or(false)
+        });
+        assert!(!all_match, "disc 1 claimed 4 but DB has 3 — mismatch");
+
+        let has_deficit = disc_actuals.iter().any(|(pos, actual_count)| {
+            disc_map
+                .get(pos)
+                .and_then(|tts| tts.keys().next())
+                .map(|&claimed| claimed < *actual_count)
+                .unwrap_or(false)
+        });
+        assert!(!has_deficit, "no disc with source claims below DB count");
+
+        // ── Step 5: Phantom track detection ──
+        let mut phantom_found: Vec<(i64, i64)> = Vec::new();
+        for (pos, actual_count) in &disc_actuals {
+            if let Some(claimed_count) = disc_map.get(pos).and_then(|tts| tts.keys().next()) {
+                if *claimed_count > *actual_count {
+                    let positions: Vec<i64> = sqlx::query(
+                        "WITH RECURSIVE positions(n) AS (
+                            SELECT 1
+                            UNION ALL
+                            SELECT n + 1 FROM positions WHERE n < ?
+                        )
+                        SELECT p.n AS track_position
+                        FROM positions p
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM track t
+                            JOIN medium m2 ON t.medium_id = m2.id
+                            WHERE m2.release_id = ?
+                              AND m2.position = ?
+                              AND t.position = p.n
+                        )
+                        ORDER BY p.n",
+                    )
+                    .bind(claimed_count)
+                    .bind(release_id)
+                    .bind(pos)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get("track_position"))
+                    .collect();
+
+                    for tp in positions {
+                        phantom_found.push((*pos, tp));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            phantom_found,
+            vec![(1, 4)],
+            "disc 1 track 4 should be phantom"
+        );
     }
 }
