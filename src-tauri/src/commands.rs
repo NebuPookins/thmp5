@@ -2818,17 +2818,6 @@ pub async fn get_release_group_detail(
                             break 'check None;
                         }
 
-                        // If any disc has sources reporting multiple different track_total
-                        // values, this is a genuine disagreement — show the Unknown display.
-                        if !disc_map.values().all(|tts| tts.len() == 1) {
-                            tracing::warn!(
-                                release_id,
-                                ?disc_map,
-                                "multi-disc unanimity: intra-disc disagreement",
-                            );
-                            break 'check None;
-                        }
-
                         // Compare per-disc source claims against actual DB track counts.
                         // If claims match DB per disc, use standard completeness logic.
                         // If sources claim more tracks per disc than the DB has, there
@@ -2848,6 +2837,52 @@ pub async fn get_release_group_detail(
                         .iter()
                         .map(|row| (row.get("position"), row.get("track_count")))
                         .collect();
+
+                        // If any disc has sources reporting multiple different track_total
+                        // values, try to find a consensus via per-disc mode. If the mode-
+                        // based layout matches the DB, proceed with standard completeness.
+                        if !disc_map.values().all(|tts| tts.len() == 1) {
+                            tracing::warn!(
+                                release_id,
+                                ?disc_map,
+                                "multi-disc unanimity: intra-disc disagreement",
+                            );
+
+                            let mode_claims: BTreeMap<i64, i64> = disc_map
+                                .iter()
+                                .map(|(&disc, tts)| {
+                                    let mode = tts
+                                        .iter()
+                                        .max_by_key(|&(_, &c)| c)
+                                        .map(|(&v, _)| v)
+                                        .unwrap_or(0);
+                                    (disc, mode)
+                                })
+                                .collect();
+
+                            let modes_match = disc_actuals.iter().all(|(pos, actual_count)| {
+                                mode_claims
+                                    .get(pos)
+                                    .map(|&claimed| claimed == *actual_count)
+                                    .unwrap_or(false)
+                            });
+
+                            if modes_match {
+                                // Replace disc_map with only the mode values so the existing
+                                // completeness logic can proceed with the consensus layout.
+                                disc_map = disc_map
+                                    .into_iter()
+                                    .map(|(disc, tts)| {
+                                        let mode = mode_claims.get(&disc).copied().unwrap_or(0);
+                                        let mut new_tts = BTreeMap::new();
+                                        new_tts.insert(mode, tts.get(&mode).copied().unwrap_or(0));
+                                        (disc, new_tts)
+                                    })
+                                    .collect();
+                            } else {
+                                break 'check None;
+                            }
+                        }
 
                         let all_discs_match = disc_actuals.iter().all(|(pos, actual_count)| {
                             disc_map
