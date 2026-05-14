@@ -6,12 +6,18 @@ use crate::models::{DuplicateFrameInfo, ImportStats, TrackMetadata};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Sqlite, Transaction};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+/// Tracks which release group each successfully rescanned source asserts
+/// (source_file_path → release_group_id).
+pub type SourceAssertions = Arc<Mutex<HashMap<String, String>>>;
 
 /// Set the calling thread's I/O priority to idle class (Linux only).
 fn set_io_priority_idle() {
@@ -1226,6 +1232,219 @@ mod tests {
     use crate::db::init_pool;
     use tempfile::TempDir;
 
+    fn tagged_meta(
+        title: &str,
+        artist: &str,
+        album_artist: &str,
+        album: &str,
+        track_number: u32,
+    ) -> TrackMetadata {
+        TrackMetadata {
+            title: Some(title.into()),
+            artist: Some(artist.into()),
+            album_artist: Some(album_artist.into()),
+            album: Some(album.into()),
+            year: Some(2024),
+            track_number: Some(track_number),
+            track_total: Some(1),
+            disc_number: Some(1),
+            duration_ms: 200000,
+            format: "mp3".into(),
+            ..Default::default()
+        }
+    }
+
+    fn utf8_text_frame(value: &str) -> Vec<u8> {
+        let mut data = vec![0x03u8];
+        data.extend_from_slice(value.as_bytes());
+        data
+    }
+
+    fn write_tagged_mp3(path: &Path, title: &str, artist: &str, album_artist: &str, album: &str) {
+        let title_data = utf8_text_frame(title);
+        let artist_data = utf8_text_frame(artist);
+        let album_artist_data = utf8_text_frame(album_artist);
+        let album_data = utf8_text_frame(album);
+        let track_data = utf8_text_frame("1/1");
+        let disc_data = utf8_text_frame("1/1");
+
+        let frames = vec![
+            crate::library::scanner::id3_frame(b"TIT2", &title_data),
+            crate::library::scanner::id3_frame(b"TPE1", &artist_data),
+            crate::library::scanner::id3_frame(b"TPE2", &album_artist_data),
+            crate::library::scanner::id3_frame(b"TALB", &album_data),
+            crate::library::scanner::id3_frame(b"TRCK", &track_data),
+            crate::library::scanner::id3_frame(b"TPOS", &disc_data),
+        ];
+        let mp3_data = crate::library::scanner::synth_mp3_with_id3(&frames);
+        std::fs::write(path, mp3_data).unwrap();
+    }
+
+    fn prepared_import_for_path(
+        path: &Path,
+        meta: TrackMetadata,
+        acoustid: Option<&str>,
+    ) -> PreparedImport {
+        let (file_size, file_mtime_ms) = file_identity(path).unwrap();
+        PreparedImport {
+            path: path.to_path_buf(),
+            path_str: path.to_string_lossy().to_string(),
+            existing_source_id: None,
+            hash: file_sha256(path).unwrap(),
+            meta,
+            warnings: vec![],
+            file_size,
+            file_mtime_ms,
+            fp: None,
+            acoustid_match: acoustid.map(|acoustid| AcoustIdMatch {
+                acoustid: acoustid.to_string(),
+                score: 1.0,
+                recording_mbid: None,
+            }),
+        }
+    }
+
+    async fn release_group_id_by_title(pool: &crate::db::DbPool, title: &str) -> Option<String> {
+        let mut conn = pool
+            .acquire("test.release_group_id_by_title")
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT id FROM release_group WHERE title = ? ORDER BY id LIMIT 1")
+            .bind(title)
+            .fetch_optional(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    async fn recording_id_for_path(pool: &crate::db::DbPool, path: &Path) -> String {
+        let path_str = path.to_string_lossy().to_string();
+        let mut conn = pool.acquire("test.recording_id_for_path").await.unwrap();
+        sqlx::query_scalar(
+            "SELECT recording_id FROM source WHERE file_path = ? AND source_type = 'local_file'",
+        )
+        .bind(path_str)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    }
+
+    async fn release_titles_for_recording(
+        pool: &crate::db::DbPool,
+        recording_id: &str,
+    ) -> Vec<String> {
+        let mut conn = pool
+            .acquire("test.release_titles_for_recording")
+            .await
+            .unwrap();
+        sqlx::query_scalar(
+            "SELECT DISTINCT rg.title
+             FROM track t
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             WHERE t.recording_id = ?
+             ORDER BY rg.title",
+        )
+        .bind(recording_id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+    }
+
+    async fn source_paths_for_release_group(
+        pool: &crate::db::DbPool,
+        release_group_id: &str,
+    ) -> Vec<String> {
+        let mut conn = pool
+            .acquire("test.source_paths_for_release_group")
+            .await
+            .unwrap();
+        sqlx::query_scalar(
+            "SELECT DISTINCT s.file_path
+             FROM source s
+             JOIN track t ON t.recording_id = s.recording_id
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             WHERE rel.release_group_id = ?
+               AND s.source_type = 'local_file'
+               AND s.file_path IS NOT NULL
+             ORDER BY s.file_path",
+        )
+        .bind(release_group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+    }
+
+    async fn force_track_id_for_release(
+        pool: &crate::db::DbPool,
+        recording_id: &str,
+        release_group_title: &str,
+        track_id: &str,
+    ) {
+        let mut conn = pool
+            .acquire("test.force_track_id_for_release")
+            .await
+            .unwrap();
+        let result = sqlx::query(
+            "UPDATE track
+             SET id = ?
+             WHERE id = (
+                 SELECT t.id
+                 FROM track t
+                 JOIN medium m ON m.id = t.medium_id
+                 JOIN release rel ON rel.id = m.release_id
+                 JOIN release_group rg ON rg.id = rel.release_group_id
+                 WHERE t.recording_id = ? AND rg.title = ?
+                 LIMIT 1
+             )",
+        )
+        .bind(track_id)
+        .bind(recording_id)
+        .bind(release_group_title)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            result.rows_affected(),
+            1,
+            "expected one track for recording {recording_id} on release group {release_group_title}"
+        );
+    }
+
+    async fn add_release_appearance(
+        pool: &crate::db::DbPool,
+        recording_id: &str,
+        album_artist_name: &str,
+        release_group_title: &str,
+        track_id: &str,
+    ) {
+        let mut conn = pool.acquire("test.add_release_appearance").await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        let album_artist_id = get_or_create_artist(&mut tx, album_artist_name)
+            .await
+            .unwrap();
+        let release_group_id =
+            get_or_create_release_group(&mut tx, release_group_title, &album_artist_id)
+                .await
+                .unwrap();
+        let release_id =
+            get_or_create_release(&mut tx, &release_group_id, release_group_title, None)
+                .await
+                .unwrap();
+        let medium_id = get_or_create_medium(&mut tx, &release_id, 1).await.unwrap();
+        sqlx::query(
+            "INSERT INTO track (id, medium_id, recording_id, position) VALUES (?, ?, ?, 1)",
+        )
+        .bind(track_id)
+        .bind(&medium_id)
+        .bind(recording_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_album_artist_groups_tracks_together() {
         let tmp = TempDir::new().unwrap();
@@ -1424,6 +1643,226 @@ mod tests {
         assert_eq!(
             album_artist_name, "Various Artists",
             "Album artist should remain unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_album_rescan_prunes_stale_ddr_extreme_release() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+        let file_issues = FileIssueLog::new();
+
+        // This mirrors a stale app state seen in the wild: the recording has
+        // one source, and that source's TALB frame asserts the corrected album,
+        // but the recording still appears on both the corrected album and an
+        // older stale album.
+        let stale_path = tmp.path().join("stale-album.mp3");
+        write_tagged_mp3(
+            &stale_path,
+            "Stale Track",
+            "DDR Artist",
+            "DDR Album Artist",
+            "Dance Dance Revolution EXTREME ORIGINAL SOUNDTRACK",
+        );
+        store_prepared_import(
+            &pool,
+            prepared_import_for_path(
+                &stale_path,
+                tagged_meta(
+                    "Stale Track",
+                    "DDR Artist",
+                    "DDR Album Artist",
+                    "Dance Dance Revolution Extreme",
+                    1,
+                ),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let stale_recording_id = recording_id_for_path(&pool, &stale_path).await;
+        force_track_id_for_release(
+            &pool,
+            &stale_recording_id,
+            "Dance Dance Revolution Extreme",
+            "z-stale-ddr-extreme-track",
+        )
+        .await;
+        add_release_appearance(
+            &pool,
+            &stale_recording_id,
+            "DDR Album Artist",
+            "Dance Dance Revolution EXTREME ORIGINAL SOUNDTRACK",
+            "a-correct-ddr-extreme-track",
+        )
+        .await;
+
+        assert_eq!(
+            release_titles_for_recording(&pool, &stale_recording_id).await,
+            vec![
+                "Dance Dance Revolution EXTREME ORIGINAL SOUNDTRACK",
+                "Dance Dance Revolution Extreme"
+            ],
+            "test setup should mirror a recording that appears on both old and corrected releases"
+        );
+        assert!(
+            release_group_id_by_title(&pool, "Dance Dance Revolution Extreme")
+                .await
+                .is_some(),
+            "test setup should create the old release group"
+        );
+
+        let stale_release_group_id =
+            release_group_id_by_title(&pool, "Dance Dance Revolution Extreme")
+                .await
+                .unwrap();
+        let stale_rescan_paths =
+            source_paths_for_release_group(&pool, &stale_release_group_id).await;
+        assert_eq!(
+            stale_rescan_paths,
+            vec![stale_path.to_string_lossy().to_string()],
+            "album rescan should find the recording's single source"
+        );
+
+        for path in stale_rescan_paths {
+            rescan_source(
+                &pool,
+                Path::new(&path),
+                None,
+                &serializer,
+                true,
+                &file_issues,
+            )
+            .await
+            .unwrap();
+        }
+        prune_library(&pool).await.unwrap();
+
+        assert_eq!(
+            release_titles_for_recording(&pool, &stale_recording_id).await,
+            vec!["Dance Dance Revolution EXTREME ORIGINAL SOUNDTRACK"],
+            "the recording should only remain associated with the album asserted by its rescanned source"
+        );
+        assert!(
+            release_group_id_by_title(&pool, "Dance Dance Revolution Extreme")
+                .await
+                .is_none(),
+            "the old release group should be deleted once no recordings remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_album_rescan_preserves_multi_release_recording_when_one_source_asserts_target() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+        let file_issues = FileIssueLog::new();
+
+        // Edge case from the feature note: one recording can legitimately
+        // appear on multiple releases, with different source files asserting
+        // each appearance. A target album rescan must inspect every source for
+        // the recording before deciding whether to remove the target release.
+        let best_path = tmp.path().join("10-best-of-cool-band.mp3");
+        let cool_path = tmp.path().join("20-cool-album.mp3");
+        write_tagged_mp3(
+            &best_path,
+            "Cool Track",
+            "Cool Band",
+            "Cool Band",
+            "Best of Cool Band",
+        );
+        write_tagged_mp3(
+            &cool_path,
+            "Cool Track",
+            "Cool Band",
+            "Cool Band",
+            "Cool Album",
+        );
+
+        store_prepared_import(
+            &pool,
+            prepared_import_for_path(
+                &best_path,
+                tagged_meta(
+                    "Cool Track",
+                    "Cool Band",
+                    "Cool Band",
+                    "Best of Cool Band",
+                    1,
+                ),
+                Some("cool-track-shared-acoustid"),
+            ),
+        )
+        .await
+        .unwrap();
+        store_prepared_import(
+            &pool,
+            prepared_import_for_path(
+                &cool_path,
+                tagged_meta("Cool Track", "Cool Band", "Cool Band", "Cool Album", 1),
+                Some("cool-track-shared-acoustid"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let cool_recording_id = recording_id_for_path(&pool, &best_path).await;
+        assert_eq!(
+            recording_id_for_path(&pool, &cool_path).await,
+            cool_recording_id,
+            "test setup should attach both source files to one recording"
+        );
+        force_track_id_for_release(
+            &pool,
+            &cool_recording_id,
+            "Best of Cool Band",
+            "a-best-of-track",
+        )
+        .await;
+        force_track_id_for_release(
+            &pool,
+            &cool_recording_id,
+            "Cool Album",
+            "z-cool-album-track",
+        )
+        .await;
+
+        let best_of_release_group_id = release_group_id_by_title(&pool, "Best of Cool Band")
+            .await
+            .unwrap();
+        let best_of_rescan_paths =
+            source_paths_for_release_group(&pool, &best_of_release_group_id).await;
+        assert_eq!(
+            best_of_rescan_paths,
+            vec![
+                best_path.to_string_lossy().to_string(),
+                cool_path.to_string_lossy().to_string()
+            ],
+            "album rescan should rescan all local sources for recordings on the target release"
+        );
+
+        for path in best_of_rescan_paths {
+            rescan_source(
+                &pool,
+                Path::new(&path),
+                None,
+                &serializer,
+                true,
+                &file_issues,
+            )
+            .await
+            .unwrap();
+        }
+        prune_library(&pool).await.unwrap();
+
+        assert_eq!(
+            release_titles_for_recording(&pool, &cool_recording_id).await,
+            vec!["Best of Cool Band", "Cool Album"],
+            "the target release must remain because one of the recording's sources still asserts it"
         );
     }
 

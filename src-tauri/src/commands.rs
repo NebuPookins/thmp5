@@ -2,7 +2,7 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::db::DbPool;
 use crate::file_issues::FileIssue;
 use crate::library::import::{
-    import_paths as do_import, prune_library, rescan_source as do_rescan_source,
+    import_paths as do_import, prune_library, rescan_source as do_rescan_source, SourceAssertions,
 };
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistFixStats, ArtistRow, CompoundArtistCheck,
