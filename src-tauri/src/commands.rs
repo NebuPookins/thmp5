@@ -224,6 +224,7 @@ pub async fn rescan_source(
         state.acoustid_api_key.as_deref(),
         &state.write_serializer,
         false,
+        &state.file_issues,
     )
     .await
     .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()));
@@ -273,6 +274,7 @@ async fn rescan_path_list(
             state.acoustid_api_key.as_deref(),
             &state.write_serializer,
             true,
+            &state.file_issues,
         )
         .await
         {
@@ -694,6 +696,10 @@ pub async fn find_orphan_sources(
             message: msg,
             source_id: Some(source_id.clone()),
             recording_id: Some(recording_id.clone()),
+            frame_id: None,
+            field_name: None,
+            lofty_value: None,
+            corrected_value: None,
         });
     }
     Ok(result)
@@ -733,6 +739,7 @@ pub async fn fix_orphan_source(
         state.acoustid_api_key.as_deref(),
         &state.write_serializer,
         false,
+        &state.file_issues,
     )
     .await
     .map_err(|e| {
@@ -746,6 +753,193 @@ pub async fn fix_orphan_source(
         .pending_jobs
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     emit_job_update(&app, &state, "rescan");
+
+    *state.recordings_cache.write().await = None;
+    Ok(())
+}
+
+/// Resolve a duplicate frame issue by applying the user's chosen value to the
+/// database and removing the issue from the in-memory log.
+///
+/// The auto-correction during scanning already applied the first-tag value
+/// (corrected_value). If the user chose that value, this is a no-op DB-wise.
+/// If they chose the lofty (last-tag) value, we do a targeted database update.
+#[tauri::command]
+pub async fn resolve_duplicate_frame(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+    frame_id: String,
+    chosen_value: String,
+) -> Result<(), String> {
+    // Find the issue so we can compare chosen vs corrected vs lofty values.
+    let issue = {
+        let issues = state.file_issues.all();
+        issues
+            .iter()
+            .find(|i| {
+                i.kind == crate::file_issues::FileIssueKind::DuplicateFrame
+                    && i.file_path == file_path
+                    && i.frame_id.as_deref() == Some(&frame_id)
+            })
+            .cloned()
+            .ok_or_else(|| format!("No duplicate frame issue for {frame_id} in {file_path}"))?
+    };
+
+    let corrected = issue.corrected_value.as_deref().unwrap_or("");
+    let lofty = issue.lofty_value.as_deref().unwrap_or("");
+
+    // Only do DB work if the user picked the lofty value over the auto-corrected one.
+    if chosen_value == lofty && chosen_value != corrected {
+        let pool = state.db.raw_pool();
+        let recording_id: String = sqlx::query_scalar(
+            "SELECT recording_id FROM source WHERE file_path = ? AND source_type = 'local_file'",
+        )
+        .bind(&file_path)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("DB error: {e}"))?
+        .flatten()
+        .ok_or_else(|| format!("Source not found: {file_path}"))?;
+
+        match frame_id.as_str() {
+            "TIT2" => {
+                sqlx::query("UPDATE recording SET title = ? WHERE id = ?")
+                    .bind(&chosen_value)
+                    .bind(&recording_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| format!("Failed to update recording title: {e}"))?;
+            }
+            "TPE1" => {
+                // Replace the primary artist for this recording.
+                let mut conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| format!("DB acquire error: {e}"))?;
+                let mut tx = conn
+                    .begin()
+                    .await
+                    .map_err(|e| format!("DB begin error: {e}"))?;
+                let artist_id =
+                    crate::library::import::get_or_create_artist(&mut tx, &chosen_value)
+                        .await
+                        .map_err(|e| format!("Artist error: {e}"))?;
+                sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
+                    .bind(&recording_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("Failed to clear recording artists: {e}"))?;
+                sqlx::query(
+                    "INSERT INTO recording_artist (recording_id, artist_id, position, role) \
+                     VALUES (?, ?, 0, 'main')",
+                )
+                .bind(&recording_id)
+                .bind(&artist_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to insert recording artist: {e}"))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("Failed to commit artist change: {e}"))?;
+            }
+            "TPE2" => {
+                // Replace the album artist on all release groups that contain this recording.
+                let mut conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| format!("DB acquire error: {e}"))?;
+                let mut tx = conn
+                    .begin()
+                    .await
+                    .map_err(|e| format!("DB begin error: {e}"))?;
+                let artist_id =
+                    crate::library::import::get_or_create_artist(&mut tx, &chosen_value)
+                        .await
+                        .map_err(|e| format!("Artist error: {e}"))?;
+                let release_groups: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT rg.id
+                     FROM track t
+                     JOIN medium m  ON m.id = t.medium_id
+                     JOIN release r ON r.id = m.release_id
+                     JOIN release_group rg ON rg.id = r.release_group_id
+                     WHERE t.recording_id = ?",
+                )
+                .bind(&recording_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to find release groups: {e}"))?;
+                for rg_id in &release_groups {
+                    // Delete existing and re-insert at position 0
+                    sqlx::query("DELETE FROM release_group_artist WHERE release_group_id = ?")
+                        .bind(rg_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| format!("Failed to clear release group artists: {e}"))?;
+                    sqlx::query(
+                        "INSERT INTO release_group_artist (release_group_id, artist_id, position, role) \
+                         VALUES (?, ?, 0, 'main')",
+                    )
+                    .bind(rg_id)
+                    .bind(&artist_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("Failed to insert release group artist: {e}"))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("Failed to commit album artist change: {e}"))?;
+            }
+            "TALB" => {
+                // Update the album title on all release groups + releases containing
+                // this recording.
+                let mut conn = pool
+                    .acquire()
+                    .await
+                    .map_err(|e| format!("DB acquire error: {e}"))?;
+                let mut tx = conn
+                    .begin()
+                    .await
+                    .map_err(|e| format!("DB begin error: {e}"))?;
+                let release_groups: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT rg.id
+                     FROM track t
+                     JOIN medium m  ON m.id = t.medium_id
+                     JOIN release r ON r.id = m.release_id
+                     JOIN release_group rg ON rg.id = r.release_group_id
+                     WHERE t.recording_id = ?",
+                )
+                .bind(&recording_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to find release groups: {e}"))?;
+                for rg_id in &release_groups {
+                    sqlx::query("UPDATE release_group SET title = ? WHERE id = ?")
+                        .bind(&chosen_value)
+                        .bind(rg_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| format!("Failed to update release group title: {e}"))?;
+                    sqlx::query("UPDATE release SET title = ? WHERE release_group_id = ?")
+                        .bind(&chosen_value)
+                        .bind(rg_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| format!("Failed to update release title: {e}"))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("Failed to commit album title change: {e}"))?;
+            }
+            other => return Err(format!("Unsupported frame ID: {other}")),
+        }
+    }
+
+    // Remove the resolved issue from the in-memory log.
+    state.file_issues.retain(|issue| {
+        !(issue.kind == crate::file_issues::FileIssueKind::DuplicateFrame
+            && issue.file_path == file_path
+            && issue.frame_id.as_deref() == Some(&frame_id))
+    });
 
     *state.recordings_cache.write().await = None;
     Ok(())
@@ -3428,6 +3622,161 @@ pub async fn apply_artist_fix(
 
     *state.recordings_cache.write().await = None;
 
+    result
+}
+
+async fn split_recording_inner(
+    db: &DbPool,
+    recording_id: &str,
+    source_ids_to_move: &[String],
+) -> Result<String, String> {
+    let mut conn = db
+        .acquire(format!("command.split_recording_inner id={recording_id}"))
+        .await
+        .map_err(|e| e.to_string())?;
+    conn.set_busy_timeout(std::time::Duration::from_secs(30))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
+
+    // Validate: at least one source must remain on the original
+    let total_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source WHERE recording_id = ?")
+        .bind(recording_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if source_ids_to_move.len() as i64 >= total_count {
+        return Err("At least one source must remain on the original recording".to_string());
+    }
+
+    // Validate: all source_ids belong to this recording
+    for sid in source_ids_to_move {
+        let exists: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM source WHERE id = ? AND recording_id = ?",
+        )
+        .bind(sid)
+        .bind(recording_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?
+            > 0;
+        if !exists {
+            return Err(format!(
+                "Source {sid} does not belong to recording {recording_id}"
+            ));
+        }
+    }
+
+    // Read metadata from the first local_file source in the list
+    let mut title = String::new();
+    let mut artist_name: Option<String> = None;
+    let mut genre: Option<String> = None;
+    let mut bpm: Option<f64> = None;
+    let mut comment: Option<String> = None;
+    let mut duration_ms: Option<i64> = None;
+
+    for sid in source_ids_to_move {
+        let file_path: Option<String> = sqlx::query_scalar(
+            "SELECT file_path FROM source WHERE id = ? AND source_type = 'local_file'",
+        )
+        .bind(sid)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if let Some(ref path) = file_path {
+            if let Ok(meta) = crate::library::scanner::read_metadata(std::path::Path::new(path)) {
+                title = meta.meta.title.unwrap_or_default();
+                artist_name = meta.meta.artist;
+                genre = meta.meta.genre;
+                bpm = meta.meta.bpm;
+                comment = meta.meta.comment;
+                duration_ms = Some(meta.meta.duration_ms as i64);
+                break; // First source with readable tags wins
+            }
+        }
+    }
+
+    // If no tags could be read, fall back to the original recording's title
+    if title.is_empty() {
+        title = sqlx::query_scalar::<_, Option<String>>("SELECT title FROM recording WHERE id = ?")
+            .bind(recording_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "Split Recording".to_string());
+    }
+
+    // Create the new recording
+    let new_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO recording (id, title, duration_ms, genre, bpm, comment)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&new_id)
+    .bind(&title)
+    .bind(duration_ms)
+    .bind(&genre)
+    .bind(bpm)
+    .bind(&comment)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Link the primary artist if we found one in the tags
+    if let Some(ref name) = artist_name {
+        let name = name.trim();
+        if !name.is_empty() {
+            let artist_id = crate::library::import::get_or_create_artist(&mut tx, name)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "INSERT INTO recording_artist (recording_id, artist_id, position, role)
+                 VALUES (?, ?, 0, 'main')",
+            )
+            .bind(&new_id)
+            .bind(&artist_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Move selected sources to the new recording
+    for sid in source_ids_to_move {
+        sqlx::query("UPDATE source SET recording_id = ? WHERE id = ?")
+            .bind(&new_id)
+            .bind(sid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(new_id)
+}
+
+#[tauri::command]
+pub async fn split_recording(
+    state: tauri::State<'_, AppState>,
+    recording_id: String,
+    source_ids_to_move: Vec<String>,
+) -> Result<String, String> {
+    if source_ids_to_move.is_empty() {
+        return Err("No sources selected to move".to_string());
+    }
+
+    let _permit = state
+        .write_serializer
+        .acquire()
+        .await
+        .map_err(|e| format!("Failed to acquire write lock for split: {e}"))?;
+
+    let result = split_recording_inner(&state.db, &recording_id, &source_ids_to_move).await;
+    drop(_permit);
+
+    *state.recordings_cache.write().await = None;
     result
 }
 

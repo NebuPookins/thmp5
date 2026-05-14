@@ -1,10 +1,12 @@
 use crate::models::{
-    Id3FrameDebugInfo, MetadataReadResult, TagProperty, TaglibHelperResponse, TrackMetadata,
+    DuplicateFrameInfo, Id3FrameDebugInfo, MetadataReadResult, TagProperty, TaglibHelperResponse,
+    TrackMetadata,
 };
 use anyhow::{Context, Result};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::ItemKey;
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -13,8 +15,156 @@ fn synchsafe_to_u32(b: &[u8]) -> u32 {
     ((b[0] as u32) << 21) | ((b[1] as u32) << 14) | ((b[2] as u32) << 7) | (b[3] as u32)
 }
 
-/// Map a common ID3 frame ID to a human-readable field name.
-fn frame_id_to_field_name(id: &str) -> &'static str {
+/// Decode text from an ID3v2 text frame based on its encoding byte.
+fn decode_id3v2_text(data: &[u8], encoding: u8) -> String {
+    match encoding {
+        0x00 => data.iter().map(|&b| b as char).collect(),
+        0x01 => {
+            let (bom, rest) = if data.len() >= 2 {
+                data.split_at(2)
+            } else {
+                return String::new();
+            };
+            let u16_data: Vec<u16> = rest
+                .chunks(2)
+                .filter(|c| c.len() == 2)
+                .map(|c| {
+                    if bom == b"\xFF\xFE" {
+                        u16::from_le_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_be_bytes([c[0], c[1]])
+                    }
+                })
+                .take_while(|&c| c != 0)
+                .collect();
+            String::from_utf16_lossy(&u16_data)
+        }
+        0x02 => {
+            let u16_data: Vec<u16> = data
+                .chunks(2)
+                .filter(|c| c.len() == 2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .take_while(|&c| c != 0)
+                .collect();
+            String::from_utf16_lossy(&u16_data)
+        }
+        0x03 => String::from_utf8_lossy(data)
+            .trim_end_matches('\0')
+            .to_string(),
+        _ => String::from_utf8_lossy(data).to_string(),
+    }
+}
+
+/// Check if a frame ID is a text frame (starts with 'T', no known exceptions here).
+fn is_text_frame(frame_id: &str) -> bool {
+    frame_id.len() == 4 && frame_id.starts_with('T') && frame_id != "TXXX"
+}
+
+/// If the file has an ID3v2 tag (or multiple consecutive ID3v2 tags) with
+/// duplicate text frames, returns a map of frame ID → first occurrence value
+/// for each duplicated frame ID.
+///
+/// Some files contain two consecutive ID3v2 tags. Lofty merges them via
+/// `Id3v2Tag::insert()`, which replaces existing frames with those from
+/// the second tag — so the *last* tag's frames win. This function scans
+/// *all* consecutive ID3v2 tags to detect such duplicates and returns
+/// the value from the *first* tag, which is more likely correct.
+fn get_first_id3v2_frame_values(path: &Path) -> HashMap<String, String> {
+    use std::io::Read;
+
+    let file_len = std::fs::metadata(path)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut first_values: HashMap<String, String> = HashMap::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    loop {
+        let mut header = [0u8; 10];
+        if file.read_exact(&mut header).is_err() || &header[..3] != b"ID3" {
+            break;
+        }
+
+        // Determine tag size: v2.4 uses synchsafe, earlier versions use big-endian.
+        // Also fall back to big-endian if synchsafe would overshoot.
+        let synchsafe_size = synchsafe_to_u32(&header[6..10]) as usize;
+        let big_endian_size =
+            u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
+        let (size, used_synchsafe) = if header[3] < 4 || synchsafe_size + 10 > file_len {
+            (big_endian_size, false)
+        } else {
+            (synchsafe_size, true)
+        };
+
+        let mut tag_data = vec![0u8; size];
+        if file.read_exact(&mut tag_data).is_err() {
+            break;
+        }
+
+        let mut pos = 0;
+        while pos + 10 <= tag_data.len() {
+            let frame_id_bytes = &tag_data[pos..pos + 4];
+            if frame_id_bytes.iter().all(|&b| b == 0) {
+                break;
+            }
+            let frame_id = match std::str::from_utf8(frame_id_bytes) {
+                Ok(id) if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => id,
+                _ => break,
+            };
+
+            let frame_size = if used_synchsafe {
+                synchsafe_to_u32(&tag_data[pos + 4..pos + 8]) as usize
+            } else {
+                u32::from_be_bytes([
+                    tag_data[pos + 4],
+                    tag_data[pos + 5],
+                    tag_data[pos + 6],
+                    tag_data[pos + 7],
+                ]) as usize
+            };
+
+            let data_start = pos + 10;
+            let data_end = data_start + frame_size;
+            if data_end > tag_data.len() {
+                break;
+            }
+
+            let count = counts.entry(frame_id.to_string()).or_insert(0);
+            *count += 1;
+
+            if *count <= 1 && is_text_frame(frame_id) && frame_size > 1 {
+                let encoding = tag_data[data_start];
+                let text = decode_id3v2_text(&tag_data[data_start + 1..data_end], encoding);
+                first_values.entry(frame_id.to_string()).or_insert(text);
+            }
+
+            pos = data_end;
+        }
+
+        // Skip footer if present (flag bit 4)
+        if header[5] & 0x10 != 0 {
+            let mut footer = [0u8; 10];
+            let _ = file.read_exact(&mut footer);
+        }
+    }
+
+    let mut result = HashMap::new();
+    for (frame_id, count) in &counts {
+        if *count > 1 {
+            if let Some(val) = first_values.get(frame_id) {
+                result.insert(frame_id.clone(), val.clone());
+            }
+        }
+    }
+
+    result
+}
+
+pub(crate) fn frame_id_to_field_name(id: &str) -> &'static str {
     match id {
         "TIT2" | "TT2" => "title",
         "TPE1" | "TP1" => "artist",
@@ -391,6 +541,7 @@ fn try_taglib_helper(path: &Path, primary_error: &str) -> Result<Option<Metadata
             meta: response.meta,
             warning,
             all_tags: response.all_tags,
+            duplicate_frames: Vec::new(),
         }));
     }
 
@@ -413,7 +564,11 @@ pub fn is_audio_file(path: &Path) -> bool {
 }
 
 /// Read audio metadata from a file using Lofty.
-fn read_metadata_with_lofty(path: &Path) -> Result<TrackMetadata> {
+///
+/// Returns `(metadata, duplicate_frame_overrides)` where
+/// `duplicate_frame_overrides` lists `DuplicateFrameInfo` for each
+/// text frame that had conflicting values across multiple ID3v2 tags.
+fn read_metadata_with_lofty(path: &Path) -> Result<(TrackMetadata, Vec<DuplicateFrameInfo>)> {
     let tagged_file = Probe::open(path)
         .context("Failed to open file for metadata reading")?
         .guess_file_type()
@@ -503,6 +658,68 @@ fn read_metadata_with_lofty(path: &Path) -> Result<TrackMetadata> {
         }
     }
 
+    // If the file has an ID3v2 tag with duplicate text frames, Lofty may have
+    // picked the last frame instead of the first. Check the raw ID3v2 tag and
+    // use the first occurrence value when duplicates exist.
+    let duplicates = get_first_id3v2_frame_values(path);
+    let mut overrides: Vec<DuplicateFrameInfo> = Vec::new();
+
+    let mut check_override = |meta_value: &mut Option<String>,
+                              raw_value: &str,
+                              frame_id: &str,
+                              field_name: &str|
+     -> bool {
+        if meta_value.as_deref() != Some(raw_value) {
+            let lofty_value = meta_value.clone().unwrap_or_default();
+            tracing::info!(
+                "ID3v2 tag has multiple {frame_id} ({field_name}) frames; using first: {raw_value:?} (was: {lofty_value:?})",
+            );
+            overrides.push(DuplicateFrameInfo {
+                frame_id: frame_id.to_string(),
+                field_name: field_name.to_string(),
+                lofty_value,
+                corrected_value: raw_value.to_string(),
+            });
+            *meta_value = Some(raw_value.to_string());
+            true
+        } else {
+            false
+        }
+    };
+
+    if let Some(raw_album) = duplicates.get("TALB") {
+        check_override(
+            &mut meta.album,
+            raw_album,
+            "TALB",
+            frame_id_to_field_name("TALB"),
+        );
+    }
+    if let Some(raw_album_artist) = duplicates.get("TPE2") {
+        check_override(
+            &mut meta.album_artist,
+            raw_album_artist,
+            "TPE2",
+            frame_id_to_field_name("TPE2"),
+        );
+    }
+    if let Some(raw_artist) = duplicates.get("TPE1") {
+        check_override(
+            &mut meta.artist,
+            raw_artist,
+            "TPE1",
+            frame_id_to_field_name("TPE1"),
+        );
+    }
+    if let Some(raw_title) = duplicates.get("TIT2") {
+        check_override(
+            &mut meta.title,
+            raw_title,
+            "TIT2",
+            frame_id_to_field_name("TIT2"),
+        );
+    }
+
     // Fall back: use filename as title if no title tag
     if meta.title.is_none() {
         meta.title = path
@@ -511,16 +728,17 @@ fn read_metadata_with_lofty(path: &Path) -> Result<TrackMetadata> {
             .map(ToString::to_string);
     }
 
-    Ok(meta)
+    Ok((meta, overrides))
 }
 
 /// Read audio metadata, falling back to the TagLib helper when Lofty rejects malformed tags.
 pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
     let mut result = match read_metadata_with_lofty(path) {
-        Ok(meta) => MetadataReadResult {
+        Ok((meta, duplicate_frames)) => MetadataReadResult {
             meta,
             warning: None,
             all_tags: Vec::new(),
+            duplicate_frames,
         },
         Err(error) => {
             let primary_error = format!("{error:#}");

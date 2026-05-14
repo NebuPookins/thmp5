@@ -1,7 +1,8 @@
 use super::scanner::{is_audio_file, read_metadata};
 use crate::db::DbPool;
+use crate::file_issues::FileIssueLog;
 use crate::fingerprint::{self, AcoustIdMatch};
-use crate::models::{ImportStats, TrackMetadata};
+use crate::models::{DuplicateFrameInfo, ImportStats, TrackMetadata};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Sqlite, Transaction};
@@ -99,6 +100,7 @@ pub async fn rescan_source(
     acoustid_key: Option<&str>,
     serializer: &Semaphore,
     skip_prune: bool,
+    file_issues: &FileIssueLog,
 ) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
     let mut conn = db
@@ -125,6 +127,7 @@ pub async fn rescan_source(
         meta: TrackMetadata,
         warnings: Vec<String>,
         fp: Option<fingerprint::FingerprintResult>,
+        duplicate_frames: Vec<DuplicateFrameInfo>,
     }
 
     let p = path.to_path_buf();
@@ -145,6 +148,7 @@ pub async fn rescan_source(
             meta: metadata_read.meta,
             warnings: metadata_read.warning.into_iter().collect(),
             fp,
+            duplicate_frames: metadata_read.duplicate_frames,
         })
     })
     .await;
@@ -184,6 +188,13 @@ pub async fn rescan_source(
         .await
         .context("Failed to start source rescan transaction")?;
 
+    tracing::info!(
+        path = %path.display(),
+        artist = %blocking.meta.artist.as_deref().unwrap_or("(none)"),
+        album_artist = %blocking.meta.album_artist.as_deref().unwrap_or("(none)"),
+        "Rescan: read metadata"
+    );
+
     let artist_name = blocking
         .meta
         .artist
@@ -208,8 +219,21 @@ pub async fn rescan_source(
         .as_deref()
         .unwrap_or("Unknown Album")
         .to_string();
+    tracing::info!(
+        path = %path.display(),
+        recording_id = %recording_id,
+        album_title = %album_title,
+        album_artist_name = %album_artist_name,
+        "Rescan: resolved metadata"
+    );
     let release_group_id =
         get_or_create_release_group(&mut tx, &album_title, &album_artist_id).await?;
+    tracing::info!(
+        path = %path.display(),
+        release_group_id = %release_group_id,
+        album_title = %album_title,
+        "Rescan: resolved release group"
+    );
     let release_date = blocking.meta.year.map(|y| y.to_string());
     let release_id = get_or_create_release(
         &mut tx,
@@ -300,6 +324,18 @@ pub async fn rescan_source(
     }
 
     if let Some(track_id) = existing_track_id {
+        let old_medium_id =
+            sqlx::query_scalar::<_, String>("SELECT medium_id FROM track WHERE id = ?")
+                .bind(&track_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("Failed to read old medium_id for rescan logging")?;
+        tracing::info!(
+            track_id = %track_id,
+            old_medium_id = %old_medium_id.as_deref().unwrap_or("(none)"),
+            new_medium_id = %medium_id,
+            "Rescan: updating track medium"
+        );
         sqlx::query(
             "UPDATE track
              SET medium_id = ?, position = ?, title = NULL, duration_ms = NULL
@@ -312,6 +348,10 @@ pub async fn rescan_source(
         .await
         .context("Failed to update track placement during source rescan")?;
     } else {
+        tracing::info!(
+            recording_id = %recording_id,
+            "Rescan: no existing track found, creating"
+        );
         get_or_create_track(&mut tx, &medium_id, &recording_id, track_position).await?;
     }
 
@@ -374,6 +414,17 @@ pub async fn rescan_source(
     tracing::info!(path = %path.display(), recording_id = %recording_id, source_id = %source_id, "Rescanned source");
     for warning in blocking.warnings {
         println!("[importer] rescan warning: {}: {}", path.display(), warning);
+    }
+
+    // Push file issues for any duplicate-frame corrections
+    for df in &blocking.duplicate_frames {
+        file_issues.push_duplicate_frame(
+            path.display().to_string(),
+            &df.frame_id,
+            &df.field_name,
+            &df.lofty_value,
+            &df.corrected_value,
+        );
     }
 
     Ok(())
@@ -897,10 +948,12 @@ async fn get_or_create_release_group(
     .fetch_optional(&mut **tx)
     .await?
     {
+        tracing::info!(release_group_id = %id, title = %title, "get_or_create_release_group: found existing");
         return Ok(id);
     }
 
     let id = Uuid::new_v4().to_string();
+    tracing::info!(release_group_id = %id, title = %title, "get_or_create_release_group: creating new");
     sqlx::query("INSERT INTO release_group (id, title, rg_type) VALUES (?, ?, 'album')")
         .bind(&id)
         .bind(title)
@@ -929,10 +982,12 @@ async fn get_or_create_release(
             .fetch_optional(&mut **tx)
             .await?
     {
+        tracing::info!(release_id = %id, release_group_id = %release_group_id, "get_or_create_release: found existing");
         return Ok(id);
     }
 
     let id = Uuid::new_v4().to_string();
+    tracing::info!(release_id = %id, release_group_id = %release_group_id, "get_or_create_release: creating new");
     sqlx::query(
         "INSERT INTO release (id, release_group_id, title, release_date) VALUES (?, ?, ?, ?)",
     )
@@ -958,10 +1013,12 @@ async fn get_or_create_medium(
     .fetch_optional(&mut **tx)
     .await?
     {
+        tracing::info!(medium_id = %id, release_id = %release_id, disc = %disc, "get_or_create_medium: found existing");
         return Ok(id);
     }
 
     let id = Uuid::new_v4().to_string();
+    tracing::info!(medium_id = %id, release_id = %release_id, disc = %disc, "get_or_create_medium: creating new");
     sqlx::query(
         "INSERT INTO medium (id, release_id, position, format) VALUES (?, ?, ?, 'Digital')",
     )
@@ -1371,6 +1428,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_diagnose_ddr_extreme_rescan() {
+        let path = std::path::Path::new("/home/nebu/Music/!Full Albums/Game - 2003 - Dance Dance Revolution Extreme/DDR Extreme Disc 1 (02) Houseboyz - We Will Rock You.mp3");
+        let db_path =
+            std::path::Path::new("/home/nebu/.local/share/net.nebupookins.thmp5/library.db");
+        let pool = crate::db::init_pool(db_path).await.unwrap();
+
+        // Read metadata first
+        let meta = crate::library::scanner::read_metadata(path).unwrap();
+        println!(
+            "METADATA: album={:?} album_artist={:?} artist={:?}",
+            meta.meta.album, meta.meta.album_artist, meta.meta.artist
+        );
+
+        let lower_title = meta
+            .meta
+            .album
+            .as_deref()
+            .unwrap_or("Unknown Album")
+            .to_lowercase();
+        let album_artist_name = meta
+            .meta
+            .album_artist
+            .as_deref()
+            .or(meta.meta.artist.as_deref())
+            .unwrap_or("Unknown Artist");
+        let mut conn = pool.acquire("diag.artist_id").await.unwrap();
+        let artist_id: String = sqlx::query_scalar("SELECT id FROM artist WHERE lower(name) = ?")
+            .bind(&album_artist_name.to_lowercase())
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        println!("RESOLVED: album_artist_name={album_artist_name} artist_id={artist_id} lower_title={lower_title}");
+
+        // Check what get_or_create_release_group would match
+        let mut cc = pool.acquire("diag.match").await.unwrap();
+        let matched: Vec<(String, String)> = sqlx::query_as(
+            "SELECT rg.id, rg.title FROM release_group rg
+             JOIN release_group_artist rga ON rga.release_group_id = rg.id
+             WHERE lower(rg.title) = ? AND rga.artist_id = ?",
+        )
+        .bind(&lower_title)
+        .bind(&artist_id)
+        .fetch_all(&mut *cc)
+        .await
+        .unwrap();
+        println!("SQL MATCH would find: {:?}", matched);
+
+        // Check what the old release_group_artist is
+        let old_artist: Vec<(String, String)> = sqlx::query_as(
+            "SELECT rg.id, a.name FROM release_group rg
+             JOIN release_group_artist rga ON rga.release_group_id = rg.id
+             JOIN artist a ON a.id = rga.artist_id
+             WHERE rg.id = (SELECT rel.release_group_id
+                 FROM track t
+                 JOIN medium m ON m.id = t.medium_id
+                 JOIN release rel ON rel.id = m.release_id
+                 WHERE t.recording_id = (
+                     SELECT recording_id FROM source
+                     WHERE file_path = ? AND source_type = 'local_file'
+                 )
+             )",
+        )
+        .bind(&path.to_string_lossy().to_string())
+        .fetch_all(&mut *cc)
+        .await
+        .unwrap();
+        println!("OLD album artist: {:?}", old_artist);
+        drop(cc);
+
+        // Snapshot before rescan
+        let mut conn = pool.acquire("diag.before").await.unwrap();
+        let before: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT t.id, t.medium_id, rg.title
+             FROM track t
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             WHERE t.recording_id = (
+                 SELECT recording_id FROM source
+                 WHERE file_path = ? AND source_type = 'local_file'
+             )",
+        )
+        .bind(&path.to_string_lossy().to_string())
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        println!(
+            "BEFORE: track_id={:?} medium_id={:?} album={:?}",
+            before[0].0, before[0].1, before[0].2
+        );
+        drop(conn);
+
+        // Run rescan
+        let serializer = tokio::sync::Semaphore::new(1);
+        let file_issues = FileIssueLog::new();
+        let result = rescan_source(&pool, path, None, &serializer, false, &file_issues).await;
+        match &result {
+            Ok(_) => println!("RESCAN SUCCEEDED"),
+            Err(e) => println!("RESCAN FAILED: {e:?}"),
+        }
+
+        // Snapshot after rescan
+        let mut conn = pool.acquire("diag.after").await.unwrap();
+        let after: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT t.id, t.medium_id, rg.title
+             FROM track t
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             WHERE t.recording_id = (
+                 SELECT recording_id FROM source
+                 WHERE file_path = ? AND source_type = 'local_file'
+             )",
+        )
+        .bind(&path.to_string_lossy().to_string())
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        println!(
+            "AFTER: track_id={:?} medium_id={:?} album={:?}",
+            after[0].0, after[0].1, after[0].2
+        );
+        println!("CHANGED: {}", before[0].1 != after[0].1);
+        drop(conn);
+
+        assert!(result.is_ok(), "Rescan should succeed, got: {:?}", result);
+    }
+
+    #[tokio::test]
     async fn test_rescan_source_picks_up_txxx_artists() {
         let tmp = TempDir::new().unwrap();
 
@@ -1452,7 +1639,8 @@ mod tests {
 
         // Step 2: Rescan — should now read TXXX=ARTISTS and add extra artists
         let serializer = tokio::sync::Semaphore::new(1);
-        rescan_source(&pool, &file_path, None, &serializer, true)
+        let file_issues = FileIssueLog::new();
+        rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
             .await
             .unwrap();
 

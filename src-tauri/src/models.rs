@@ -265,11 +265,24 @@ pub struct TrackMetadata {
     pub artists: Option<String>,
 }
 
+/// Describes a duplicate-frame override applied during metadata reading.
+/// `lofty_value` is what Lofty returned (the last tag's value), and
+/// `corrected_value` is what we use instead (the first tag's value).
+#[derive(Debug)]
+pub struct DuplicateFrameInfo {
+    pub frame_id: String,
+    pub field_name: String,
+    pub lofty_value: String,
+    pub corrected_value: String,
+}
+
 #[derive(Debug)]
 pub struct MetadataReadResult {
     pub meta: TrackMetadata,
     pub warning: Option<String>,
     pub all_tags: Vec<TagProperty>,
+    /// Frame IDs that had conflicting values across multiple ID3v2 tags.
+    pub duplicate_frames: Vec<DuplicateFrameInfo>,
 }
 
 #[derive(Debug, Deserialize)]

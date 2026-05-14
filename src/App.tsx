@@ -176,13 +176,42 @@ type ArtistFixStats = {
 
 type FileIssue = {
   file_path: string;
-  kind: "import_error" | "playback_error" | "orphan_source";
+  kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame";
   message: string;
   source_id?: string;
   recording_id?: string;
+  frame_id?: string;
+  field_name?: string;
+  lofty_value?: string;
+  corrected_value?: string;
 };
 
 type QueueItem = RecordingRow;
+
+// ── Types for split recording modal ──────────────────────────────────────────
+type SplitSourceTagInfo = {
+  frame_id: string;
+  field_name: string;
+  value: string;
+};
+
+type SplitSourceDetail = {
+  id: string;
+  source_type: string;
+  file_path: string | null;
+  duration_ms: number | null;
+  tags: SplitSourceTagInfo[];
+};
+
+type SplitRecordingDetail = {
+  id: string;
+  title: string;
+  artist_credit_name: string | null;
+  primary_artist_id: string | null;
+  genre: string | null;
+  bpm: number | null;
+  sources: SplitSourceDetail[];
+};
 
 type ContextMenuState =
   | { kind: "recording"; x: number; y: number; path: string; recording: RecordingRow }
@@ -208,6 +237,85 @@ function formatNormGain(gain: number): string {
   if (gain <= 0) return "0 dB";
   const db = 20 * Math.log10(gain);
   return `${db >= 0 ? "+" : ""}${db.toFixed(1)} dB`;
+}
+
+// Helper: derive metadata from selected sources' tags (first source wins per field)
+function firstTag(sources: SplitSourceDetail[], frameId: string): string | null {
+  for (const src of sources) {
+    const tag = src.tags.find((t) => t.frame_id === frameId);
+    if (tag?.value) return tag.value;
+  }
+  return null;
+}
+
+function allUniqueTags(sources: SplitSourceDetail[], frameId: string): string[] {
+  const values = new Set<string>();
+  for (const src of sources) {
+    for (const t of src.tags) {
+      if (t.frame_id === frameId && t.value) values.add(t.value);
+    }
+  }
+  return Array.from(values);
+}
+
+function abbreviatePaths(sources: SplitSourceDetail[]): Map<string, string> {
+  const paths = sources.map((s) => s.file_path).filter((p): p is string => p !== null);
+  const map = new Map<string, string>();
+
+  if (paths.length <= 1) {
+    for (const s of sources) {
+      map.set(s.id, s.file_path ?? "(no file path)");
+    }
+    return map;
+  }
+
+  // Split all paths into segments
+  const segmented = paths.map((p) => p.split("/"));
+  const minLen = Math.min(...segmented.map((s) => s.length));
+
+  // Find common prefix segments
+  let prefixLen = 0;
+  while (prefixLen < minLen) {
+    const first = segmented[0][prefixLen];
+    if (segmented.every((s) => s[prefixLen] === first)) {
+      prefixLen++;
+    } else {
+      break;
+    }
+  }
+
+  // Find common suffix segments
+  let suffixLen = 0;
+  while (suffixLen < minLen - prefixLen) {
+    const last = segmented[0][segmented[0].length - 1 - suffixLen];
+    if (segmented.every((s) => s[s.length - 1 - suffixLen] === last)) {
+      suffixLen++;
+    } else {
+      break;
+    }
+  }
+
+  for (const s of sources) {
+    if (!s.file_path) {
+      map.set(s.id, "(no file path)");
+      continue;
+    }
+    const segs = s.file_path.split("/");
+    const middle = segs.slice(prefixLen, suffixLen === 0 ? undefined : segs.length - suffixLen);
+
+    let abbreviated = "";
+    if (prefixLen > 0) abbreviated = "…/";
+    abbreviated += middle.join("/");
+    if (suffixLen > 0 && middle.length > 0) abbreviated += "/…";
+
+    // Fallback: if nothing unique remains, show just the filename
+    if (!abbreviated || abbreviated === "…/") {
+      abbreviated = "…/" + segs[segs.length - 1];
+    }
+
+    map.set(s.id, abbreviated);
+  }
+  return map;
 }
 
 function formatDuration(durationMs: number | null): string {
@@ -465,6 +573,7 @@ function App() {
   const [settingsTab, setSettingsTab] = useState<"options" | "issues">("options");
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
   const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
+  const [resolvingDuplicates, setResolvingDuplicates] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [_allTags, setAllTags] = useState<string[]>([]);
@@ -486,6 +595,11 @@ function App() {
   const [artistFixStats, setArtistFixStats] = useState<ArtistFixStats | null>(null);
   const [artistFixApplying, setArtistFixApplying] = useState(false);
   const [artistFixError, setArtistFixError] = useState<string | null>(null);
+  const [splitRecordingId, setSplitRecordingId] = useState<string | null>(null);
+  const [splitData, setSplitData] = useState<SplitRecordingDetail | null>(null);
+  const [splitSelectedSourceIds, setSplitSelectedSourceIds] = useState<Set<string>>(new Set());
+  const [splitIsSubmitting, setSplitIsSubmitting] = useState(false);
+  const [splitError, setSplitError] = useState<string | null>(null);
   const [compareAnchor, setCompareAnchor] = useState<RecordingRow | null>(null);
   const [comparisonModal, setComparisonModal] = useState<{
     recA: RecordingRow;
@@ -495,7 +609,6 @@ function App() {
   const [comparisonBer, setComparisonBer] = useState<number | null | "loading" | "error">(null);
   const [comparisonSideAMs, setComparisonSideAMs] = useState(0);
   const [comparisonSideBMs, setComparisonSideBMs] = useState(0);
-  const [comparisonActiveSide, setComparisonActiveSide] = useState<"A" | "B">("A");
   const [mergeTitleChoice, setMergeTitleChoice] = useState<"A" | "B" | "custom">("A");
   const [mergeTitleCustom, setMergeTitleCustom] = useState("");
   const [mergeArtistChoice, setMergeArtistChoice] = useState<"A" | "B" | "custom">("A");
@@ -636,6 +749,7 @@ function App() {
 
   const trackTableScrollRef = useRef<HTMLDivElement>(null);
   const isComparisonScrubbing = useRef(false);
+  const comparisonPlayingRef = useRef<"A" | "B" | null>(null);
   const rowVirtualizer = useVirtualizer({
     count: filteredRecordings.length,
     getScrollElement: () => trackTableScrollRef.current,
@@ -925,6 +1039,24 @@ function App() {
     return () => window.clearTimeout(timeoutId);
   }, [bootstrap?.needs_setup, search, selectedArtistId]);
 
+  // Fetch recording detail when split modal opens
+  useEffect(() => {
+    if (!splitRecordingId) {
+      setSplitData(null);
+      setSplitSelectedSourceIds(new Set());
+      setSplitError(null);
+      return;
+    }
+    invoke<SplitRecordingDetail>("get_recording_detail", { id: splitRecordingId })
+      .then((detail) => {
+        setSplitData(detail);
+        // Pre-select all sources except the last one as a reasonable default
+        const ids = detail.sources.slice(0, -1).map((s) => s.id);
+        setSplitSelectedSourceIds(new Set(ids));
+      })
+      .catch((e) => setSplitError(e instanceof Error ? e.message : String(e)));
+  }, [splitRecordingId]);
+
   useEffect(() => {
     if (!selectedReleaseGroupId) {
       return;
@@ -1052,11 +1184,8 @@ function App() {
           position_ms: event.payload,
         }));
 
-        setComparisonActiveSide((side) => {
-          if (side === "A") setComparisonSideAMs(event.payload);
-          else setComparisonSideBMs(event.payload);
-          return side;
-        });
+        if (comparisonPlayingRef.current === "A") setComparisonSideAMs(event.payload);
+        else if (comparisonPlayingRef.current === "B") setComparisonSideBMs(event.payload);
       });
       const unlistenEnded = await listen<{
         recording_id: string;
@@ -1244,7 +1373,6 @@ function App() {
     setComparisonBer("loading");
     setComparisonSideAMs(0);
     setComparisonSideBMs(0);
-    setComparisonActiveSide("A");
     setMergeTitleChoice("A");
     setMergeTitleCustom("");
     setMergeArtistChoice("A");
@@ -1572,11 +1700,16 @@ function App() {
     if (wasPlaying) {
       try { await invoke("pause"); } catch { /* ignore */ }
     }
+    comparisonPlayingRef.current = null;
+    setComparisonSideAMs(0);
+    setComparisonSideBMs(0);
     setMergeRatingChoice(recA.rating === null && recB.rating !== null ? "B" : "A");
     setComparisonModal({ recA, recB, step: "compare" });
   }
 
   async function closeComparisonModal() {
+    if (isComparisonScrubbing.current) return;
+    comparisonPlayingRef.current = null;
     try { await invoke("stop"); } catch { /* ignore */ }
     setComparisonModal(null);
     if (comparisonWasPlaying && currentTrack?.primary_source_id) {
@@ -1590,8 +1723,8 @@ function App() {
     if (!comparisonModal) return;
     const rec = side === "A" ? comparisonModal.recA : comparisonModal.recB;
     const seekMs = side === "A" ? comparisonSideAMs : comparisonSideBMs;
-    if (side === comparisonActiveSide) {
-      // Toggle pause/resume on the active side
+    const isActiveNow = rec.primary_source_id != null && playerState.status !== "stopped" && playerState.source_id === rec.primary_source_id;
+    if (isActiveNow) {
       try {
         if (playerState.status === "playing") {
           await invoke("pause");
@@ -1601,28 +1734,31 @@ function App() {
       } catch { /* ignore */ }
       return;
     }
-    setComparisonActiveSide(side);
     if (rec.primary_source_id) {
       try {
         await invoke("play", { request: { source_id: rec.primary_source_id } });
+        comparisonPlayingRef.current = side;
         if (seekMs > 0) await invoke("seek", { request: { position_ms: seekMs } });
       } catch { /* ignore */ }
     }
   }
 
-  async function handleComparisonScrubChange(side: "A" | "B", ms: number) {
+  async function handleComparisonScrubChange(side: "A" | "B", sourceId: string | null, ms: number) {
     if (side === "A") setComparisonSideAMs(ms);
     else setComparisonSideBMs(ms);
-    if (side === comparisonActiveSide) {
+    if (sourceId != null && playerState.status !== "stopped" && playerState.source_id === sourceId) {
       setPlayerState((current) => ({ ...current, position_ms: ms }));
     }
   }
 
-  async function handleComparisonScrubCommit(side: "A" | "B", ms: number) {
-    if (side !== comparisonActiveSide) {
+  async function handleComparisonScrubCommit(side: "A" | "B", sourceId: string | null, ms: number) {
+    const isActiveNow = sourceId != null && playerState.status !== "stopped" && playerState.source_id === sourceId;
+    if (!isActiveNow) {
       await handleComparisonSwitchSide(side);
     } else {
-      try { await invoke("seek", { request: { position_ms: ms } }); } catch { /* ignore */ }
+      try { await invoke("seek", { request: { position_ms: ms } }); } catch {
+        await handleComparisonSwitchSide(side);
+      }
     }
     isComparisonScrubbing.current = false;
   }
@@ -1658,6 +1794,27 @@ function App() {
       setComparisonWasPlaying(false);
     } catch (mergeError) {
       setError(mergeError instanceof Error ? mergeError.message : String(mergeError));
+    }
+  }
+
+  async function handleSplitConfirm() {
+    if (!splitData || splitSelectedSourceIds.size === 0) return;
+    const sourceIdsToMove = Array.from(splitSelectedSourceIds);
+    setSplitIsSubmitting(true);
+    setSplitError(null);
+    try {
+      const newId = await invoke<string>("split_recording", {
+        recordingId: splitData.id,
+        sourceIdsToMove,
+      });
+      setSplitRecordingId(null);
+      setSplitSelectedSourceIds(new Set());
+      await loadLibraryData(selectedArtistId, search);
+      dispatchNav({ type: "navigate", nav: { type: "recording", id: newId } });
+    } catch (e) {
+      setSplitError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSplitIsSubmitting(false);
     }
   }
 
@@ -2183,6 +2340,7 @@ function App() {
                   }}
                   onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
                   onRefreshLibrary={() => { void loadLibraryData(selectedArtistId, search); }}
+                  onSplitRecording={(recordingId) => { setSplitRecordingId(recordingId); }}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">
@@ -2716,7 +2874,7 @@ function App() {
                       <li key={i} className="issue-item">
                         <div className="issue-item-header">
                           <span className={`issue-kind issue-kind-${issue.kind}`}>
-                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : "Playback"}
+                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : issue.kind === "duplicate_frame" ? "Duplicate Tag" : "Playback"}
                           </span>
                           {issue.kind === "orphan_source" ? (
                             <button
@@ -2735,6 +2893,53 @@ function App() {
                             >
                               {fixingOrphans.has(issue.source_id!) ? "Fixing…" : "Fix"}
                             </button>
+                          ) : issue.kind === "duplicate_frame" ? (
+                            <div className="duplicate-frame-choices">
+                              <button
+                                className="use-value-btn"
+                                type="button"
+                                disabled={resolvingDuplicates.has(issue.file_path + issue.frame_id)}
+                                onClick={() => {
+                                  const key = issue.file_path + issue.frame_id;
+                                  setResolvingDuplicates(prev => new Set(prev).add(key));
+                                  void (async () => {
+                                    await invoke("resolve_duplicate_frame", {
+                                      filePath: issue.file_path,
+                                      frameId: issue.frame_id,
+                                      chosenValue: issue.corrected_value,
+                                    });
+                                    setFileIssues(prev => prev.filter(
+                                      fi => !(fi.kind === "duplicate_frame" && fi.file_path === issue.file_path && fi.frame_id === issue.frame_id)
+                                    ));
+                                    setResolvingDuplicates(prev => { const n = new Set(prev); n.delete(key); return n; });
+                                  })();
+                                }}
+                              >
+                                {resolvingDuplicates.has(issue.file_path + issue.frame_id) ? "Applying…" : `Use: ${issue.corrected_value?.substring(0, 60)}`}
+                              </button>
+                              <button
+                                className="use-value-btn use-alt-value"
+                                type="button"
+                                disabled={resolvingDuplicates.has(issue.file_path + issue.frame_id)}
+                                onClick={() => {
+                                  const key = issue.file_path + issue.frame_id;
+                                  setResolvingDuplicates(prev => new Set(prev).add(key));
+                                  void (async () => {
+                                    await invoke("resolve_duplicate_frame", {
+                                      filePath: issue.file_path,
+                                      frameId: issue.frame_id,
+                                      chosenValue: issue.lofty_value,
+                                    });
+                                    setFileIssues(prev => prev.filter(
+                                      fi => !(fi.kind === "duplicate_frame" && fi.file_path === issue.file_path && fi.frame_id === issue.frame_id)
+                                    ));
+                                    setResolvingDuplicates(prev => { const n = new Set(prev); n.delete(key); return n; });
+                                  })();
+                                }}
+                              >
+                                {resolvingDuplicates.has(issue.file_path + issue.frame_id) ? "Applying…" : `Use: ${issue.lofty_value?.substring(0, 60)}`}
+                              </button>
+                            </div>
                           ) : null}
                         </div>
                         <span className="issue-path" title={issue.file_path}>
@@ -2762,7 +2967,7 @@ function App() {
         }
 
         function ScrubSide({ side, rec, durationMs }: { side: "A" | "B"; rec: RecordingRow; durationMs: number }) {
-          const isActive = comparisonActiveSide === side;
+          const isActive = rec.primary_source_id != null && playerState.status !== "stopped" && playerState.source_id === rec.primary_source_id;
           const posMs = isActive ? playerState.position_ms : (side === "A" ? comparisonSideAMs : comparisonSideBMs);
           const canPlay = !!rec.primary_source_id;
           return (
@@ -2785,9 +2990,9 @@ function App() {
                 disabled={durationMs <= 0 || !canPlay}
                 max={durationMs}
                 min={0}
-                onChange={(e) => { void handleComparisonScrubChange(side, Number(e.currentTarget.value)); }}
+                onChange={(e) => { void handleComparisonScrubChange(side, rec.primary_source_id, Number(e.currentTarget.value)); }}
                 onPointerDown={() => { isComparisonScrubbing.current = true; }}
-                onPointerUp={(e) => { void handleComparisonScrubCommit(side, Number((e.currentTarget as HTMLInputElement).value)); }}
+                onPointerUp={(e) => { e.stopPropagation(); void handleComparisonScrubCommit(side, rec.primary_source_id, Number((e.currentTarget as HTMLInputElement).value)); }}
                 step={1}
                 type="range"
                 value={posMs}
@@ -2984,6 +3189,130 @@ function App() {
         );
       })()}
 
+      {splitRecordingId && splitData && (
+        <div className="modal-overlay" onClick={() => setSplitRecordingId(null)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+            <div className="modal-header">
+              <h2>Split Recording</h2>
+              <button className="modal-close-btn" onClick={() => setSplitRecordingId(null)} type="button">×</button>
+            </div>
+            <div className="modal-section">
+              <p className="subtle-text">
+                Splitting: <strong>{splitData.title}</strong>
+              </p>
+              <p className="subtle-text">Select sources to move to a new recording.</p>
+
+              {(() => {
+                const abbrevPaths = abbreviatePaths(splitData.sources);
+                return (
+                  <div className="split-source-list">
+                    {splitData.sources.map((source) => (
+                      <label
+                        key={source.id}
+                        className={`split-source-item${splitSelectedSourceIds.has(source.id) ? " split-source-item-selected" : ""}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={splitSelectedSourceIds.has(source.id)}
+                          onChange={() => {
+                            setSplitSelectedSourceIds((prev) => {
+                              const next = new Set(prev);
+                              next.has(source.id) ? next.delete(source.id) : next.add(source.id);
+                              return next;
+                            });
+                          }}
+                        />
+                        <span className="entity-detail-badge">{source.source_type}</span>
+                        <span className="split-source-path" title={source.file_path ?? undefined}>{abbrevPaths.get(source.id) ?? source.file_path ?? "(no file path)"}</span>
+                        {source.duration_ms != null && (
+                          <span className="subtle-text">{formatDuration(source.duration_ms)}</span>
+                        )}
+                      </label>
+                    ))}
+                  </div>
+                );
+              })()}
+
+              {/* Metadata preview */}
+              <div className="split-preview-section">
+                <h3 className="entity-detail-section-title">Metadata preview</h3>
+                {(() => {
+                  const selectedSources = splitData.sources.filter((s) => splitSelectedSourceIds.has(s.id));
+                  const derivedTitle = firstTag(selectedSources, "TIT2");
+                  const derivedArtists = allUniqueTags(selectedSources, "TPE1");
+                  const derivedTags = allUniqueTags(selectedSources, "TCON");
+
+                  const releaseStrs: string[] = [];
+                  const releaseKeys = new Set<string>();
+                  for (const src of selectedSources) {
+                    const album = firstTag([src], "TALB");
+                    if (!album) continue;
+                    const discNum = src.tags.find((t) => t.frame_id === "TPOS" && t.field_name === "disc_number")?.value;
+                    const discTot = src.tags.find((t) => t.frame_id === "TPOS" && t.field_name === "disc_total")?.value;
+                    const trackNum = src.tags.find((t) => t.frame_id === "TRCK" && t.field_name === "track_number")?.value;
+                    const trackTot = src.tags.find((t) => t.frame_id === "TRCK" && t.field_name === "track_total")?.value;
+                    let r = album;
+                    const parts: string[] = [];
+                    if (discNum) parts.push(discTot ? `Disc ${discNum}/${discTot}` : `Disc ${discNum}`);
+                    if (trackNum) parts.push(trackTot ? `Track ${trackNum}/${trackTot}` : `Track ${trackNum}`);
+                    if (parts.length) r += ` (${parts.join(", ")})`;
+                    if (!releaseKeys.has(r)) {
+                      releaseKeys.add(r);
+                      releaseStrs.push(r);
+                    }
+                  }
+
+                  return (
+                    <table className="entity-detail-meta-table">
+                      <tbody>
+                        <tr>
+                          <td className="split-preview-label">Title</td>
+                          <td className="split-preview-value">{derivedTitle || "—"}</td>
+                        </tr>
+                        <tr>
+                          <td className="split-preview-label">Artist(s)</td>
+                          <td className="split-preview-value">{derivedArtists.length ? derivedArtists.join(", ") : "—"}</td>
+                        </tr>
+                        <tr>
+                          <td className="split-preview-label">Release(s)</td>
+                          <td className="split-preview-value">{releaseStrs.length ? releaseStrs.join("; ") : "—"}</td>
+                        </tr>
+                        <tr>
+                          <td className="split-preview-label">Tag(s)</td>
+                          <td className="split-preview-value">{derivedTags.length ? derivedTags.join(", ") : "—"}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  );
+                })()}
+              </div>
+
+              <p className="split-summary">
+                {splitData.sources.length - splitSelectedSourceIds.size} source(s) remain on original,
+                {" "}{splitSelectedSourceIds.size} moved to new recording.
+              </p>
+
+              {splitError && <div className="error-banner">{splitError}</div>}
+            </div>
+            <div className="comparison-modal-footer">
+              <button className="comparison-cancel-btn" onClick={() => setSplitRecordingId(null)} type="button">Cancel</button>
+              <button
+                className="comparison-confirm-btn"
+                disabled={
+                  splitIsSubmitting ||
+                  splitSelectedSourceIds.size === 0 ||
+                  splitSelectedSourceIds.size === splitData.sources.length
+                }
+                onClick={() => { void handleSplitConfirm(); }}
+                type="button"
+              >
+                {splitIsSubmitting ? "Splitting..." : "Split Recording"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {artistFixModal && (() => {
         const { artistId, artistName } = artistFixModal;
         function closeModal() {
@@ -3170,6 +3499,20 @@ function App() {
                     </button>
                   </li>
                 ) : null}
+                {contextMenu.recording.source_paths.length > 1 && (
+                  <li>
+                    <button
+                      className="ctx-menu-item"
+                      type="button"
+                      onClick={() => {
+                        setSplitRecordingId(contextMenu.recording.id);
+                        setContextMenu(null);
+                      }}
+                    >
+                      Split recording...
+                    </button>
+                  </li>
+                )}
                 {compareAnchor === null ? (
                   <li>
                     <button

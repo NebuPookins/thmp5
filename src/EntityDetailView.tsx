@@ -226,9 +226,10 @@ type Props = {
   onEnqueueTrack?: (track: TrackDetail) => void;
   onRescanReleaseGroup?: (releaseGroupId: string) => void;
   onRefreshLibrary?: () => void;
+  onSplitRecording?: (recordingId: string) => void;
 };
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanReleaseGroup, onRefreshLibrary }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [artist, setArtist] = useState<ArtistDetail | null>(null);
@@ -722,6 +723,16 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
               ))
             )}
           </div>
+
+          {recording.sources.length > 1 && onSplitRecording && (
+            <button
+              className="split-recording-btn"
+              type="button"
+              onClick={() => onSplitRecording(recording.id)}
+            >
+              Split recording...
+            </button>
+          )}
         </div>
       </section>
     );
