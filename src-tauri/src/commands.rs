@@ -2,7 +2,7 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::db::DbPool;
 use crate::file_issues::FileIssue;
 use crate::library::import::{
-    import_paths as do_import, prune_library, rescan_source as do_rescan_source, SourceAssertions,
+    import_paths as do_import, prune_library, rescan_source as do_rescan_source,
 };
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistFixStats, ArtistRow, CompoundArtistCheck,
@@ -17,7 +17,7 @@ use crate::query::{self, LimitUnit};
 use crate::AppState;
 use serde::Serialize;
 use sqlx::{Acquire, Row, Sqlite, SqliteConnection, Transaction};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Emitter;
@@ -227,6 +227,7 @@ pub async fn rescan_source(
         &state.file_issues,
     )
     .await
+    .map(|_| ())
     .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()));
 
     state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
@@ -250,35 +251,52 @@ pub async fn rescan_sources(
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect();
-    rescan_path_list(&app, &state, trimmed).await
+    rescan_path_list(&app, &state, trimmed).await?;
+    Ok(())
 }
 
 /// Shared loop: track per-file counter in AppState, emit `job-update` after each file.
+///
+/// Returns a map of recording_id → set of release_group_ids that the rescanned
+/// sources' files currently assert. Callers that need to detect stale tracks
+/// (e.g., `rescan_sources_for_release_group`) can use this to identify tracks
+/// on release groups that no source still claims.
 async fn rescan_path_list(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     paths: Vec<String>,
-) -> Result<(), String> {
+) -> Result<HashMap<String, HashSet<String>>, String> {
     let count = paths.len() as i64;
     state.pending_jobs.fetch_add(count, Ordering::Relaxed);
     emit_job_update(app, state, "rescan");
 
     let mut failures = Vec::new();
+    let mut assertions: HashMap<String, HashSet<String>> = HashMap::new();
     for path in paths {
         let source_path = std::path::Path::new(&path);
         if !source_path.is_file() {
             failures.push(format!("{}: Source file is missing", source_path.display()));
-        } else if let Err(error) = do_rescan_source(
-            &state.db,
-            source_path,
-            state.acoustid_api_key.as_deref(),
-            &state.write_serializer,
-            true,
-            &state.file_issues,
-        )
-        .await
-        {
-            failures.push(format!("{}:\n{error:#}", source_path.display()));
+        } else {
+            match do_rescan_source(
+                &state.db,
+                source_path,
+                state.acoustid_api_key.as_deref(),
+                &state.write_serializer,
+                true,
+                &state.file_issues,
+            )
+            .await
+            {
+                Ok((recording_id, release_group_id)) => {
+                    assertions
+                        .entry(recording_id)
+                        .or_default()
+                        .insert(release_group_id);
+                }
+                Err(error) => {
+                    failures.push(format!("{}:\n{error:#}", source_path.display()));
+                }
+            }
         }
         state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
         emit_job_update(app, state, "rescan");
@@ -292,7 +310,7 @@ async fn rescan_path_list(
     }
 
     if failures.is_empty() {
-        Ok(())
+        Ok(assertions)
     } else {
         Err(format!(
             "Failed to rescan {} source(s):\n{}",
@@ -335,7 +353,8 @@ pub async fn rescan_sources_for_artist(
         return Err("No local sources found for this artist.".to_string());
     }
 
-    rescan_path_list(&app, &state, paths).await
+    rescan_path_list(&app, &state, paths).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -373,7 +392,54 @@ pub async fn rescan_sources_for_release_group(
         return Err("No local sources found for this album.".to_string());
     }
 
-    rescan_path_list(&app, &state, paths).await
+    let assertions = rescan_path_list(&app, &state, paths).await?;
+
+    // After all rescans, recordings on the target release group may have
+    // stale tracks left behind from prior imports that used different ID3
+    // metadata.  For each recording whose rescanned sources no longer
+    // assert the target release group, remove its track from that group.
+    // (The recordings themselves and their tracks on other, still-asserted
+    // release groups are preserved.)
+    let mut prune_again = false;
+    for (recording_id, asserted_groups) in &assertions {
+        if !asserted_groups.contains(&release_group_id) {
+            let mut conn = state
+                .db
+                .acquire(format!(
+                    "command.rescan_sources_for_release_group.cleanup recording_id={recording_id}"
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+            let deleted = sqlx::query(
+                "DELETE FROM track
+                 WHERE recording_id = ?
+                   AND id IN (
+                       SELECT t.id FROM track t
+                       JOIN medium m ON m.id = t.medium_id
+                       JOIN release rel ON rel.id = m.release_id
+                       WHERE t.recording_id = ?
+                         AND rel.release_group_id = ?
+                   )",
+            )
+            .bind(recording_id)
+            .bind(recording_id)
+            .bind(&release_group_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+            if deleted.rows_affected() > 0 {
+                prune_again = true;
+            }
+        }
+    }
+
+    if prune_again {
+        if let Err(e) = prune_library(&state.db).await {
+            tracing::warn!("Library pruning after stale-track cleanup failed: {e}");
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -403,7 +469,8 @@ pub async fn rescan_all_sources(
         return Err("No local sources found in the library.".to_string());
     }
 
-    rescan_path_list(&app, &state, paths).await
+    rescan_path_list(&app, &state, paths).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -742,6 +809,7 @@ pub async fn fix_orphan_source(
         &state.file_issues,
     )
     .await
+    .map(|_| ())
     .map_err(|e| {
         format!(
             "Failed to fix orphan source {}:\n{e:#}",

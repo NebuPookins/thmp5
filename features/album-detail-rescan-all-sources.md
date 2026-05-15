@@ -23,8 +23,18 @@ The way this use case should get handled is as follows:
 - If there is none of the ID3 tags claim that a recording is associated with a given release, then we remove the association between the recording and the release.
 - If a release has zero recordings after this process, we delete the release.
 
+---
+
 Note that this use case is distinct from the case where a release has recordings with no source. In this scenario, the recordings DO have sources. However, those sources do not assert the existence of the release that the recording is currently a part of.
+
+---
 
 Another edge case to be careful of:
 
 A recording can genuinely appear on multiple releases. For example a band "Cool Band" might have a track "Cool Track" that appears both on the release "Cool album" and also "Best of Cool Band". The file system may also contain sources for both of these appearances, for example one folder for all the tracks of "Cool album" and a different folder for all the tracks of "Best of Cool Band". Thus it is not correct to conclude that just because you've found a source asserting that "Cool Track" is associated with "Cool Album", that means it's safe to remove the association with "Best of Cool Band". You should only remove the association between a recording and a release if you have look at ALL sources associated with a recording, and none of those sources have asserted an association with the target release.
+
+---
+
+Another edge case to be careful of:
+
+It's possible for multiple sources to assert the existence of the same track. For example, maybe I have the same album twice, once in mp3 and once in ogg vorbis. Thus, there is not a one-to-one correspondence between tracks and sources. A track can have multiple sources (e.g. one mp3 file and one ogg vorbis file), and a source can have multiple tracks (e.g. the mp3 file is a source for a recording that appears on multiple different albums).

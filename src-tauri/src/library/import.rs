@@ -107,7 +107,7 @@ pub async fn rescan_source(
     serializer: &Semaphore,
     skip_prune: bool,
     file_issues: &FileIssueLog,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let path_str = path.to_string_lossy().to_string();
     let mut conn = db
         .acquire(format!("source_rescan.lookup path={path_str}"))
@@ -252,14 +252,6 @@ pub async fn rescan_source(
     let medium_id = get_or_create_medium(&mut tx, &release_id, disc).await?;
     let track_position = blocking.meta.track_number.unwrap_or(0) as i64;
 
-    let existing_track_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM track WHERE recording_id = ? ORDER BY id LIMIT 1",
-    )
-    .bind(&recording_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .context("Failed to load track row for source rescan")?;
-
     let title = blocking.meta.title.as_deref().unwrap_or("Unknown Title");
     let fingerprint_str = blocking.fp.as_ref().map(|f| f.fingerprint.as_str());
 
@@ -329,36 +321,87 @@ pub async fn rescan_source(
         }
     }
 
-    if let Some(track_id) = existing_track_id {
-        let old_medium_id =
-            sqlx::query_scalar::<_, String>("SELECT medium_id FROM track WHERE id = ?")
-                .bind(&track_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .context("Failed to read old medium_id for rescan logging")?;
+    // Find or create a track for this recording on the newly-asserted release
+    // group.  Prefer an existing track that is already on this release group
+    // rather than picking the first track by ID order — the latter can select
+    // a track that belongs to a different release group and move it, corrupting
+    // multi-release recordings whose multiple sources assert different albums.
+    let track_id: String = if let Some(id) = sqlx::query_scalar::<_, String>(
+        "SELECT t.id FROM track t
+         JOIN medium m ON m.id = t.medium_id
+         JOIN release rel ON rel.id = m.release_id
+         WHERE t.recording_id = ? AND rel.release_group_id = ?
+         LIMIT 1",
+    )
+    .bind(&recording_id)
+    .bind(&release_group_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("Failed to find existing track on target release group")?
+    {
+        id
+    } else {
+        let id = get_or_create_track(&mut tx, &medium_id, &recording_id, track_position).await?;
         tracing::info!(
-            track_id = %track_id,
-            old_medium_id = %old_medium_id.as_deref().unwrap_or("(none)"),
-            new_medium_id = %medium_id,
-            "Rescan: updating track medium"
+            recording_id = %recording_id,
+            track_id = %id,
+            release_group_id = %release_group_id,
+            "Rescan: created new track on target release group"
         );
-        sqlx::query(
-            "UPDATE track
-             SET medium_id = ?, position = ?, title = NULL, duration_ms = NULL
-             WHERE id = ?",
-        )
-        .bind(&medium_id)
+        id
+    };
+
+    tracing::info!(
+        track_id = %track_id,
+        medium_id = %medium_id,
+        position = track_position,
+        "Rescan: updating track position"
+    );
+    sqlx::query("UPDATE track SET position = ?, title = NULL, duration_ms = NULL WHERE id = ?")
         .bind(track_position)
         .bind(&track_id)
         .execute(&mut *tx)
         .await
-        .context("Failed to update track placement during source rescan")?;
-    } else {
-        tracing::info!(
-            recording_id = %recording_id,
-            "Rescan: no existing track found, creating"
-        );
-        get_or_create_track(&mut tx, &medium_id, &recording_id, track_position).await?;
+        .context("Failed to update track position during source rescan")?;
+
+    // If the recording has only one source, the track we just found/created
+    // is the only one that matters — any other track on a different release
+    // group must be stale (left behind by a prior import with different ID3
+    // metadata).  Multi-source recordings are intentionally skipped because
+    // other source files may legitimately assert other release groups.
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM source WHERE recording_id = ?")
+            .bind(&recording_id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("Failed to count sources for stale-track check")?;
+
+    if source_count == 1 {
+        let deleted = sqlx::query(
+            "DELETE FROM track
+             WHERE id != ?
+               AND recording_id = ?
+               AND id IN (
+                   SELECT t.id FROM track t
+                   JOIN medium m ON m.id = t.medium_id
+                   JOIN release rel ON rel.id = m.release_id
+                   WHERE t.recording_id = ?
+                     AND rel.release_group_id != ?
+               )",
+        )
+        .bind(&track_id)
+        .bind(&recording_id)
+        .bind(&recording_id)
+        .bind(&release_group_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to clean up stale tracks during source rescan")?;
+        if deleted.rows_affected() > 0 {
+            tracing::info!(
+                recording_id = %recording_id,
+                "Rescan: removed stale track(s) from other release groups"
+            );
+        }
     }
 
     sqlx::query(
@@ -433,7 +476,7 @@ pub async fn rescan_source(
         );
     }
 
-    Ok(())
+    Ok((recording_id, release_group_id))
 }
 
 /// Returns `Ok(true)` if imported, `Ok(false)` if skipped (already exists).
