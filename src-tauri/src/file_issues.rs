@@ -103,24 +103,36 @@ impl FileIssueLog {
         lofty_value: impl Into<String>,
         corrected_value: impl Into<String>,
     ) {
+        let file_path = file_path.into();
         let frame_id = frame_id.into();
         let field_name = field_name.into();
         let lofty_value = lofty_value.into();
         let corrected_value = corrected_value.into();
-        self.push(FileIssue {
-            file_path: file_path.into(),
-            kind: FileIssueKind::DuplicateFrame,
-            message: format!(
-                "ID3v2 {field_name} (frame {frame_id}) has conflicting values: \
-                 Lofty picked {lofty_value:?}, raw first-value is {corrected_value:?}"
-            ),
-            source_id: None,
-            recording_id: None,
-            frame_id: Some(frame_id),
-            field_name: Some(field_name),
-            lofty_value: Some(lofty_value),
-            corrected_value: Some(corrected_value),
-        });
+        if let Ok(mut issues) = self.issues.lock() {
+            // Dedup: don't add if we already have a DuplicateFrame issue for
+            // the same file and frame ID.
+            if issues.iter().any(|i| {
+                i.file_path == file_path
+                    && i.kind == FileIssueKind::DuplicateFrame
+                    && i.frame_id.as_deref() == Some(&frame_id)
+            }) {
+                return;
+            }
+            issues.push(FileIssue {
+                file_path,
+                kind: FileIssueKind::DuplicateFrame,
+                message: format!(
+                    "ID3v2 {field_name} (frame {frame_id}) has conflicting values: \
+                     Lofty picked {lofty_value:?}, raw first-value is {corrected_value:?}"
+                ),
+                source_id: None,
+                recording_id: None,
+                frame_id: Some(frame_id),
+                field_name: Some(field_name),
+                lofty_value: Some(lofty_value),
+                corrected_value: Some(corrected_value),
+            });
+        }
     }
 
     pub fn all(&self) -> Vec<FileIssue> {
