@@ -1580,6 +1580,18 @@ function App() {
     }
   }
 
+  async function handleRescanRecording(recordingId: string) {
+    try {
+      setError(null);
+      await invoke("rescan_sources_for_recording", { recordingId });
+    } catch (rescanError) {
+      await reportPoolTimeout("source rescan", rescanError);
+      setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
+    } finally {
+      await loadLibraryData(selectedArtistId, search);
+    }
+  }
+
   async function handleRescanReleaseGroup(releaseGroupId: string) {
     try {
       setError(null);
@@ -2338,6 +2350,7 @@ function App() {
                       setQueue((q) => [...q, item]);
                     }
                   }}
+                  onRescanRecording={(recordingId) => { void handleRescanRecording(recordingId); }}
                   onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
                   onRefreshLibrary={() => { void loadLibraryData(selectedArtistId, search); }}
                   onSplitRecording={(recordingId) => { setSplitRecordingId(recordingId); }}

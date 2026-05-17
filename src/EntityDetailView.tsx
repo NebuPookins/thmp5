@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./EntityDetailView.css";
 
 // ── Types matching Rust models ─────────────────────────────────────────────
@@ -224,12 +225,13 @@ type Props = {
   onClose: () => void;
   onSourceContextMenu?: (e: React.MouseEvent<HTMLDivElement>, filePath: string) => void;
   onEnqueueTrack?: (track: TrackDetail) => void;
+  onRescanRecording?: (recordingId: string) => void;
   onRescanReleaseGroup?: (releaseGroupId: string) => void;
   onRefreshLibrary?: () => void;
   onSplitRecording?: (recordingId: string) => void;
 };
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanRecording, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [artist, setArtist] = useState<ArtistDetail | null>(null);
@@ -266,6 +268,18 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
   }, [nav]);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      unlisten = await listen<{ recording_ids: string[] }>("recording-releases-updated", (event) => {
+        if (nav.type === "recording" && event.payload.recording_ids.includes(nav.id)) {
+          void load();
+        }
+      });
+    })();
+    return () => unlisten?.();
+  }, [nav, load]);
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -672,6 +686,16 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
             <h3 className="entity-detail-section-title">
               Sources ({recording.sources.length})
             </h3>
+            <div className="entity-detail-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                title="Re-read metadata from all source files for this recording"
+                onClick={() => onRescanRecording?.(recording.id)}
+              >
+                Rescan all sources
+              </button>
+            </div>
             {recording.sources.length === 0 ? (
               <p className="empty-browser-state">No sources.</p>
             ) : (

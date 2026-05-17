@@ -1242,6 +1242,69 @@ async fn prune_empty_library_entities(tx: &mut Transaction<'_, Sqlite>) -> Resul
     Ok(())
 }
 
+/// Detect and delete duplicate track entries.
+///
+/// A "duplicate track entry" is when the same recording has more than one
+/// track on the same release group at the same track position.  When such
+/// duplicates exist, all but one are kept (the one with the smallest ID).
+///
+/// Returns the number of rows deleted.
+pub async fn fix_duplicate_track_entries(db: &DbPool) -> Result<u64> {
+    let mut conn = db
+        .acquire("fix_duplicate_track_entries".to_string())
+        .await
+        .context("Failed to acquire DB connection for duplicate track cleanup")?;
+    conn.set_busy_timeout(std::time::Duration::from_secs(30))
+        .await
+        .context("Failed to set busy timeout for duplicate track cleanup")?;
+    let mut tx = conn
+        .begin()
+        .await
+        .context("Failed to start duplicate track cleanup transaction")?;
+    let deleted = fix_duplicate_track_entries_inner(&mut tx).await?;
+    tx.commit()
+        .await
+        .context("Failed to commit duplicate track cleanup transaction")?;
+    Ok(deleted)
+}
+
+async fn fix_duplicate_track_entries_inner(tx: &mut Transaction<'_, Sqlite>) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM track WHERE id IN (
+            SELECT t.id FROM track t
+            JOIN medium m ON m.id = t.medium_id
+            JOIN release rel ON rel.id = m.release_id
+            WHERE (t.recording_id, rel.release_group_id, t.position) IN (
+                SELECT t2.recording_id, rel2.release_group_id, t2.position
+                FROM track t2
+                JOIN medium m2 ON m2.id = t2.medium_id
+                JOIN release rel2 ON rel2.id = m2.release_id
+                GROUP BY t2.recording_id, rel2.release_group_id, t2.position
+                HAVING COUNT(*) > 1
+            )
+            AND t.id NOT IN (
+                SELECT MIN(t3.id)
+                FROM track t3
+                JOIN medium m3 ON m3.id = t3.medium_id
+                JOIN release rel3 ON rel3.id = m3.release_id
+                WHERE (t3.recording_id, rel3.release_group_id, t3.position) IN (
+                    SELECT t4.recording_id, rel4.release_group_id, t4.position
+                    FROM track t4
+                    JOIN medium m4 ON m4.id = t4.medium_id
+                    JOIN release rel4 ON rel4.id = m4.release_id
+                    GROUP BY t4.recording_id, rel4.release_group_id, t4.position
+                    HAVING COUNT(*) > 1
+                )
+                GROUP BY t3.recording_id, rel3.release_group_id, t3.position
+            )
+        )",
+    )
+    .execute(&mut **tx)
+    .await
+    .context("Failed to delete duplicate track entries")?;
+    Ok(result.rows_affected())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilities
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2552,6 +2615,170 @@ mod tests {
             "Lofty currently fails on dual-tag files so no DuplicateFrame issues are created. \
              If this assertion fails, Lofty has been fixed — wire up the raw scanner \
              to populate `duplicate_frames` in the TagLib fallback path, then update this test."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fix_duplicate_track_entries_removes_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+
+        // Import a recording on "History of beatmania IIDX" at track 15.
+        let presto_path = tmp.path().join("presto.mp3");
+        write_tagged_mp3(
+            &presto_path,
+            "Presto",
+            "Osamu Kubota",
+            "Osamu Kubota",
+            "History of beatmania IIDX",
+        );
+        store_prepared_import(
+            &pool,
+            prepared_import_for_path(
+                &presto_path,
+                tagged_meta(
+                    "Presto",
+                    "Osamu Kubota",
+                    "Osamu Kubota",
+                    "History of beatmania IIDX",
+                    15,
+                ),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let rec_id = recording_id_for_path(&pool, &presto_path).await;
+
+        // Add a duplicate track on the same release group & position.
+        let mut conn = pool.acquire("test.setup.hob_dup").await.unwrap();
+        let hob_medium_id: String = sqlx::query_scalar(
+            "SELECT m.id FROM medium m
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             WHERE rg.title = 'History of beatmania IIDX'
+             LIMIT 1",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO track (id, medium_id, recording_id, position)
+             VALUES (?, ?, ?, 15)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&hob_medium_id)
+        .bind(&rec_id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        // Add a legitimate third track on a different album at position 24.
+        let mut tx = conn.begin().await.unwrap();
+        let artist_id = get_or_create_artist(&mut tx, "Osamu Kubota").await.unwrap();
+        let iidx3_rg_id = get_or_create_release_group(
+            &mut tx,
+            "beatmania IIDX 3rd Style Original Soundtracks",
+            &artist_id,
+        )
+        .await
+        .unwrap();
+        let iidx3_release_id = get_or_create_release(
+            &mut tx,
+            &iidx3_rg_id,
+            "beatmania IIDX 3rd Style Original Soundtracks",
+            None,
+        )
+        .await
+        .unwrap();
+        let iidx3_medium_id = get_or_create_medium(&mut tx, &iidx3_release_id, 1)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO track (id, medium_id, recording_id, position)
+             VALUES (?, ?, ?, 24)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&iidx3_medium_id)
+        .bind(&rec_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        drop(conn);
+
+        // Verify: 3 track rows (2 on HOB IIDX + 1 on IIDX 3rd Style).
+        let mut verify = pool.acquire("test.verify_before").await.unwrap();
+        let track_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM track WHERE recording_id = ?")
+                .bind(&rec_id)
+                .fetch_one(&mut *verify)
+                .await
+                .unwrap();
+        assert_eq!(track_count, 3, "test setup should create 3 track rows");
+
+        let album_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT rg.id)
+             FROM track t
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             WHERE t.recording_id = ?",
+        )
+        .bind(&rec_id)
+        .fetch_one(&mut *verify)
+        .await
+        .unwrap();
+        assert_eq!(
+            album_count, 2,
+            "test setup should assert 2 distinct release groups"
+        );
+        drop(verify);
+
+        // Run the fix.
+        let deleted = fix_duplicate_track_entries(&pool).await.unwrap();
+        assert!(
+            deleted > 0,
+            "should have deleted at least one duplicate track"
+        );
+
+        // Verify: 2 tracks (1 per album), no duplicates.
+        let remaining_tracks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM track WHERE recording_id = ?")
+                .bind(&rec_id)
+                .fetch_one(&mut *pool.acquire("test.verify_after").await.unwrap())
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining_tracks, 2,
+            "should have exactly 2 tracks after dedup"
+        );
+        assert_eq!(
+            release_titles_for_recording(&pool, &rec_id).await,
+            vec![
+                "History of beatmania IIDX",
+                "beatmania IIDX 3rd Style Original Soundtracks"
+            ],
+            "recording should still appear on both albums"
+        );
+
+        // Verify the duplicate was not the only HOB IIDX track left.
+        let hob_track_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM track t
+             JOIN medium m ON m.id = t.medium_id
+             JOIN release rel ON rel.id = m.release_id
+             JOIN release_group rg ON rg.id = rel.release_group_id
+             WHERE t.recording_id = ? AND rg.title = 'History of beatmania IIDX'",
+        )
+        .bind(&rec_id)
+        .fetch_one(&mut *pool.acquire("test.verify_hob").await.unwrap())
+        .await
+        .unwrap();
+        assert_eq!(
+            hob_track_count, 1,
+            "should have exactly 1 track on History of beatmania IIDX"
         );
     }
 }

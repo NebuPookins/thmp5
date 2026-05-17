@@ -2,7 +2,8 @@ use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::db::DbPool;
 use crate::file_issues::FileIssue;
 use crate::library::import::{
-    import_paths as do_import, prune_library, rescan_source as do_rescan_source,
+    fix_duplicate_track_entries, import_paths as do_import, prune_library,
+    rescan_source as do_rescan_source,
 };
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistFixStats, ArtistRow, CompoundArtistCheck,
@@ -26,6 +27,11 @@ use tauri::Emitter;
 struct JobUpdate {
     remaining: i64,
     job_type: String,
+}
+
+#[derive(Clone, Serialize)]
+struct RecordingUpdatedEvent {
+    recording_ids: Vec<String>,
 }
 
 /// Emit a `job-update` event so the frontend can show the queue status.
@@ -309,6 +315,20 @@ async fn rescan_path_list(
         tracing::warn!("Library pruning after batch rescan failed: {e}");
     }
 
+    // Single duplicate-track cleanup pass after the batch.
+    if let Err(e) = fix_duplicate_track_entries(&state.db).await {
+        tracing::warn!("Duplicate track cleanup after batch rescan failed: {e}");
+    }
+
+    // Notify the frontend that affected recordings may have changed releases.
+    let recording_ids: Vec<String> = assertions.keys().cloned().collect();
+    if !recording_ids.is_empty() {
+        let _ = app.emit(
+            "recording-releases-updated",
+            RecordingUpdatedEvent { recording_ids },
+        );
+    }
+
     if failures.is_empty() {
         Ok(assertions)
     } else {
@@ -439,6 +459,42 @@ pub async fn rescan_sources_for_release_group(
         }
     }
 
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn rescan_sources_for_recording(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    recording_id: String,
+) -> Result<(), String> {
+    let paths: Vec<String> = {
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.rescan_sources_for_recording recording_id={recording_id}"
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query_scalar(
+            "SELECT DISTINCT s.file_path
+             FROM source s
+             WHERE s.recording_id = ?
+               AND s.source_type = 'local_file'
+               AND s.file_path IS NOT NULL
+             ORDER BY s.file_path",
+        )
+        .bind(&recording_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?
+    };
+
+    if paths.is_empty() {
+        return Err("No local sources found for this recording.".to_string());
+    }
+
+    rescan_path_list(&app, &state, paths).await?;
     Ok(())
 }
 

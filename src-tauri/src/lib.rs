@@ -149,6 +149,7 @@ pub fn run() {
             commands::rescan_source,
             commands::rescan_sources,
             commands::rescan_sources_for_artist,
+            commands::rescan_sources_for_recording,
             commands::rescan_sources_for_release_group,
             commands::rescan_all_sources,
             commands::set_music_root,
