@@ -672,6 +672,7 @@ fn read_metadata_with_lofty(path: &Path) -> Result<(TrackMetadata, Vec<Duplicate
         if meta_value.as_deref() != Some(raw_value) {
             let lofty_value = meta_value.clone().unwrap_or_default();
             tracing::info!(
+                path = %path.display(),
                 "ID3v2 tag has multiple {frame_id} ({field_name}) frames; using first: {raw_value:?} (was: {lofty_value:?})",
             );
             overrides.push(DuplicateFrameInfo {

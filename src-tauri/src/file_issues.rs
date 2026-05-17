@@ -10,7 +10,7 @@ pub enum FileIssueKind {
     DuplicateFrame,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FileIssue {
     pub file_path: String,
     pub kind: FileIssueKind,
@@ -144,5 +144,81 @@ impl FileIssueLog {
         if let Ok(mut issues) = self.issues.lock() {
             issues.push(issue);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_push_duplicate_frame_adds_issue() {
+        let log = FileIssueLog::new();
+        log.push_duplicate_frame("/path/a.mp3", "TIT2", "title", "Lofty Title", "First Title");
+        let issues = log.all();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].file_path, "/path/a.mp3");
+        assert_eq!(issues[0].kind, FileIssueKind::DuplicateFrame);
+        assert_eq!(issues[0].frame_id.as_deref(), Some("TIT2"));
+        assert_eq!(issues[0].lofty_value.as_deref(), Some("Lofty Title"));
+        assert_eq!(issues[0].corrected_value.as_deref(), Some("First Title"));
+    }
+
+    #[test]
+    fn test_push_duplicate_frame_dedup_same_file_same_frame() {
+        let log = FileIssueLog::new();
+        log.push_duplicate_frame("/path/a.mp3", "TIT2", "title", "Lofty Title", "First Title");
+        log.push_duplicate_frame("/path/a.mp3", "TIT2", "title", "Lofty Title", "First Title");
+        let issues = log.all();
+        // Pushing the same duplicate frame for the same file should not
+        // create a second entry. (Requires dedup support in push_duplicate_frame.)
+        assert_eq!(
+            issues.len(),
+            1,
+            "pushing the same duplicate frame twice should result in one entry"
+        );
+    }
+
+    #[test]
+    fn test_push_duplicate_frame_different_frames_same_file() {
+        let log = FileIssueLog::new();
+        log.push_duplicate_frame("/path/a.mp3", "TIT2", "title", "Lofty Title", "First Title");
+        log.push_duplicate_frame(
+            "/path/a.mp3",
+            "TPE1",
+            "artist",
+            "Lofty Artist",
+            "First Artist",
+        );
+        let issues = log.all();
+        assert_eq!(issues.len(), 2);
+    }
+
+    #[test]
+    fn test_retain_removes_issues_by_predicate() {
+        let log = FileIssueLog::new();
+        log.push_duplicate_frame("/path/a.mp3", "TIT2", "title", "A", "B");
+        log.push_duplicate_frame("/path/b.mp3", "TIT2", "title", "C", "D");
+        log.retain(|issue| issue.file_path != "/path/a.mp3");
+        let issues = log.all();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].file_path, "/path/b.mp3");
+    }
+
+    #[test]
+    fn test_retain_clears_all_duplicate_frame_issues_for_a_file() {
+        let log = FileIssueLog::new();
+        log.push_duplicate_frame("/path/a.mp3", "TIT2", "title", "A", "B");
+        log.push_duplicate_frame("/path/a.mp3", "TPE1", "artist", "C", "D");
+        log.push_duplicate_frame("/path/b.mp3", "TIT2", "title", "E", "F");
+
+        // Simulate clearing all DuplicateFrame issues for /path/a.mp3
+        log.retain(|issue| {
+            !(issue.kind == FileIssueKind::DuplicateFrame && issue.file_path == "/path/a.mp3")
+        });
+
+        let issues = log.all();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].file_path, "/path/b.mp3");
     }
 }

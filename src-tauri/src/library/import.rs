@@ -1273,6 +1273,7 @@ fn file_identity(path: &Path) -> Result<(i64, i64)> {
 mod tests {
     use super::*;
     use crate::db::init_pool;
+    use crate::file_issues::FileIssueKind;
     use tempfile::TempDir;
 
     fn tagged_meta(
@@ -2242,6 +2243,315 @@ mod tests {
         assert!(
             ga_release_groups.is_empty(),
             "Album Artist should not appear in guest appearances when they are the album artist; got {ga_release_groups:?}"
+        );
+    }
+
+    // ── Duplicate-frame integration tests ───────────────────────────────────
+    //
+    // Uses duplicate frame IDs within a single ID3v2 tag (e.g. two TIT2 frames).
+    // Lofty merges duplicates by taking the last value, while our raw scanner
+    // (`get_first_id3v2_frame_values`) reports the first. A DuplicateFrame
+    // issue is created when these values differ.
+
+    /// Short-hand: MP3 with duplicate frame IDs for each tag type.
+    fn duplicate_frame_mp3() -> Vec<u8> {
+        let frames = vec![
+            crate::library::scanner::id3_frame(b"TIT2", b"\x03Corrected Title"),
+            crate::library::scanner::id3_frame(b"TIT2", b"\x03Lofty Title"),
+            crate::library::scanner::id3_frame(b"TPE1", b"\x03Corrected Artist"),
+            crate::library::scanner::id3_frame(b"TPE1", b"\x03Lofty Artist"),
+            crate::library::scanner::id3_frame(b"TPE2", b"\x03Corrected Album Artist"),
+            crate::library::scanner::id3_frame(b"TPE2", b"\x03Lofty Album Artist"),
+            crate::library::scanner::id3_frame(b"TALB", b"\x03Corrected Album"),
+            crate::library::scanner::id3_frame(b"TALB", b"\x03Lofty Album"),
+        ];
+        crate::library::scanner::synth_mp3_with_id3(&frames)
+    }
+
+    /// Short-hand: clean MP3 with no duplicate frame IDs.
+    fn clean_mp3() -> Vec<u8> {
+        let frames = vec![
+            crate::library::scanner::id3_frame(b"TIT2", b"\x03Clean Title"),
+            crate::library::scanner::id3_frame(b"TPE1", b"\x03Clean Artist"),
+            crate::library::scanner::id3_frame(b"TPE2", b"\x03Clean Album Artist"),
+            crate::library::scanner::id3_frame(b"TALB", b"\x03Clean Album"),
+        ];
+        crate::library::scanner::synth_mp3_with_id3(&frames)
+    }
+
+    /// Import the given MP3 data as a source at `file_path`.
+    async fn import_mp3_as_source(
+        pool: &crate::db::DbPool,
+        file_path: &std::path::Path,
+        mp3_data: &[u8],
+    ) {
+        std::fs::write(file_path, mp3_data).unwrap();
+        store_prepared_import(
+            pool,
+            prepared_import_for_path(
+                file_path,
+                tagged_meta(
+                    "Lofty Title",
+                    "Lofty Artist",
+                    "Lofty Album Artist",
+                    "Lofty Album",
+                    1,
+                ),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rescan_detects_duplicate_frame_issue() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+        let file_issues = FileIssueLog::new();
+
+        let file_path = tmp.path().join("test_dup.mp3");
+        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3()).await;
+        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+
+        rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
+            .await
+            .unwrap();
+
+        let issues = file_issues.all();
+        let dup_issues_for_file: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.kind == FileIssueKind::DuplicateFrame
+                    && i.file_path == file_path.to_string_lossy()
+            })
+            .collect();
+
+        assert!(
+            !dup_issues_for_file.is_empty(),
+            "rescan of file with duplicate frames should create DuplicateFrame issues"
+        );
+
+        for expected_frame in &["TIT2", "TPE1", "TPE2", "TALB"] {
+            assert!(
+                dup_issues_for_file
+                    .iter()
+                    .any(|i| i.frame_id.as_deref() == Some(expected_frame)),
+                "expected a DuplicateFrame issue for frame {expected_frame}, got: {dup_issues_for_file:#?}"
+            );
+        }
+
+        for issue in &dup_issues_for_file {
+            match issue.frame_id.as_deref() {
+                Some("TIT2") => {
+                    assert_eq!(issue.corrected_value.as_deref(), Some("Corrected Title"));
+                    assert_eq!(issue.lofty_value.as_deref(), Some("Lofty Title"));
+                }
+                Some("TPE1") => {
+                    assert_eq!(issue.corrected_value.as_deref(), Some("Corrected Artist"));
+                    assert_eq!(issue.lofty_value.as_deref(), Some("Lofty Artist"));
+                }
+                Some("TPE2") => {
+                    assert_eq!(
+                        issue.corrected_value.as_deref(),
+                        Some("Corrected Album Artist")
+                    );
+                    assert_eq!(issue.lofty_value.as_deref(), Some("Lofty Album Artist"));
+                }
+                Some("TALB") => {
+                    assert_eq!(issue.corrected_value.as_deref(), Some("Corrected Album"));
+                    assert_eq!(issue.lofty_value.as_deref(), Some("Lofty Album"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rescan_duplicate_frame_not_duplicated_on_second_rescan() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+        let file_issues = FileIssueLog::new();
+
+        let file_path = tmp.path().join("test_dup.mp3");
+        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3()).await;
+        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+
+        rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
+            .await
+            .unwrap();
+        let count_after_first = file_issues
+            .all()
+            .iter()
+            .filter(|i| {
+                i.kind == FileIssueKind::DuplicateFrame
+                    && i.file_path == file_path.to_string_lossy()
+            })
+            .count();
+
+        rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
+            .await
+            .unwrap();
+        let count_after_second = file_issues
+            .all()
+            .iter()
+            .filter(|i| {
+                i.kind == FileIssueKind::DuplicateFrame
+                    && i.file_path == file_path.to_string_lossy()
+            })
+            .count();
+
+        assert_eq!(
+            count_after_second, count_after_first,
+            "rescanned the same file twice — DuplicateFrame count should not grow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rescan_clears_duplicate_frame_issue_when_file_is_fixed() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+        let file_issues = FileIssueLog::new();
+
+        let file_path = tmp.path().join("test_dup.mp3");
+        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3()).await;
+        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+
+        rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
+            .await
+            .unwrap();
+
+        assert!(
+            file_issues
+                .all()
+                .iter()
+                .any(|i| i.kind == FileIssueKind::DuplicateFrame
+                    && i.file_path == file_path.to_string_lossy()),
+            "first rescan should detect duplicate frames and create issues"
+        );
+
+        std::fs::write(&file_path, clean_mp3()).unwrap();
+
+        rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
+            .await
+            .unwrap();
+
+        let remaining: Vec<_> = file_issues
+            .all()
+            .into_iter()
+            .filter(|i| {
+                i.kind == FileIssueKind::DuplicateFrame
+                    && i.file_path == file_path.to_string_lossy()
+            })
+            .collect();
+
+        assert!(
+            remaining.is_empty(),
+            "after replacing with a clean file, DuplicateFrame issues should be removed, got: {remaining:#?}"
+        );
+    }
+
+    // ── Dual consecutive ID3v2 tag tests ────────────────────────────────────
+    //
+    // Some real-world MP3s have two consecutive ID3v2 tags with overlapping
+    // frames (second tag's values overwrite the first). Our raw scanner
+    // (`get_first_id3v2_frame_values`) detects these duplicates, but Lofty
+    // currently fails to parse such files. The `duplicate_frames` field is
+    // only populated in the Lofty code path, so dual-tag files currently
+    // bypass duplicate detection entirely. These tests document that
+    // limitation.
+
+    /// Build a synthetic MP3 with two consecutive ID3v2.4 tags, each
+    /// containing different frame values.
+    fn build_dual_tag_mp3(first_frames: &[Vec<u8>], second_frames: &[Vec<u8>]) -> Vec<u8> {
+        fn build_id3_tag(frames: &[Vec<u8>]) -> Vec<u8> {
+            let mut tag_data = Vec::new();
+            for f in frames {
+                tag_data.extend_from_slice(f);
+            }
+            let mut header = Vec::new();
+            header.extend_from_slice(b"ID3");
+            header.extend_from_slice(&[0x04, 0x00]); // version 2.4
+            header.push(0x00); // flags
+            header.extend_from_slice(&crate::library::scanner::synchsafe(tag_data.len() as u32));
+            header.extend_from_slice(&tag_data);
+            header
+        }
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&build_id3_tag(first_frames));
+        file.extend_from_slice(&build_id3_tag(second_frames));
+        // Minimal valid MPEG-1 Audio Layer 3 frame (silent)
+        file.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        file.resize(file.len() + 413, 0u8);
+        file
+    }
+
+    #[tokio::test]
+    async fn test_dual_tag_lofty_fails_to_parse() {
+        // Known limitation: Lofty rejects files with two consecutive ID3v2
+        // tags, so the duplicate detection code path (which runs after Lofty
+        // reads the file) is never reached. When this test starts passing, it
+        // means Lofty has been fixed or the fallback has been wired up to
+        // populate `duplicate_frames` from the raw scanner.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+        let file_issues = FileIssueLog::new();
+
+        let tag1_frames = vec![
+            crate::library::scanner::id3_frame(b"TIT2", b"\x03First Title"),
+            crate::library::scanner::id3_frame(b"TPE1", b"\x03First Artist"),
+        ];
+        let tag2_frames = vec![
+            crate::library::scanner::id3_frame(b"TIT2", b"\x03Second Title"),
+            crate::library::scanner::id3_frame(b"TPE1", b"\x03Second Artist"),
+        ];
+        let mp3_data = build_dual_tag_mp3(&tag1_frames, &tag2_frames);
+        let file_path = tmp.path().join("test_dual.mp3");
+        std::fs::write(&file_path, &mp3_data).unwrap();
+
+        store_prepared_import(
+            &pool,
+            prepared_import_for_path(
+                &file_path,
+                tagged_meta("Second Title", "Second Artist", "Album Artist", "Album", 1),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+
+        rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
+            .await
+            .unwrap();
+
+        let dup_count = file_issues
+            .all()
+            .iter()
+            .filter(|i| {
+                i.kind == FileIssueKind::DuplicateFrame
+                    && i.file_path == file_path.to_string_lossy()
+            })
+            .count();
+
+        // Currently zero because Lofty fails to parse dual-tag files and
+        // the TagLib fallback doesn't populate duplicate_frames.
+        // Remove this guard and assert > 0 once the limitation is fixed.
+        assert_eq!(
+            dup_count, 0,
+            "Lofty currently fails on dual-tag files so no DuplicateFrame issues are created. \
+             If this assertion fails, Lofty has been fixed — wire up the raw scanner \
+             to populate `duplicate_frames` in the TagLib fallback path, then update this test."
         );
     }
 }
