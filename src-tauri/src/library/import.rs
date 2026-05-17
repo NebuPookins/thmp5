@@ -1,6 +1,6 @@
 use super::scanner::{is_audio_file, read_metadata};
 use crate::db::DbPool;
-use crate::file_issues::FileIssueLog;
+use crate::file_issues::{FileIssueKind, FileIssueLog};
 use crate::fingerprint::{self, AcoustIdMatch};
 use crate::models::{DuplicateFrameInfo, ImportStats, TrackMetadata};
 use anyhow::{Context, Result};
@@ -465,7 +465,11 @@ pub async fn rescan_source(
         println!("[importer] rescan warning: {}: {}", path.display(), warning);
     }
 
-    // Push file issues for any duplicate-frame corrections
+    // Clear stale DuplicateFrame issues for this file, then push new ones.
+    file_issues.retain(|issue| {
+        !(issue.kind == FileIssueKind::DuplicateFrame
+            && issue.file_path == path.display().to_string())
+    });
     for df in &blocking.duplicate_frames {
         file_issues.push_duplicate_frame(
             path.display().to_string(),
@@ -2558,11 +2562,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_dual_tag_lofty_fails_to_parse() {
-        // Known limitation: Lofty rejects files with two consecutive ID3v2
-        // tags, so the duplicate detection code path (which runs after Lofty
-        // reads the file) is never reached. When this test starts passing, it
-        // means Lofty has been fixed or the fallback has been wired up to
-        // populate `duplicate_frames` from the raw scanner.
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
         let pool = init_pool(&db_path).await.unwrap();
@@ -2607,14 +2606,9 @@ mod tests {
             })
             .count();
 
-        // Currently zero because Lofty fails to parse dual-tag files and
-        // the TagLib fallback doesn't populate duplicate_frames.
-        // Remove this guard and assert > 0 once the limitation is fixed.
-        assert_eq!(
-            dup_count, 0,
-            "Lofty currently fails on dual-tag files so no DuplicateFrame issues are created. \
-             If this assertion fails, Lofty has been fixed — wire up the raw scanner \
-             to populate `duplicate_frames` in the TagLib fallback path, then update this test."
+        assert!(
+            dup_count > 0,
+            "TagLib fallback should detect duplicate frames from raw ID3v2 bytes, got {dup_count}"
         );
     }
 

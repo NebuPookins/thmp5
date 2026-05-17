@@ -164,6 +164,126 @@ fn get_first_id3v2_frame_values(path: &Path) -> HashMap<String, String> {
     result
 }
 
+/// Scan the raw ID3v2 bytes and, for each text frame ID that appears more
+/// than once, collect all distinct values.  The metadata fields are overridden
+/// with the first-occurrence value, and `DuplicateFrameInfo` entries are
+/// appended to `duplicate_frames` with the first value as `corrected_value`
+/// and the last value as `lofty_value`.
+///
+/// This is used by the TagLib fallback path where the parser returns one
+/// value (possibly the first) but the file has duplicates.
+fn detect_duplicates_from_raw_bytes(
+    path: &Path,
+    meta: &mut TrackMetadata,
+    duplicate_frames: &mut Vec<DuplicateFrameInfo>,
+) {
+    use std::io::Read;
+
+    let file_len = match std::fs::metadata(path).map(|m| m.len() as usize) {
+        Ok(len) => len,
+        Err(_) => return,
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    // per-frame-id: ordered list of distinct values
+    let mut frame_values: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+
+    loop {
+        let mut header = [0u8; 10];
+        if file.read_exact(&mut header).is_err() || &header[..3] != b"ID3" {
+            break;
+        }
+
+        let synchsafe_size = synchsafe_to_u32(&header[6..10]) as usize;
+        let big_endian_size =
+            u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
+        let (size, used_synchsafe) = if header[3] < 4 || synchsafe_size + 10 > file_len {
+            (big_endian_size, false)
+        } else {
+            (synchsafe_size, true)
+        };
+
+        let mut tag_data = vec![0u8; size];
+        if file.read_exact(&mut tag_data).is_err() {
+            break;
+        }
+
+        let mut pos = 0;
+        while pos + 10 <= tag_data.len() {
+            let frame_id_bytes = &tag_data[pos..pos + 4];
+            if frame_id_bytes.iter().all(|&b| b == 0) {
+                break;
+            }
+            let frame_id = match std::str::from_utf8(frame_id_bytes) {
+                Ok(id) if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => id,
+                _ => break,
+            };
+
+            let frame_size = if used_synchsafe {
+                synchsafe_to_u32(&tag_data[pos + 4..pos + 8]) as usize
+            } else {
+                u32::from_be_bytes([
+                    tag_data[pos + 4],
+                    tag_data[pos + 5],
+                    tag_data[pos + 6],
+                    tag_data[pos + 7],
+                ]) as usize
+            };
+
+            let data_start = pos + 10;
+            let data_end = data_start + frame_size;
+            if data_end > tag_data.len() {
+                break;
+            }
+
+            if is_text_frame(frame_id) && frame_size > 1 {
+                let encoding = tag_data[data_start];
+                let text = decode_id3v2_text(&tag_data[data_start + 1..data_end], encoding);
+                let values = frame_values.entry(frame_id.to_string()).or_default();
+                if !values.contains(&text) {
+                    values.push(text);
+                }
+            }
+
+            pos = data_end;
+        }
+
+        // Skip footer if present (flag bit 4)
+        if header[5] & 0x10 != 0 {
+            let mut footer = [0u8; 10];
+            let _ = file.read_exact(&mut footer);
+        }
+    }
+
+    // Process each duplicated frame (more than one distinct value).
+    for (frame_id, values) in &frame_values {
+        if values.len() < 2 {
+            continue;
+        }
+        let corrected = &values[0];
+        let lofty_val = &values[values.len() - 1];
+        let field_name = frame_id_to_field_name(frame_id);
+        duplicate_frames.push(DuplicateFrameInfo {
+            frame_id: frame_id.clone(),
+            field_name: field_name.to_string(),
+            lofty_value: lofty_val.clone(),
+            corrected_value: corrected.clone(),
+        });
+        // Override the metadata field with the first value.
+        match frame_id.as_str() {
+            "TALB" => meta.album = Some(corrected.clone()),
+            "TPE2" => meta.album_artist = Some(corrected.clone()),
+            "TPE1" => meta.artist = Some(corrected.clone()),
+            "TIT2" => meta.title = Some(corrected.clone()),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn frame_id_to_field_name(id: &str) -> &'static str {
     match id {
         "TIT2" | "TT2" => "title",
@@ -537,11 +657,20 @@ fn try_taglib_helper(path: &Path, primary_error: &str) -> Result<Option<Metadata
                 format!("Metadata fallback via TagLib helper after Lofty failure: {primary_error}")
             }
         });
+        // Detect duplicate ID3v2 text frames using the raw byte scanner.
+        // We scan raw bytes to find all distinct values for each frame ID
+        // that appears more than once, then use the first value as the
+        // correction. This works regardless of whether TagLib returned the
+        // first or last occurrence.
+        let mut meta = response.meta;
+        let mut duplicate_frames: Vec<DuplicateFrameInfo> = Vec::new();
+        detect_duplicates_from_raw_bytes(path, &mut meta, &mut duplicate_frames);
+
         return Ok(Some(MetadataReadResult {
-            meta: response.meta,
+            meta,
             warning,
             all_tags: response.all_tags,
-            duplicate_frames: Vec::new(),
+            duplicate_frames,
         }));
     }
 
