@@ -524,6 +524,7 @@ pub(crate) async fn prepare_import(
     }
 
     let existing_source_id = existing_source.as_ref().map(|(id, _, _)| id.as_str());
+    drop(conn);
 
     struct BlockingResult {
         hash: String,

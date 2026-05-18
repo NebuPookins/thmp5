@@ -66,7 +66,8 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool> {
         .filename(db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(30));
 
     // Reserve enough connections for import workers plus concurrent UI reads.
     let pool = SqlitePoolOptions::new()
