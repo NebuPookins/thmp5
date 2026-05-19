@@ -10,6 +10,7 @@ mod logging;
 mod models;
 pub mod query;
 mod sleep_inhibitor;
+pub mod storage;
 mod waveform;
 
 use audio::AudioEngineHandle;
@@ -24,6 +25,7 @@ use tokio::sync::{RwLock, Semaphore};
 
 pub struct AppState {
     pub db: DbPool,
+    pub catalog: storage::Catalog,
     /// AcoustID client API key, read from the `ACOUSTID_API_KEY` environment variable.
     /// AcoustID lookups are skipped when this is `None`.
     pub acoustid_api_key: Option<String>,
@@ -71,8 +73,11 @@ pub fn run() {
             let importer = ImportManager::new(file_issues.clone());
             let player = AudioEngineHandle::new(app.handle().clone(), file_issues.clone())
                 .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
+            let catalog =
+                storage::Catalog::Sql(storage::sql::SqlCatalog::new(pool.clone()));
             let state = AppState {
                 db: pool.clone(),
+                catalog,
                 acoustid_api_key: acoustid_api_key.clone(),
                 importer,
                 player,
