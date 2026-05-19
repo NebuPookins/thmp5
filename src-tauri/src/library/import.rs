@@ -1,4 +1,4 @@
-use super::scanner::{is_audio_file, read_metadata};
+use super::scanner::{build_raw_tags_json, is_audio_file, read_metadata};
 use crate::db::DbPool;
 use crate::file_issues::{FileIssueKind, FileIssueLog};
 use crate::fingerprint::{self, AcoustIdMatch};
@@ -39,6 +39,7 @@ pub(crate) struct PreparedImport {
     file_mtime_ms: i64,
     fp: Option<fingerprint::FingerprintResult>,
     acoustid_match: Option<AcoustIdMatch>,
+    raw_tags_json: String,
 }
 
 pub async fn import_paths(
@@ -134,6 +135,7 @@ pub async fn rescan_source(
         warnings: Vec<String>,
         fp: Option<fingerprint::FingerprintResult>,
         duplicate_frames: Vec<DuplicateFrameInfo>,
+        raw_tags_json: String,
     }
 
     let p = path.to_path_buf();
@@ -149,12 +151,18 @@ pub async fn rescan_source(
                 None
             }
         };
+        let raw_tags_json = build_raw_tags_json(
+            &p,
+            &metadata_read.meta,
+            &metadata_read.all_tags,
+        );
         Ok::<_, anyhow::Error>(BlockingResult {
             hash,
             meta: metadata_read.meta,
             warnings: metadata_read.warning.into_iter().collect(),
             fp,
             duplicate_frames: metadata_read.duplicate_frames,
+            raw_tags_json,
         })
     })
     .await;
@@ -417,6 +425,7 @@ pub async fn rescan_source(
              replay_gain_track_peak = ?,
              replay_gain_album_db = ?,
              replay_gain_album_peak = ?,
+             raw_tags_json = ?,
              last_verified = datetime('now')
          WHERE id = ?",
     )
@@ -431,6 +440,7 @@ pub async fn rescan_source(
     .bind(blocking.meta.replay_gain_track_peak)
     .bind(blocking.meta.replay_gain_album_db)
     .bind(blocking.meta.replay_gain_album_peak)
+    .bind(&blocking.raw_tags_json)
     .bind(&source_id)
     .execute(&mut *tx)
     .await
@@ -531,6 +541,7 @@ pub(crate) async fn prepare_import(
         meta: TrackMetadata,
         warnings: Vec<String>,
         fp: Option<fingerprint::FingerprintResult>,
+        raw_tags_json: String,
     }
 
     let p = path.to_path_buf();
@@ -546,11 +557,13 @@ pub(crate) async fn prepare_import(
                 None
             }
         };
+        let raw_tags_json = build_raw_tags_json(&p, &metadata_read.meta, &metadata_read.all_tags);
         Ok::<_, anyhow::Error>(BlockingResult {
             hash,
             meta: metadata_read.meta,
             warnings: metadata_read.warning.into_iter().collect(),
             fp,
+            raw_tags_json,
         })
     })
     .await;
@@ -561,7 +574,13 @@ pub(crate) async fn prepare_import(
         Err(e) => anyhow::bail!("Blocking import task panicked: {e}"),
     };
 
-    let (hash, meta, warnings, fp) = (blocking.hash, blocking.meta, blocking.warnings, blocking.fp);
+    let (hash, meta, warnings, fp, raw_tags_json) = (
+        blocking.hash,
+        blocking.meta,
+        blocking.warnings,
+        blocking.fp,
+        blocking.raw_tags_json,
+    );
 
     let acoustid_match: Option<AcoustIdMatch> = match (acoustid_key, fp.as_ref()) {
         (Some(key), Some(fp_result)) => match fingerprint::lookup_acoustid(key, fp_result).await {
@@ -585,6 +604,7 @@ pub(crate) async fn prepare_import(
         file_mtime_ms,
         fp,
         acoustid_match,
+        raw_tags_json,
     }))
 }
 
@@ -600,6 +620,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         file_mtime_ms,
         fp,
         acoustid_match,
+        raw_tags_json,
     } = prepared;
 
     let mut dup_conn = db
@@ -637,8 +658,9 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
                 id, recording_id, source_type, file_path, file_hash, format, duration_ms,
                 fingerprint, file_size, file_mtime_ms,
                 replay_gain_track_db, replay_gain_track_peak,
-                replay_gain_album_db, replay_gain_album_peak
-             ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                replay_gain_album_db, replay_gain_album_peak,
+                raw_tags_json
+             ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(file_path) DO UPDATE SET
                 recording_id = excluded.recording_id,
                 file_hash = excluded.file_hash,
@@ -650,7 +672,8 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
                 replay_gain_track_db = excluded.replay_gain_track_db,
                 replay_gain_track_peak = excluded.replay_gain_track_peak,
                 replay_gain_album_db = excluded.replay_gain_album_db,
-                replay_gain_album_peak = excluded.replay_gain_album_peak",
+                replay_gain_album_peak = excluded.replay_gain_album_peak,
+                raw_tags_json = excluded.raw_tags_json",
         )
         .bind(&source_id)
         .bind(&matched_recording_id)
@@ -665,6 +688,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
         .bind(meta.replay_gain_track_peak)
         .bind(meta.replay_gain_album_db)
         .bind(meta.replay_gain_album_peak)
+        .bind(&raw_tags_json)
         .execute(&mut *alt_conn)
         .await
         .context("Failed to insert alternate source")?;
@@ -831,8 +855,9 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
             id, recording_id, source_type, file_path, file_hash, format, duration_ms,
             fingerprint, file_size, file_mtime_ms, track_total,
             replay_gain_track_db, replay_gain_track_peak,
-            replay_gain_album_db, replay_gain_album_peak
-         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            replay_gain_album_db, replay_gain_album_peak,
+            raw_tags_json
+         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(file_path) DO UPDATE SET
             recording_id = excluded.recording_id,
             file_hash = excluded.file_hash,
@@ -845,7 +870,8 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
             replay_gain_track_db = excluded.replay_gain_track_db,
             replay_gain_track_peak = excluded.replay_gain_track_peak,
             replay_gain_album_db = excluded.replay_gain_album_db,
-            replay_gain_album_peak = excluded.replay_gain_album_peak",
+            replay_gain_album_peak = excluded.replay_gain_album_peak,
+            raw_tags_json = excluded.raw_tags_json",
     )
     .bind(&source_id)
     .bind(&recording_id)
@@ -861,6 +887,7 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
     .bind(meta.replay_gain_track_peak)
     .bind(meta.replay_gain_album_db)
     .bind(meta.replay_gain_album_peak)
+    .bind(&raw_tags_json)
     .execute(&mut *tx)
     .await
     .context("Failed to insert source")?;
@@ -1413,6 +1440,7 @@ mod tests {
                 score: 1.0,
                 recording_mbid: None,
             }),
+            raw_tags_json: "[]".into(),
         }
     }
 
@@ -1602,6 +1630,7 @@ mod tests {
             file_mtime_ms: 1000000,
             fp: None,
             acoustid_match: None,
+            raw_tags_json: "[]".into(),
         };
 
         let prepared2 = PreparedImport {
@@ -1615,6 +1644,7 @@ mod tests {
             file_mtime_ms: 2000000,
             fp: None,
             acoustid_match: None,
+            raw_tags_json: "[]".into(),
         };
 
         store_prepared_import(&pool, prepared1).await.unwrap();
@@ -1689,6 +1719,7 @@ mod tests {
                 score: 1.0,
                 recording_mbid: None,
             }),
+            raw_tags_json: "[]".into(),
         };
 
         let prepared2 = PreparedImport {
@@ -1706,6 +1737,7 @@ mod tests {
                 score: 1.0,
                 recording_mbid: None,
             }),
+            raw_tags_json: "[]".into(),
         };
 
         store_prepared_import(&pool, prepared1).await.unwrap();
@@ -2160,6 +2192,7 @@ mod tests {
             file_mtime_ms,
             fp: None,
             acoustid_match: None,
+            raw_tags_json: "[]".into(),
         };
 
         store_prepared_import(&pool, prepared).await.unwrap();
@@ -2273,6 +2306,7 @@ mod tests {
             file_mtime_ms,
             fp: None,
             acoustid_match: None,
+            raw_tags_json: "[]".into(),
         };
 
         store_prepared_import(&pool, prepared).await.unwrap();

@@ -1213,6 +1213,202 @@ pub fn list_all_tags(path: &Path) -> Result<Vec<crate::models::SourceTagInfo>> {
     }
 }
 
+/// Split raw ID3v2 frame payload at its first null separator.
+/// UTF-16 encodings (1 = with BOM, 2 = BE without BOM) use a two-byte null;
+/// Latin-1 (0) and UTF-8 (3) use a single-byte null.
+fn id3_null_split(data: &[u8], encoding: u8) -> (&[u8], &[u8]) {
+    if encoding == 1 || encoding == 2 {
+        let mut i = 0;
+        while i + 1 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 {
+                return (&data[..i], &data[i + 2..]);
+            }
+            i += 2;
+        }
+    } else if let Some(pos) = data.iter().position(|&b| b == 0) {
+        return (&data[..pos], &data[pos + 1..]);
+    }
+    (data, &[])
+}
+
+/// Scan all consecutive ID3v2 tag blocks in a file and return every text frame
+/// (T* and TXXX) in file order, including repeated occurrences of the same frame ID.
+/// Returns `None` if the file does not begin with an ID3v2 header.
+fn scan_all_id3_text_frames(path: &Path) -> Option<Vec<(String, String)>> {
+    use std::io::Read;
+
+    let file_len = std::fs::metadata(path).ok()?.len() as usize;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut frames: Vec<(String, String)> = Vec::new();
+    let mut found_id3 = false;
+
+    loop {
+        let mut header = [0u8; 10];
+        if file.read_exact(&mut header).is_err() || &header[..3] != b"ID3" {
+            break;
+        }
+        found_id3 = true;
+
+        let synchsafe_size = synchsafe_to_u32(&header[6..10]) as usize;
+        let big_endian_size =
+            u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
+        let (size, used_synchsafe) = if header[3] < 4 || synchsafe_size + 10 > file_len {
+            (big_endian_size, false)
+        } else {
+            (synchsafe_size, true)
+        };
+
+        let mut tag_data = vec![0u8; size];
+        if file.read_exact(&mut tag_data).is_err() {
+            break;
+        }
+
+        let mut pos = 0;
+        while pos + 10 <= tag_data.len() {
+            let frame_id_bytes = &tag_data[pos..pos + 4];
+            if frame_id_bytes.iter().all(|&b| b == 0) {
+                break;
+            }
+            let frame_id = match std::str::from_utf8(frame_id_bytes) {
+                Ok(id) if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => id,
+                _ => break,
+            };
+
+            let frame_size = if used_synchsafe {
+                synchsafe_to_u32(&tag_data[pos + 4..pos + 8]) as usize
+            } else {
+                u32::from_be_bytes([
+                    tag_data[pos + 4],
+                    tag_data[pos + 5],
+                    tag_data[pos + 6],
+                    tag_data[pos + 7],
+                ]) as usize
+            };
+
+            let data_start = pos + 10;
+            let data_end = data_start + frame_size;
+            if data_end > tag_data.len() {
+                break;
+            }
+
+            if is_text_frame(frame_id) && frame_size > 1 {
+                let encoding = tag_data[data_start];
+                let text = decode_id3v2_text(&tag_data[data_start + 1..data_end], encoding);
+                frames.push((frame_id.to_string(), text));
+            } else if frame_id == "TXXX" && frame_size > 2 {
+                let encoding = tag_data[data_start];
+                let payload = &tag_data[data_start + 1..data_end];
+                let (desc_bytes, value_bytes) = id3_null_split(payload, encoding);
+                let description = decode_id3v2_text(desc_bytes, encoding);
+                let value = decode_id3v2_text(value_bytes, encoding);
+                let key = if description.is_empty() {
+                    "TXXX".to_string()
+                } else {
+                    format!("TXXX:{description}")
+                };
+                frames.push((key, value));
+            }
+
+            pos = data_end;
+        }
+
+        if header[5] & 0x10 != 0 {
+            let mut footer = [0u8; 10];
+            let _ = file.read_exact(&mut footer);
+        }
+    }
+
+    if !found_id3 {
+        return None;
+    }
+    Some(frames)
+}
+
+/// Build a JSON string recording every raw tag frame from a file in file order.
+///
+/// Returns a JSON array of string pairs, e.g. `[["TIT2","My Song"],["TPE1","Artist"]]`.
+/// For ID3v2 files, scans raw bytes so every frame occurrence is emitted — a frame
+/// that appears N times produces N entries under the same key, in file order.
+/// For non-ID3 files (FLAC, Ogg, M4A, …), falls back to the parsed metadata fields
+/// and `extra_props` from the TagLib fallback path.
+pub fn build_raw_tags_json(
+    path: &Path,
+    meta: &TrackMetadata,
+    extra_props: &[TagProperty],
+) -> String {
+    // ID3v2 path: raw scan captures every occurrence without any cap on repetitions.
+    if let Some(frames) = scan_all_id3_text_frames(path) {
+        return serde_json::to_string(&frames).unwrap_or_else(|_| "[]".into());
+    }
+
+    // Non-ID3 fallback: build from the parsed metadata fields.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    if let Some(v) = &meta.title {
+        pairs.push(("TIT2".into(), v.clone()));
+    }
+    if let Some(v) = &meta.artist {
+        pairs.push(("TPE1".into(), v.clone()));
+    }
+    if let Some(v) = &meta.album_artist {
+        pairs.push(("TPE2".into(), v.clone()));
+    }
+    if let Some(v) = &meta.album {
+        pairs.push(("TALB".into(), v.clone()));
+    }
+    if let Some(v) = meta.year {
+        pairs.push(("TYER".into(), v.to_string()));
+    }
+    if let Some(num) = meta.track_number {
+        let val = match meta.track_total {
+            Some(tot) => format!("{num}/{tot}"),
+            None => num.to_string(),
+        };
+        pairs.push(("TRCK".into(), val));
+    }
+    if let Some(v) = meta.disc_number {
+        pairs.push(("TPOS".into(), v.to_string()));
+    }
+    if let Some(v) = &meta.genre {
+        pairs.push(("TCON".into(), v.clone()));
+    }
+    if let Some(v) = &meta.comment {
+        pairs.push(("COMM".into(), v.clone()));
+    }
+    if let Some(v) = &meta.artists {
+        pairs.push(("TXXX:ARTISTS".into(), v.clone()));
+    }
+    if let Some(v) = meta.bpm {
+        pairs.push(("TBPM".into(), v.to_string()));
+    }
+
+    // Extra props from the TagLib fallback path (TXXX frames etc.) — skip duplicates.
+    for prop in extra_props {
+        let covered = matches!(
+            prop.key.as_str(),
+            "TITLE"
+                | "ARTIST"
+                | "ALBUM"
+                | "GENRE"
+                | "COMMENT"
+                | "DATE"
+                | "YEAR"
+                | "TRACKNUMBER"
+                | "TRACKTOTAL"
+                | "DISCNUMBER"
+                | "ALBUMARTIST"
+                | "ALBUM ARTIST"
+                | "BPM"
+                | "ARTISTS"
+        );
+        if !covered {
+            pairs.push((prop.key.clone(), prop.value.clone()));
+        }
+    }
+
+    serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".into())
+}
+
 // ── Test helpers (shared with import tests) ─────────────────────────────────
 
 #[cfg(test)]
