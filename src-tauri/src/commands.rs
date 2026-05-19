@@ -54,9 +54,14 @@ pub async fn import_paths(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<ImportStats, String> {
-    let result = do_import(&state.db, paths, state.acoustid_api_key.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = do_import(
+        &state.db,
+        paths,
+        state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     *state.recordings_cache.write().await = None;
     Ok(result)
 }
@@ -126,6 +131,7 @@ pub async fn fix_merged_recordings(
     let result = crate::library::fix_merges::fix_merged_recordings(
         &state.db,
         state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
     )
     .await
     .map_err(|e| e.to_string())?;

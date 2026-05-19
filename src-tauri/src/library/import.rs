@@ -46,6 +46,7 @@ pub async fn import_paths(
     db: &DbPool,
     paths: Vec<String>,
     acoustid_key: Option<&str>,
+    serializer: &Semaphore,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats {
         scanned: 0,
@@ -62,7 +63,7 @@ pub async fn import_paths(
                 match entry {
                     Ok(e) if e.file_type().is_file() && is_audio_file(e.path()) => {
                         stats.scanned += 1;
-                        match import_file(db, e.path(), acoustid_key).await {
+                        match import_file(db, e.path(), acoustid_key, serializer).await {
                             Ok(true) => stats.imported += 1,
                             Ok(false) => stats.skipped += 1,
                             Err(e) => {
@@ -86,7 +87,7 @@ pub async fn import_paths(
             }
         } else if path.is_file() && is_audio_file(path) {
             stats.scanned += 1;
-            match import_file(db, path, acoustid_key).await {
+            match import_file(db, path, acoustid_key, serializer).await {
                 Ok(true) => stats.imported += 1,
                 Ok(false) => stats.skipped += 1,
                 Err(e) => {
@@ -498,12 +499,13 @@ pub(crate) async fn import_file(
     db: &DbPool,
     path: &Path,
     acoustid_key: Option<&str>,
+    serializer: &Semaphore,
 ) -> Result<bool> {
     let Some(prepared) = prepare_import(db, path, acoustid_key).await? else {
         return Ok(false);
     };
 
-    store_prepared_import(db, prepared).await
+    store_prepared_import(db, prepared, serializer).await
 }
 
 pub(crate) async fn prepare_import(
@@ -608,7 +610,11 @@ pub(crate) async fn prepare_import(
     }))
 }
 
-pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport) -> Result<bool> {
+pub(crate) async fn store_prepared_import(
+    db: &DbPool,
+    prepared: PreparedImport,
+    serializer: &Semaphore,
+) -> Result<bool> {
     let PreparedImport {
         path,
         path_str,
@@ -640,6 +646,11 @@ pub(crate) async fn store_prepared_import(db: &DbPool, prepared: PreparedImport)
     .await
     .context("DB error checking hash")?;
     drop(dup_conn);
+
+    let _permit = serializer
+        .acquire()
+        .await
+        .context("Failed to acquire write serializer for import")?;
 
     if let Some((_matched_source_id, matched_recording_id)) = existing_with_hash {
         // This file's content already exists at a different path (e.g. the file was moved or
@@ -1590,6 +1601,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
         let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
 
         let meta1 = TrackMetadata {
             title: Some("Song A".into()),
@@ -1647,8 +1659,12 @@ mod tests {
             raw_tags_json: "[]".into(),
         };
 
-        store_prepared_import(&pool, prepared1).await.unwrap();
-        store_prepared_import(&pool, prepared2).await.unwrap();
+        store_prepared_import(&pool, prepared1, &serializer)
+            .await
+            .unwrap();
+        store_prepared_import(&pool, prepared2, &serializer)
+            .await
+            .unwrap();
 
         // Both tracks should share exactly one release_group.
         let mut conn = pool.acquire("test_query".to_string()).await.unwrap();
@@ -1673,6 +1689,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
         let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
 
         // Two sources with the same AcoustID but different TPE1:
         //  - Source 1: TPE1 = "Various Artists" (generic album-artist value)
@@ -1740,8 +1757,12 @@ mod tests {
             raw_tags_json: "[]".into(),
         };
 
-        store_prepared_import(&pool, prepared1).await.unwrap();
-        store_prepared_import(&pool, prepared2).await.unwrap();
+        store_prepared_import(&pool, prepared1, &serializer)
+            .await
+            .unwrap();
+        store_prepared_import(&pool, prepared2, &serializer)
+            .await
+            .unwrap();
 
         // Both sources should share one recording (AcoustID match).
         let mut conn = pool.acquire("test".to_string()).await.unwrap();
@@ -1823,6 +1844,7 @@ mod tests {
                 ),
                 None,
             ),
+            &serializer,
         )
         .await
         .unwrap();
@@ -1940,6 +1962,7 @@ mod tests {
                 ),
                 Some("cool-track-shared-acoustid"),
             ),
+            &serializer,
         )
         .await
         .unwrap();
@@ -1950,6 +1973,7 @@ mod tests {
                 tagged_meta("Cool Track", "Cool Band", "Cool Band", "Cool Album", 1),
                 Some("cool-track-shared-acoustid"),
             ),
+            &serializer,
         )
         .await
         .unwrap();
@@ -2161,6 +2185,7 @@ mod tests {
         // Create test DB
         let db_path = tmp.path().join("test.db");
         let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
 
         let path_str = file_path.to_string_lossy().to_string();
         let (file_size, file_mtime_ms) = file_identity(&file_path).unwrap();
@@ -2195,7 +2220,9 @@ mod tests {
             raw_tags_json: "[]".into(),
         };
 
-        store_prepared_import(&pool, prepared).await.unwrap();
+        store_prepared_import(&pool, prepared, &serializer)
+            .await
+            .unwrap();
 
         // Verify only the primary artist exists after import
         let mut conn = pool.acquire("test.verify.initial").await.unwrap();
@@ -2277,6 +2304,7 @@ mod tests {
 
         let db_path = tmp.path().join("test.db");
         let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
         let path_str = file_path.to_string_lossy().to_string();
         let (file_size, file_mtime_ms) = file_identity(&file_path).unwrap();
         let hash = file_sha256(&file_path).unwrap();
@@ -2309,7 +2337,9 @@ mod tests {
             raw_tags_json: "[]".into(),
         };
 
-        store_prepared_import(&pool, prepared).await.unwrap();
+        store_prepared_import(&pool, prepared, &serializer)
+            .await
+            .unwrap();
 
         // Find the album artist's ID — they should have zero guest appearances
         // since they are the album artist for the only release group.
@@ -2386,6 +2416,7 @@ mod tests {
         pool: &crate::db::DbPool,
         file_path: &std::path::Path,
         mp3_data: &[u8],
+        serializer: &tokio::sync::Semaphore,
     ) {
         std::fs::write(file_path, mp3_data).unwrap();
         store_prepared_import(
@@ -2401,6 +2432,7 @@ mod tests {
                 ),
                 None,
             ),
+            serializer,
         )
         .await
         .unwrap();
@@ -2415,7 +2447,7 @@ mod tests {
         let file_issues = FileIssueLog::new();
 
         let file_path = tmp.path().join("test_dup.mp3");
-        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3()).await;
+        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3(), &serializer).await;
         let _rec_id = recording_id_for_path(&pool, &file_path).await;
 
         rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
@@ -2480,7 +2512,7 @@ mod tests {
         let file_issues = FileIssueLog::new();
 
         let file_path = tmp.path().join("test_dup.mp3");
-        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3()).await;
+        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3(), &serializer).await;
         let _rec_id = recording_id_for_path(&pool, &file_path).await;
 
         rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
@@ -2522,7 +2554,7 @@ mod tests {
         let file_issues = FileIssueLog::new();
 
         let file_path = tmp.path().join("test_dup.mp3");
-        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3()).await;
+        import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3(), &serializer).await;
         let _rec_id = recording_id_for_path(&pool, &file_path).await;
 
         rescan_source(&pool, &file_path, None, &serializer, true, &file_issues)
@@ -2622,6 +2654,7 @@ mod tests {
                 tagged_meta("Second Title", "Second Artist", "Album Artist", "Album", 1),
                 None,
             ),
+            &serializer,
         )
         .await
         .unwrap();
@@ -2652,6 +2685,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
         let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
 
         // Import a recording on "History of beatmania IIDX" at track 15.
         let presto_path = tmp.path().join("presto.mp3");
@@ -2675,6 +2709,7 @@ mod tests {
                 ),
                 None,
             ),
+            &serializer,
         )
         .await
         .unwrap();

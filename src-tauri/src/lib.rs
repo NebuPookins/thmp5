@@ -41,7 +41,7 @@ pub struct AppState {
     pub pending_jobs: AtomicI64,
     /// Serializes write operations (rescan, delete) so only one DB writer is active at a time,
     /// preventing SQLITE_BUSY / "database is locked" errors under concurrent access.
-    pub write_serializer: Semaphore,
+    pub write_serializer: Arc<Semaphore>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -70,7 +70,8 @@ pub fn run() {
                 tracing::info!("ACOUSTID_API_KEY not set — fingerprint lookups disabled");
             }
             let file_issues = FileIssueLog::new();
-            let importer = ImportManager::new(file_issues.clone());
+            let write_serializer = Arc::new(Semaphore::new(1));
+            let importer = ImportManager::new(file_issues.clone(), write_serializer.clone());
             let player = AudioEngineHandle::new(app.handle().clone(), file_issues.clone())
                 .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
             let catalog =
@@ -85,7 +86,7 @@ pub fn run() {
                 file_issues,
                 recordings_cache: RwLock::new(None),
                 pending_jobs: AtomicI64::new(0),
-                write_serializer: Semaphore::new(1),
+                write_serializer,
             };
 
             if let Ok(Some(root_path)) =

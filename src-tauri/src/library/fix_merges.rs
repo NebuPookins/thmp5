@@ -5,6 +5,7 @@ use crate::models::FixMergedRecordingsStats;
 use anyhow::Result;
 use sqlx::Row;
 use std::path::Path;
+use tokio::sync::Semaphore;
 
 /// For each recording that has more than one local-file source, compare the
 /// Chromaprint fingerprints of those sources.  Any source whose fingerprint
@@ -14,6 +15,7 @@ use std::path::Path;
 pub async fn fix_merged_recordings(
     db: &DbPool,
     acoustid_key: Option<&str>,
+    serializer: &Semaphore,
 ) -> Result<FixMergedRecordingsStats> {
     let mut stats = FixMergedRecordingsStats {
         recordings_checked: 0,
@@ -35,7 +37,9 @@ pub async fn fix_merged_recordings(
 
     for recording_id in &recording_ids {
         stats.recordings_checked += 1;
-        if let Err(e) = process_recording(db, recording_id, acoustid_key, &mut stats).await {
+        if let Err(e) =
+            process_recording(db, recording_id, acoustid_key, serializer, &mut stats).await
+        {
             stats
                 .errors
                 .push(format!("recording {recording_id}: {e:#}"));
@@ -49,6 +53,7 @@ async fn process_recording(
     db: &DbPool,
     recording_id: &str,
     acoustid_key: Option<&str>,
+    serializer: &Semaphore,
     stats: &mut FixMergedRecordingsStats,
 ) -> Result<()> {
     let mut conn = db
@@ -132,7 +137,7 @@ async fn process_recording(
             .await?;
         drop(conn);
 
-        match import_file(db, Path::new(&file_path), acoustid_key).await {
+        match import_file(db, Path::new(&file_path), acoustid_key, serializer).await {
             Ok(_) => {
                 stats.sources_reimported += 1;
                 tracing::info!(path = %file_path, "Re-imported split source");

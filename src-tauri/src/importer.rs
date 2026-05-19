@@ -6,6 +6,7 @@ use crate::models::ImportProgress;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
@@ -13,13 +14,15 @@ use walkdir::WalkDir;
 pub struct ImportManager {
     progress: Arc<Mutex<ImportProgress>>,
     file_issues: FileIssueLog,
+    write_serializer: Arc<Semaphore>,
 }
 
 impl ImportManager {
-    pub fn new(file_issues: FileIssueLog) -> Self {
+    pub fn new(file_issues: FileIssueLog, write_serializer: Arc<Semaphore>) -> Self {
         Self {
             progress: Arc::new(Mutex::new(ImportProgress::default())),
             file_issues,
+            write_serializer,
         }
     }
 
@@ -50,6 +53,7 @@ impl ImportManager {
 
         let progress = Arc::clone(&self.progress);
         let file_issues = self.file_issues.clone();
+        let write_serializer = Arc::clone(&self.write_serializer);
         tauri::async_runtime::spawn(async move {
             println!("[importer] scan started: {root_path}");
             let result = run_scan(
@@ -58,6 +62,7 @@ impl ImportManager {
                 acoustid_key.as_deref(),
                 &progress,
                 &file_issues,
+                &write_serializer,
             )
             .await;
             let mut state = progress.lock().expect("import progress mutex poisoned");
@@ -83,6 +88,7 @@ async fn run_scan(
     acoustid_key: Option<&str>,
     progress: &Arc<Mutex<ImportProgress>>,
     file_issues: &FileIssueLog,
+    write_serializer: &Semaphore,
 ) -> Result<()> {
     let concurrency = import_concurrency();
     println!("[importer] concurrency={concurrency}, root={root_path}");
@@ -112,7 +118,8 @@ async fn run_scan(
 
                 if tasks.len() >= concurrency {
                     if let Some(result) = tasks.join_next().await {
-                        handle_task_result(db, progress, file_issues, result).await;
+                        handle_task_result(db, progress, file_issues, write_serializer, result)
+                            .await;
                     }
                 }
 
@@ -146,7 +153,7 @@ async fn run_scan(
     }
 
     while let Some(result) = tasks.join_next().await {
-        handle_task_result(db, progress, file_issues, result).await;
+        handle_task_result(db, progress, file_issues, write_serializer, result).await;
     }
 
     let mut state = progress.lock().expect("import progress mutex poisoned");
@@ -158,6 +165,7 @@ async fn handle_task_result(
     db: &DbPool,
     progress: &Arc<Mutex<ImportProgress>>,
     file_issues: &FileIssueLog,
+    write_serializer: &Semaphore,
     result: std::result::Result<
         (
             std::path::PathBuf,
@@ -167,25 +175,27 @@ async fn handle_task_result(
     >,
 ) {
     match result {
-        Ok((path, Ok(Some(prepared)))) => match store_prepared_import(db, prepared).await {
-            Ok(true) => {
-                let mut state = progress.lock().expect("import progress mutex poisoned");
-                state.imported += 1;
+        Ok((path, Ok(Some(prepared)))) => {
+            match store_prepared_import(db, prepared, write_serializer).await {
+                Ok(true) => {
+                    let mut state = progress.lock().expect("import progress mutex poisoned");
+                    state.imported += 1;
+                }
+                Ok(false) => {
+                    let mut state = progress.lock().expect("import progress mutex poisoned");
+                    state.skipped += 1;
+                }
+                Err(error) => {
+                    let detail = format!("{:#}", error);
+                    let msg = format!("{}: {}", path.display(), detail);
+                    println!("[importer] import error: {msg}");
+                    file_issues.push_import_error(path.to_string_lossy(), detail);
+                    let mut state = progress.lock().expect("import progress mutex poisoned");
+                    state.errors += 1;
+                    state.error_messages.push(msg);
+                }
             }
-            Ok(false) => {
-                let mut state = progress.lock().expect("import progress mutex poisoned");
-                state.skipped += 1;
-            }
-            Err(error) => {
-                let detail = format!("{:#}", error);
-                let msg = format!("{}: {}", path.display(), detail);
-                println!("[importer] import error: {msg}");
-                file_issues.push_import_error(path.to_string_lossy(), detail);
-                let mut state = progress.lock().expect("import progress mutex poisoned");
-                state.errors += 1;
-                state.error_messages.push(msg);
-            }
-        },
+        }
         Ok((_, Ok(None))) => {
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.skipped += 1;
