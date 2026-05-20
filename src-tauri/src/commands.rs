@@ -21,7 +21,6 @@ use serde::Serialize;
 use sqlx::{Acquire, Row, Sqlite, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use tauri::Emitter;
 
 #[derive(Clone, Serialize)]
@@ -47,6 +46,19 @@ fn emit_job_update(app: &tauri::AppHandle, state: &AppState, job_type: &str) {
     );
 }
 
+/// Rebuild the in-memory catalog from the current database state.
+/// Called after any write that changes source or user data.
+async fn reload_catalog(state: &AppState) {
+    match crate::storage::memory::MemoryCatalog::load_from_db(&state.db).await {
+        Ok(mem) => {
+            *state.catalog.write().await = crate::storage::Catalog::Memory(Box::new(mem));
+        }
+        Err(e) => {
+            tracing::error!("Failed to reload memory catalog: {e:#}");
+        }
+    }
+}
+
 // ── Import ────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -62,7 +74,7 @@ pub async fn import_paths(
     )
     .await
     .map_err(|e| e.to_string())?;
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     Ok(result)
 }
 
@@ -73,6 +85,8 @@ pub async fn get_app_bootstrap(state: tauri::State<'_, AppState>) -> Result<AppB
         .map_err(|e| e.to_string())?;
     let library_summary = state
         .catalog
+        .read()
+        .await
         .get_library_summary()
         .await
         .map_err(|e| e.to_string())?;
@@ -135,7 +149,7 @@ pub async fn fix_merged_recordings(
     )
     .await
     .map_err(|e| e.to_string())?;
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     Ok(result)
 }
 
@@ -189,7 +203,7 @@ pub async fn rescan_source(
     state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
     emit_job_update(&app, &state, "rescan");
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     result
 }
 
@@ -258,7 +272,7 @@ async fn rescan_path_list(
         emit_job_update(app, state, "rescan");
     }
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(state).await;
 
     // Single prune pass after the batch, regardless of individual failures.
     if let Err(e) = prune_library(&state.db).await {
@@ -598,7 +612,7 @@ pub async fn record_play_history(
     .await
     .map_err(|e| e.to_string())?;
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     Ok(())
 }
 
@@ -705,7 +719,7 @@ pub async fn set_recording_rating(
     })
     .collect();
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     Ok(RecordingRatingUpdateResult {
         release_groups,
         artists,
@@ -828,7 +842,7 @@ pub async fn fix_orphan_source(
         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     emit_job_update(&app, &state, "rescan");
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     Ok(())
 }
 
@@ -1015,7 +1029,7 @@ pub async fn resolve_duplicate_frame(
             && issue.frame_id.as_deref() == Some(&frame_id))
     });
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     Ok(())
 }
 
@@ -1250,6 +1264,8 @@ pub async fn get_library_summary(
 ) -> Result<LibrarySummary, String> {
     state
         .catalog
+        .read()
+        .await
         .get_library_summary()
         .await
         .map_err(|e| e.to_string())
@@ -1263,32 +1279,22 @@ pub async fn list_recordings(
 ) -> Result<Vec<RecordingRow>, String> {
     let limit = limit.unwrap_or(200) as usize;
     let offset = offset.unwrap_or(0) as usize;
-
-    // Fast path: serve from in-memory cache.
-    {
-        let guard = state.recordings_cache.read().await;
-        if let Some(all) = guard.as_ref() {
-            return Ok(all.iter().skip(offset).take(limit).cloned().collect());
-        }
-    }
-
-    // Cache miss: fetch all recordings once and populate the cache.
-    let all = Arc::new(
-        state
-            .catalog
-            .list_recordings()
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-    let result = all.iter().skip(offset).take(limit).cloned().collect();
-    *state.recordings_cache.write().await = Some(Arc::clone(&all));
-    Ok(result)
+    let all = state
+        .catalog
+        .read()
+        .await
+        .list_recordings()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(all.into_iter().skip(offset).take(limit).collect())
 }
 
 #[tauri::command]
 pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<ArtistRow>, String> {
     state
         .catalog
+        .read()
+        .await
         .list_artists()
         .await
         .map_err(|e| e.to_string())
@@ -1303,6 +1309,8 @@ pub async fn list_release_groups(
     let search = search.as_deref().map(str::trim).filter(|v| !v.is_empty());
     state
         .catalog
+        .read()
+        .await
         .list_release_groups(artist_id.as_deref(), search)
         .await
         .map_err(|e| e.to_string())
@@ -1397,6 +1405,8 @@ pub async fn get_cover_art(
 pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     state
         .catalog
+        .read()
+        .await
         .list_all_tags()
         .await
         .map_err(|e| e.to_string())
@@ -1411,6 +1421,8 @@ pub async fn evaluate_smart_playlist(
 ) -> Result<SmartPlaylistResult, String> {
     state
         .catalog
+        .read()
+        .await
         .evaluate_smart_playlist(&query)
         .await
         .map_err(|e| e.to_string())
@@ -1518,7 +1530,7 @@ pub async fn delete_recording(
     state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
     emit_job_update(&app, &state, "delete");
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     result
 }
 
@@ -1741,17 +1753,14 @@ pub async fn merge_recordings(
 
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    // Invalidate cache and return fresh list
-    *state.recordings_cache.write().await = None;
-    let all = std::sync::Arc::new(
-        state
-            .catalog
-            .list_recordings()
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-    let result = (*all).clone();
-    *state.recordings_cache.write().await = Some(all);
+    reload_catalog(&state).await;
+    let result = state
+        .catalog
+        .read()
+        .await
+        .list_recordings()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(result)
 }
 
@@ -2038,6 +2047,8 @@ pub async fn get_artist_detail(
 ) -> Result<ArtistDetail, String> {
     state
         .catalog
+        .read()
+        .await
         .get_artist_detail(&id)
         .await
         .map_err(|e| e.to_string())?
@@ -2051,6 +2062,8 @@ pub async fn get_release_group_detail(
 ) -> Result<ReleaseGroupDetail, String> {
     state
         .catalog
+        .read()
+        .await
         .get_release_group_detail(&id)
         .await
         .map_err(|e| e.to_string())?
@@ -2064,6 +2077,8 @@ pub async fn get_recording_detail(
 ) -> Result<RecordingDetail, String> {
     state
         .catalog
+        .read()
+        .await
         .get_recording_detail(&id)
         .await
         .map_err(|e| e.to_string())?
@@ -2101,7 +2116,7 @@ pub async fn apply_artist_fix(
 
     drop(_permit);
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
 
     result
 }
@@ -2257,7 +2272,7 @@ pub async fn split_recording(
     let result = split_recording_inner(&state.db, &recording_id, &source_ids_to_move).await;
     drop(_permit);
 
-    *state.recordings_cache.write().await = None;
+    reload_catalog(&state).await;
     result
 }
 

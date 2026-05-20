@@ -17,7 +17,6 @@ use audio::AudioEngineHandle;
 use db::DbPool;
 use file_issues::FileIssueLog;
 use importer::ImportManager;
-use models::RecordingRow;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tauri::Manager;
@@ -25,7 +24,8 @@ use tokio::sync::{RwLock, Semaphore};
 
 pub struct AppState {
     pub db: DbPool,
-    pub catalog: storage::Catalog,
+    /// In-memory catalog rebuilt from `source.raw_tags_json` on startup and after every write.
+    pub catalog: Arc<RwLock<storage::Catalog>>,
     /// AcoustID client API key, read from the `ACOUSTID_API_KEY` environment variable.
     /// AcoustID lookups are skipped when this is `None`.
     pub acoustid_api_key: Option<String>,
@@ -33,9 +33,6 @@ pub struct AppState {
     pub player: AudioEngineHandle,
     pub log_file_path: String,
     pub file_issues: FileIssueLog,
-    /// In-memory cache of all recordings, sorted by (lower(artist.sort_name), lower(title)).
-    /// Populated on first `list_recordings` call; invalidated by any write that changes recording data.
-    pub recordings_cache: RwLock<Option<Arc<Vec<RecordingRow>>>>,
     /// Total number of background jobs (rescans + deletes) queued or in-progress.
     /// Used for UI progress display and to decide when to invalidate cache.
     pub pending_jobs: AtomicI64,
@@ -71,11 +68,17 @@ pub fn run() {
             }
             let file_issues = FileIssueLog::new();
             let write_serializer = Arc::new(Semaphore::new(1));
-            let importer = ImportManager::new(file_issues.clone(), write_serializer.clone());
             let player = AudioEngineHandle::new(app.handle().clone(), file_issues.clone())
                 .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
-            let catalog =
-                storage::Catalog::Sql(storage::sql::SqlCatalog::new(pool.clone()));
+            let mem_catalog =
+                tauri::async_runtime::block_on(storage::memory::MemoryCatalog::load_from_db(&pool))
+                    .map_err(|e| format!("Failed to build in-memory catalog: {e}"))?;
+            let catalog = Arc::new(RwLock::new(storage::Catalog::Memory(Box::new(mem_catalog))));
+            let importer = ImportManager::new(
+                file_issues.clone(),
+                write_serializer.clone(),
+                Arc::clone(&catalog),
+            );
             let state = AppState {
                 db: pool.clone(),
                 catalog,
@@ -84,7 +87,6 @@ pub fn run() {
                 player,
                 log_file_path: log_path.display().to_string(),
                 file_issues,
-                recordings_cache: RwLock::new(None),
                 pending_jobs: AtomicI64::new(0),
                 write_serializer,
             };

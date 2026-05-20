@@ -15,14 +15,20 @@ pub struct ImportManager {
     progress: Arc<Mutex<ImportProgress>>,
     file_issues: FileIssueLog,
     write_serializer: Arc<Semaphore>,
+    catalog: Arc<tokio::sync::RwLock<crate::storage::Catalog>>,
 }
 
 impl ImportManager {
-    pub fn new(file_issues: FileIssueLog, write_serializer: Arc<Semaphore>) -> Self {
+    pub fn new(
+        file_issues: FileIssueLog,
+        write_serializer: Arc<Semaphore>,
+        catalog: Arc<tokio::sync::RwLock<crate::storage::Catalog>>,
+    ) -> Self {
         Self {
             progress: Arc::new(Mutex::new(ImportProgress::default())),
             file_issues,
             write_serializer,
+            catalog,
         }
     }
 
@@ -54,6 +60,7 @@ impl ImportManager {
         let progress = Arc::clone(&self.progress);
         let file_issues = self.file_issues.clone();
         let write_serializer = Arc::clone(&self.write_serializer);
+        let catalog = Arc::clone(&self.catalog);
         tauri::async_runtime::spawn(async move {
             println!("[importer] scan started: {root_path}");
             let result = run_scan(
@@ -65,18 +72,29 @@ impl ImportManager {
                 &write_serializer,
             )
             .await;
-            let mut state = progress.lock().expect("import progress mutex poisoned");
-            state.is_running = false;
-            state.finished_at = Some(now_iso());
-            if let Err(error) = result {
-                eprintln!("[importer] scan error: {error:#}");
-                state.errors += 1;
-                state.error_messages.push(error.to_string());
-            } else {
-                println!(
-                    "[importer] scan finished: scanned={} imported={} skipped={} errors={}",
-                    state.scanned, state.imported, state.skipped, state.errors
-                );
+            {
+                let mut state = progress.lock().expect("import progress mutex poisoned");
+                state.is_running = false;
+                state.finished_at = Some(now_iso());
+                if let Err(error) = &result {
+                    eprintln!("[importer] scan error: {error:#}");
+                    state.errors += 1;
+                    state.error_messages.push(error.to_string());
+                } else {
+                    println!(
+                        "[importer] scan finished: scanned={} imported={} skipped={} errors={}",
+                        state.scanned, state.imported, state.skipped, state.errors
+                    );
+                }
+            }
+            match crate::storage::memory::MemoryCatalog::load_from_db(&db).await {
+                Ok(mem) => {
+                    *catalog.write().await = crate::storage::Catalog::Memory(Box::new(mem));
+                    println!("[importer] catalog reloaded after scan");
+                }
+                Err(e) => {
+                    eprintln!("[importer] catalog reload failed: {e:#}");
+                }
             }
         });
     }
