@@ -15,6 +15,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Disable with --no-default-features if you cannot build libopus or do not need Opus support.
 default = ["opus"]
 opus = ["dep:opus"]
+# Enables transparent fallback to JACK when the default ALSA audio device becomes unavailable
+# (e.g. after PulseAudio restarts or the audio server is reset).  Requires libjack-dev at
+# build time; at runtime JACK is only activated when ALSA fails.
+jack = ["cpal/jack"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

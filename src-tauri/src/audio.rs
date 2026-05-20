@@ -92,6 +92,9 @@ struct AudioCallbackCtx {
     /// The track buffer – engine thread writes via `lock()`, callback
     /// reads via `try_lock()`, falling back to silence on contention.
     current_track: Mutex<Option<Arc<Mutex<TrackBuffer>>>>,
+    /// Set to true by the cpal stream error callback to signal the engine
+    /// thread that the output device died and needs to be rebuilt.
+    stream_rebuild_needed: AtomicBool,
     /// Metadata snapshot used by the callback to build track-ended events.
     current_recording_id: Mutex<Option<String>>,
     current_source_id: Mutex<Option<String>>,
@@ -119,6 +122,7 @@ impl AudioCallbackCtx {
             output_sample_rate: AtomicU32::new(output_sample_rate),
             output_channels: AtomicU16::new(output_channels),
             track_duration_ms: AtomicU64::new(0),
+            stream_rebuild_needed: AtomicBool::new(false),
             current_track: Mutex::new(None),
             current_recording_id: Mutex::new(None),
             current_source_id: Mutex::new(None),
@@ -184,7 +188,6 @@ impl AudioEngineHandle {
         thread::Builder::new()
             .name("audio-engine".to_string())
             .spawn(move || {
-                let host = cpal::default_host();
                 let mut stream: Option<cpal::Stream> = None;
                 let events = Some(events);
                 tracing::info!("Audio engine thread started");
@@ -194,7 +197,6 @@ impl AudioEngineHandle {
                         Ok(command) => {
                             if matches!(command, AudioCommand::Play(_) | AudioCommand::Resume) {
                                 if let Err(error) = ensure_output_stream(
-                                    &host,
                                     &mut stream,
                                     &command_shared,
                                     &command_ctx,
@@ -222,6 +224,33 @@ impl AudioEngineHandle {
                     // Drain event channels from the cpal callback.
                     if let Some(ref ev) = events {
                         drain_events(&command_shared, &command_ctx, ev, &app);
+                    }
+
+                    // If the output stream error callback fired (e.g. ALSA/PulseAudio
+                    // restarted, device hotplug, system resume), rebuild the stream
+                    // automatically so playback resumes without requiring a manual
+                    // pause/resume cycle from the user.
+                    if command_ctx
+                        .stream_rebuild_needed
+                        .swap(false, Ordering::Acquire)
+                    {
+                        tracing::warn!("Output stream error detected, attempting to rebuild");
+                        if let Err(error) = ensure_output_stream(
+                            &mut stream,
+                            &command_shared,
+                            &command_ctx,
+                            &app,
+                        ) {
+                            tracing::error!(%error, "Failed to rebuild output stream, stopping playback");
+                            set_engine_error(
+                                &command_shared,
+                                &app,
+                                format!("Stream rebuild failed: {error}"),
+                            );
+                            if let Ok(mut state) = command_shared.lock() {
+                                state.clear_track(&command_ctx);
+                            }
+                        }
                     }
                 }
             })
@@ -745,7 +774,6 @@ fn should_inhibit_for_status(status: &PlaybackStatus) -> bool {
 }
 
 fn ensure_output_stream(
-    host: &cpal::Host,
     stream: &mut Option<cpal::Stream>,
     shared: &Arc<Mutex<SharedState>>,
     ctx: &Arc<AudioCallbackCtx>,
@@ -757,7 +785,43 @@ fn ensure_output_stream(
     // old stream is fire-and-forget, so caching a single stream for the app lifetime
     // silently fails after the audio sink is invalidated overnight.
     *stream = None;
+    // Clear any stale rebuild-request flag from an earlier error callback so it
+    // doesn't trigger a redundant rebuild on the next engine loop iteration.
+    ctx.stream_rebuild_needed.store(false, Ordering::Relaxed);
 
+    // Try the default host (ALSA on Linux) first.
+    let default_host = cpal::default_host();
+    match try_build_stream(&default_host, ctx, app.clone()) {
+        Ok(output_stream) => {
+            *stream = Some(output_stream);
+            clear_engine_error(shared);
+            return Ok(());
+        }
+        Err(e) => tracing::warn!(%e, "Default output device unusable"),
+    }
+
+    // If the default host fails, try alternative audio backends (JACK, PulseAudio).
+    // Each host is queried via its own device enumeration so a broken ALSA/PulseAudio
+    // configuration does not prevent e.g. a JACK-only stream from working.
+    for host_id in cpal::available_hosts() {
+        if let Ok(host) = cpal::host_from_id(host_id) {
+            if let Ok(output_stream) = try_build_stream(&host, ctx, app.clone()) {
+                *stream = Some(output_stream);
+                clear_engine_error(shared);
+                return Ok(());
+            }
+        }
+    }
+
+    Err(anyhow!("No usable output audio device is available"))
+}
+
+/// Try to select an output device and build a stream on a single cpal host.
+fn try_build_stream(
+    host: &cpal::Host,
+    ctx: &Arc<AudioCallbackCtx>,
+    app: AppHandle,
+) -> Result<cpal::Stream> {
     let (device, supported_config) = select_output_device(host)?;
     let stream_config = supported_config.config();
     let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
@@ -774,14 +838,11 @@ fn ensure_output_stream(
     ctx.output_channels
         .store(stream_config.channels, Ordering::Relaxed);
 
-    let output_stream =
-        build_output_stream(&device, &supported_config, Arc::clone(ctx), app.clone())?;
+    let output_stream = build_output_stream(&device, &supported_config, Arc::clone(ctx), app)?;
     output_stream
         .play()
         .context("Failed to start output stream")?;
-    *stream = Some(output_stream);
-    clear_engine_error(shared);
-    Ok(())
+    Ok(output_stream)
 }
 
 fn select_output_device(host: &cpal::Host) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
@@ -822,36 +883,48 @@ fn build_output_stream(
     match supported_config.sample_format() {
         cpal::SampleFormat::F32 => {
             let ctx_ref = Arc::clone(&ctx);
+            let err_ctx = Arc::clone(&ctx);
             let app_for_err = app.clone();
             device
                 .build_output_stream(
                     &config,
                     move |data: &mut [f32], _| write_output_data_f32(data, &ctx_ref),
-                    move |error| emit_error(&app_for_err, format!("Audio stream error: {error}")),
+                    move |error| {
+                        err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
+                        emit_error(&app_for_err, format!("Audio stream error: {error}"));
+                    },
                     None,
                 )
                 .context("Failed to build f32 output stream")
         }
         cpal::SampleFormat::I16 => {
             let ctx_ref = Arc::clone(&ctx);
+            let err_ctx = Arc::clone(&ctx);
             let app_for_err = app.clone();
             device
                 .build_output_stream(
                     &config,
                     move |data: &mut [i16], _| write_output_data_i16(data, &ctx_ref),
-                    move |error| emit_error(&app_for_err, format!("Audio stream error: {error}")),
+                    move |error| {
+                        err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
+                        emit_error(&app_for_err, format!("Audio stream error: {error}"));
+                    },
                     None,
                 )
                 .context("Failed to build i16 output stream")
         }
         cpal::SampleFormat::U16 => {
             let ctx_ref = Arc::clone(&ctx);
-            let app_for_err = app;
+            let err_ctx = Arc::clone(&ctx);
+            let app_for_err = app.clone();
             device
                 .build_output_stream(
                     &config,
                     move |data: &mut [u16], _| write_output_data_u16(data, &ctx_ref),
-                    move |error| emit_error(&app_for_err, format!("Audio stream error: {error}")),
+                    move |error| {
+                        err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
+                        emit_error(&app_for_err, format!("Audio stream error: {error}"));
+                    },
                     None,
                 )
                 .context("Failed to build u16 output stream")
