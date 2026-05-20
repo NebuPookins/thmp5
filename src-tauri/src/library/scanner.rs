@@ -1249,16 +1249,19 @@ fn scan_all_id3_text_frames(path: &Path) -> Option<Vec<(String, String)>> {
         }
         found_id3 = true;
 
+        let version = header[3];
         let synchsafe_size = synchsafe_to_u32(&header[6..10]) as usize;
-        let big_endian_size =
-            u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
-        let (size, used_synchsafe) = if header[3] < 4 || synchsafe_size + 10 > file_len {
-            (big_endian_size, false)
+        // The tag header size is always synchsafe in all ID3v2 versions.
+        // Fall back to big-endian only when synchsafe gives an impossible size (malformed file).
+        let tag_size = if synchsafe_size + 10 <= file_len {
+            synchsafe_size
         } else {
-            (synchsafe_size, true)
+            u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize
         };
+        // Frame sizes are synchsafe in ID3v2.4+; big-endian in ID3v2.3 and earlier.
+        let frame_sizes_synchsafe = version >= 4;
 
-        let mut tag_data = vec![0u8; size];
+        let mut tag_data = vec![0u8; tag_size];
         if file.read_exact(&mut tag_data).is_err() {
             break;
         }
@@ -1274,7 +1277,7 @@ fn scan_all_id3_text_frames(path: &Path) -> Option<Vec<(String, String)>> {
                 _ => break,
             };
 
-            let frame_size = if used_synchsafe {
+            let frame_size = if frame_sizes_synchsafe {
                 synchsafe_to_u32(&tag_data[pos + 4..pos + 8]) as usize
             } else {
                 u32::from_be_bytes([
