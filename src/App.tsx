@@ -123,6 +123,7 @@ type EntityRatingUpdate = {
 };
 
 type RecordingRatingUpdateResult = {
+  recording: EntityRatingUpdate;
   release_groups: EntityRatingUpdate[];
   artists: EntityRatingUpdate[];
 };
@@ -166,12 +167,6 @@ type CompoundArtistCheck = {
   total_sources_checked: number;
   individual_artist_names: string[];
   source_examples: string[];
-};
-
-type ArtistFixStats = {
-  recordings_updated: number;
-  release_groups_updated: number;
-  compound_artist_deleted: boolean;
 };
 
 type FileIssue = {
@@ -592,8 +587,6 @@ function App() {
   const [artistFixModal, setArtistFixModal] = useState<{ artistId: string; artistName: string } | null>(null);
   const [artistFixCheckResult, setArtistFixCheckResult] = useState<CompoundArtistCheck | null>(null);
   const [artistFixChecking, setArtistFixChecking] = useState(false);
-  const [artistFixStats, setArtistFixStats] = useState<ArtistFixStats | null>(null);
-  const [artistFixApplying, setArtistFixApplying] = useState(false);
   const [artistFixError, setArtistFixError] = useState<string | null>(null);
   const [splitRecordingId, setSplitRecordingId] = useState<string | null>(null);
   const [splitData, setSplitData] = useState<SplitRecordingDetail | null>(null);
@@ -613,7 +606,6 @@ function App() {
   const [mergeTitleCustom, setMergeTitleCustom] = useState("");
   const [mergeArtistChoice, setMergeArtistChoice] = useState<"A" | "B" | "custom">("A");
   const [mergeArtistCustom, setMergeArtistCustom] = useState("");
-  const [mergeRatingChoice, setMergeRatingChoice] = useState<"A" | "B">("A");
   const [comparisonWasPlaying, setComparisonWasPlaying] = useState(false);
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
@@ -1715,7 +1707,6 @@ function App() {
     comparisonPlayingRef.current = null;
     setComparisonSideAMs(0);
     setComparisonSideBMs(0);
-    setMergeRatingChoice(recA.rating === null && recB.rating !== null ? "B" : "A");
     setComparisonModal({ recA, recB, step: "compare" });
   }
 
@@ -1783,9 +1774,6 @@ function App() {
       : mergeTitleChoice === "B" ? recB.title
       : mergeTitleCustom;
     const customArtistText = mergeArtistChoice === "custom" ? mergeArtistCustom : null;
-    const chosenRating = recA.rating === recB.rating
-      ? recA.rating
-      : mergeRatingChoice === "A" ? recA.rating : recB.rating;
     try {
       await invoke("stop");
       const updated = await invoke<RecordingRow[]>("merge_recordings", {
@@ -1794,7 +1782,6 @@ function App() {
         title,
         artistChoice: mergeArtistChoice,
         customArtistText,
-        chosenRating,
       });
       setRecordings(updated);
       const artistRows = await loadArtists();
@@ -1894,9 +1881,19 @@ function App() {
     );
 
     try {
-      const updateResult = await invoke<RecordingRatingUpdateResult>("set_recording_rating", {
-        request: { id: recordingId, stars },
+      const rec = recordings.find((r) => r.id === recordingId);
+      const sourceId = rec?.primary_source_id;
+      if (!sourceId) throw new Error("No source available to rate");
+      const updateResult = await invoke<RecordingRatingUpdateResult>("set_source_rating", {
+        request: { source_id: sourceId, stars },
       });
+      // Reconcile the recording's displayed rating with the server's computed average
+      setRecordings((current) => applyAggregateRatings(current, [updateResult.recording]));
+      setHistory((current) => applyAggregateRatings(current, [updateResult.recording]));
+      setQueue((current) => applyAggregateRatings(current, [updateResult.recording]));
+      setCurrentTrack((current) =>
+        current ? (applyAggregateRatings([current], [updateResult.recording])[0] ?? current) : current,
+      );
       setArtists((current) => applyAggregateRatings(current, updateResult.artists));
       setReleaseGroups((current) => applyAggregateRatings(current, updateResult.release_groups));
     } catch (ratingError) {
@@ -3149,34 +3146,6 @@ function App() {
                   />
                 )}
               </div>
-              {recA.rating !== recB.rating && (() => {
-                function starLabel(r: number | null) {
-                  return r === null ? "(no rating)" : "★".repeat(r) + "☆".repeat(5 - r);
-                }
-                return (
-                  <div className="merge-field-section">
-                    <div className="merge-field-label">Rating</div>
-                    <label className="merge-field-option">
-                      <input
-                        checked={mergeRatingChoice === "A"}
-                        name="merge-rating"
-                        onChange={() => setMergeRatingChoice("A")}
-                        type="radio"
-                      />
-                      A: {starLabel(recA.rating)}
-                    </label>
-                    <label className="merge-field-option">
-                      <input
-                        checked={mergeRatingChoice === "B"}
-                        name="merge-rating"
-                        onChange={() => setMergeRatingChoice("B")}
-                        type="radio"
-                      />
-                      B: {starLabel(recB.rating)}
-                    </label>
-                  </div>
-                );
-              })()}
               <div className="comparison-modal-footer">
                 <button
                   className="comparison-back-btn"
@@ -3331,13 +3300,11 @@ function App() {
         function closeModal() {
           setArtistFixModal(null);
           setArtistFixCheckResult(null);
-          setArtistFixStats(null);
           setArtistFixError(null);
         }
         async function runChecks() {
           setArtistFixChecking(true);
           setArtistFixCheckResult(null);
-          setArtistFixStats(null);
           setArtistFixError(null);
           try {
             const result = await invoke<CompoundArtistCheck>("check_artist_compound", { artistId });
@@ -3346,24 +3313,6 @@ function App() {
             setArtistFixError(String(e));
           } finally {
             setArtistFixChecking(false);
-          }
-        }
-        async function applyFix() {
-          if (!artistFixCheckResult?.individual_artist_names) return;
-          setArtistFixApplying(true);
-          setArtistFixError(null);
-          try {
-            const stats = await invoke<ArtistFixStats>("apply_artist_fix", {
-              artistId,
-              individualArtistNames: artistFixCheckResult.individual_artist_names,
-            });
-            setArtistFixStats(stats);
-            setArtistFixCheckResult(null);
-            void loadLibraryData();
-          } catch (e) {
-            setArtistFixError(String(e));
-          } finally {
-            setArtistFixApplying(false);
           }
         }
         return (
@@ -3385,7 +3334,7 @@ function App() {
                 )}
 
                 {/* Initial state — no checks run yet */}
-                {!artistFixChecking && !artistFixCheckResult && !artistFixStats && !artistFixError && (
+                {!artistFixChecking && !artistFixCheckResult && !artistFixError && (
                   <>
                     <p className="check-empty">
                       Run checks to identify potential issues with this artist.
@@ -3428,30 +3377,7 @@ function App() {
                         ))}
                       </ul>
                     </div>
-                    <div className="check-actions">
-                      <button
-                        className="check-fix-btn"
-                        type="button"
-                        disabled={artistFixApplying}
-                        onClick={() => void applyFix()}
-                      >
-                        {artistFixApplying ? "Applying fix…" : "Apply Fix: Split into individual artists"}
-                      </button>
-                    </div>
                   </>
-                )}
-
-                {/* Fix applied */}
-                {artistFixStats && (
-                  <div className="check-success">
-                    <p className="check-success-title">✓ Fix applied successfully</p>
-                    <ul className="check-stats-list">
-                      <li>Recordings updated: {artistFixStats.recordings_updated}</li>
-                      <li>Release groups updated: {artistFixStats.release_groups_updated}</li>
-                      <li>Compound artist deleted: {artistFixStats.compound_artist_deleted ? "Yes" : "No"}</li>
-                    </ul>
-                    <p className="check-reload-note">The library will refresh automatically.</p>
-                  </div>
                 )}
               </div>
             </div>

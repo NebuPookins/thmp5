@@ -1,25 +1,21 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::db::DbPool;
 use crate::file_issues::FileIssue;
-use crate::library::import::{
-    fix_duplicate_track_entries, import_paths as do_import, prune_library,
-    rescan_source as do_rescan_source,
-};
+use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
-    AppBootstrap, AppConfig, ArtistDetail, ArtistFixStats, ArtistRow, CompoundArtistCheck,
-    DbPoolDebugSnapshot, ExternalCommand, FixMergedRecordingsStats, Id3FrameDebugInfo,
-    Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest, LibrarySummary,
-    PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
-    RatingUpdateRequest, RecordingDetail, RecordingRatingUpdateResult, RecordingRow,
-    ReleaseGroupDetail, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
-    SmartPlaylistResult, VolumeRequest,
+    AppBootstrap, AppConfig, ArtistDetail, ArtistRow, CompoundArtistCheck, DbPoolDebugSnapshot,
+    ExternalCommand, FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest,
+    ImportProgress, ImportStats, InitialSetupRequest, LibrarySummary, PlayHistoryInput,
+    PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate, RecordingDetail,
+    RecordingRatingUpdateResult, RecordingRow, ReleaseGroupDetail, ReleaseGroupRow,
+    SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult, SourceRatingUpdateRequest,
+    VolumeRequest,
 };
 use crate::query;
 use crate::storage::CatalogReader;
 use crate::AppState;
 use serde::Serialize;
-use sqlx::{Acquire, Row, Sqlite, Transaction};
-use std::collections::{HashMap, HashSet};
+use sqlx::{Acquire, Row};
 use std::sync::atomic::Ordering;
 use tauri::Emitter;
 
@@ -27,11 +23,6 @@ use tauri::Emitter;
 struct JobUpdate {
     remaining: i64,
     job_type: String,
-}
-
-#[derive(Clone, Serialize)]
-struct RecordingUpdatedEvent {
-    recording_ids: Vec<String>,
 }
 
 /// Emit a `job-update` event so the frontend can show the queue status.
@@ -193,7 +184,6 @@ pub async fn rescan_source(
         source_path,
         state.acoustid_api_key.as_deref(),
         &state.write_serializer,
-        false,
         &state.file_issues,
     )
     .await
@@ -226,46 +216,31 @@ pub async fn rescan_sources(
 }
 
 /// Shared loop: track per-file counter in AppState, emit `job-update` after each file.
-///
-/// Returns a map of recording_id → set of release_group_ids that the rescanned
-/// sources' files currently assert. Callers that need to detect stale tracks
-/// (e.g., `rescan_sources_for_release_group`) can use this to identify tracks
-/// on release groups that no source still claims.
 async fn rescan_path_list(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     paths: Vec<String>,
-) -> Result<HashMap<String, HashSet<String>>, String> {
+) -> Result<(), String> {
     let count = paths.len() as i64;
     state.pending_jobs.fetch_add(count, Ordering::Relaxed);
     emit_job_update(app, state, "rescan");
 
     let mut failures = Vec::new();
-    let mut assertions: HashMap<String, HashSet<String>> = HashMap::new();
     for path in paths {
         let source_path = std::path::Path::new(&path);
         if !source_path.is_file() {
             failures.push(format!("{}: Source file is missing", source_path.display()));
         } else {
-            match do_rescan_source(
+            if let Err(error) = do_rescan_source(
                 &state.db,
                 source_path,
                 state.acoustid_api_key.as_deref(),
                 &state.write_serializer,
-                true,
                 &state.file_issues,
             )
             .await
             {
-                Ok((recording_id, release_group_id)) => {
-                    assertions
-                        .entry(recording_id)
-                        .or_default()
-                        .insert(release_group_id);
-                }
-                Err(error) => {
-                    failures.push(format!("{}:\n{error:#}", source_path.display()));
-                }
+                failures.push(format!("{}:\n{error:#}", source_path.display()));
             }
         }
         state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
@@ -274,27 +249,8 @@ async fn rescan_path_list(
 
     reload_catalog(state).await;
 
-    // Single prune pass after the batch, regardless of individual failures.
-    if let Err(e) = prune_library(&state.db).await {
-        tracing::warn!("Library pruning after batch rescan failed: {e}");
-    }
-
-    // Single duplicate-track cleanup pass after the batch.
-    if let Err(e) = fix_duplicate_track_entries(&state.db).await {
-        tracing::warn!("Duplicate track cleanup after batch rescan failed: {e}");
-    }
-
-    // Notify the frontend that affected recordings may have changed releases.
-    let recording_ids: Vec<String> = assertions.keys().cloned().collect();
-    if !recording_ids.is_empty() {
-        let _ = app.emit(
-            "recording-releases-updated",
-            RecordingUpdatedEvent { recording_ids },
-        );
-    }
-
     if failures.is_empty() {
-        Ok(assertions)
+        Ok(())
     } else {
         Err(format!(
             "Failed to rescan {} source(s):\n{}",
@@ -311,34 +267,15 @@ pub async fn rescan_sources_for_artist(
     artist_id: String,
 ) -> Result<(), String> {
     let paths: Vec<String> = {
-        let mut conn = state
-            .db
-            .acquire(format!(
-                "command.rescan_sources_for_artist artist_id={artist_id}"
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
-        sqlx::query_scalar(
-            "SELECT DISTINCT s.file_path
-             FROM source s
-             JOIN recording_artist ra ON ra.recording_id = s.recording_id
-             WHERE ra.artist_id = ?
-               AND s.source_type = 'local_file'
-               AND s.file_path IS NOT NULL
-             ORDER BY s.file_path",
-        )
-        .bind(&artist_id)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?
+        let cat = state.catalog.read().await;
+        cat.source_paths_for_artist(&artist_id).1
     };
 
     if paths.is_empty() {
         return Err("No local sources found for this artist.".to_string());
     }
 
-    rescan_path_list(&app, &state, paths).await?;
-    Ok(())
+    rescan_path_list(&app, &state, paths).await
 }
 
 #[tauri::command]
@@ -348,82 +285,15 @@ pub async fn rescan_sources_for_release_group(
     release_group_id: String,
 ) -> Result<(), String> {
     let paths: Vec<String> = {
-        let mut conn = state
-            .db
-            .acquire(format!(
-                "command.rescan_sources_for_release_group release_group_id={release_group_id}"
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
-        sqlx::query_scalar(
-            "SELECT DISTINCT s.file_path
-             FROM source s
-             JOIN track t ON t.recording_id = s.recording_id
-             JOIN medium m ON m.id = t.medium_id
-             JOIN release rel ON rel.id = m.release_id
-             WHERE rel.release_group_id = ?
-               AND s.source_type = 'local_file'
-               AND s.file_path IS NOT NULL
-             ORDER BY s.file_path",
-        )
-        .bind(&release_group_id)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?
+        let cat = state.catalog.read().await;
+        cat.source_paths_for_release_group(&release_group_id)
     };
 
     if paths.is_empty() {
         return Err("No local sources found for this album.".to_string());
     }
 
-    let assertions = rescan_path_list(&app, &state, paths).await?;
-
-    // After all rescans, recordings on the target release group may have
-    // stale tracks left behind from prior imports that used different ID3
-    // metadata.  For each recording whose rescanned sources no longer
-    // assert the target release group, remove its track from that group.
-    // (The recordings themselves and their tracks on other, still-asserted
-    // release groups are preserved.)
-    let mut prune_again = false;
-    for (recording_id, asserted_groups) in &assertions {
-        if !asserted_groups.contains(&release_group_id) {
-            let mut conn = state
-                .db
-                .acquire(format!(
-                    "command.rescan_sources_for_release_group.cleanup recording_id={recording_id}"
-                ))
-                .await
-                .map_err(|e| e.to_string())?;
-            let deleted = sqlx::query(
-                "DELETE FROM track
-                 WHERE recording_id = ?
-                   AND id IN (
-                       SELECT t.id FROM track t
-                       JOIN medium m ON m.id = t.medium_id
-                       JOIN release rel ON rel.id = m.release_id
-                       WHERE t.recording_id = ?
-                         AND rel.release_group_id = ?
-                   )",
-            )
-            .bind(recording_id)
-            .bind(recording_id)
-            .bind(&release_group_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| e.to_string())?;
-            if deleted.rows_affected() > 0 {
-                prune_again = true;
-            }
-        }
-    }
-
-    if prune_again {
-        if let Err(e) = prune_library(&state.db).await {
-            tracing::warn!("Library pruning after stale-track cleanup failed: {e}");
-        }
-    }
-
-    Ok(())
+    rescan_path_list(&app, &state, paths).await
 }
 
 #[tauri::command]
@@ -617,110 +487,96 @@ pub async fn record_play_history(
 }
 
 #[tauri::command]
-pub async fn set_recording_rating(
+pub async fn set_source_rating(
     state: tauri::State<'_, AppState>,
-    request: RatingUpdateRequest,
+    request: SourceRatingUpdateRequest,
 ) -> Result<RecordingRatingUpdateResult, String> {
     validate_rating(request.stars)?;
 
     let mut conn = state
         .db
         .acquire(format!(
-            "command.set_recording_rating recording_id={}",
-            request.id
+            "command.set_source_rating source_id={}",
+            request.source_id
         ))
         .await
         .map_err(|e| e.to_string())?;
 
     if let Some(stars) = request.stars {
         sqlx::query(
-            "INSERT INTO user_rating (recording_id, stars, updated_at)
+            "INSERT INTO source_rating (source_id, stars, updated_at)
              VALUES (?, ?, datetime('now'))
-             ON CONFLICT(recording_id) DO UPDATE SET
+             ON CONFLICT(source_id) DO UPDATE SET
                 stars = excluded.stars,
                 updated_at = datetime('now')",
         )
-        .bind(&request.id)
+        .bind(&request.source_id)
         .bind(stars)
         .execute(&mut *conn)
         .await
         .map_err(|e| e.to_string())?;
     } else {
-        sqlx::query("DELETE FROM user_rating WHERE recording_id = ?")
-            .bind(&request.id)
+        sqlx::query("DELETE FROM source_rating WHERE source_id = ?")
+            .bind(&request.source_id)
             .execute(&mut *conn)
             .await
             .map_err(|e| e.to_string())?;
     }
 
-    let release_groups = sqlx::query(
-        "WITH affected_release_groups AS (
-            SELECT DISTINCT rel.release_group_id AS id
-            FROM track t
-            JOIN medium m
-                ON m.id = t.medium_id
-            JOIN release rel
-                ON rel.id = m.release_id
-            WHERE t.recording_id = ?
-         )
-         SELECT
-            affected_release_groups.id AS id,
-            (
-                SELECT AVG(track_ratings.stars)
-                FROM (
-                    SELECT DISTINCT t2.recording_id, ur2.stars
-                    FROM release rel2
-                    JOIN medium m2
-                        ON m2.release_id = rel2.id
-                    JOIN track t2
-                        ON t2.medium_id = m2.id
-                    JOIN user_rating ur2
-                        ON ur2.recording_id = t2.recording_id
-                    WHERE rel2.release_group_id = affected_release_groups.id
-                ) AS track_ratings
-            ) AS rating
-         FROM affected_release_groups",
-    )
-    .bind(&request.id)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?
-    .into_iter()
-    .map(|row| crate::models::EntityRatingUpdate {
-        id: row.get("id"),
-        rating: row.get("rating"),
-    })
-    .collect();
+    // Look up the recording_id that owns this source, before releasing the connection.
+    let recording_id: Option<String> = sqlx::query("SELECT recording_id FROM source WHERE id = ?")
+        .bind(&request.source_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|r| r.get("recording_id"));
 
-    let artists = sqlx::query(
-        "WITH affected_artists AS (
-            SELECT DISTINCT artist_id AS id
-            FROM recording_artist
-            WHERE recording_id = ?
-         )
-         SELECT
-            affected_artists.id AS id,
-            AVG(ur.stars)       AS rating
-         FROM affected_artists
-         LEFT JOIN recording_artist ra
-             ON ra.artist_id = affected_artists.id
-         LEFT JOIN user_rating ur
-             ON ur.recording_id = ra.recording_id
-         GROUP BY affected_artists.id",
-    )
-    .bind(&request.id)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?
-    .into_iter()
-    .map(|row| crate::models::EntityRatingUpdate {
-        id: row.get("id"),
-        rating: row.get("rating"),
-    })
-    .collect();
-
+    drop(conn);
     reload_catalog(&state).await;
+
+    let mut recording = crate::models::EntityRatingUpdate {
+        id: String::new(),
+        rating: None,
+    };
+    let mut artists: Vec<crate::models::EntityRatingUpdate> = Vec::new();
+    let mut release_groups: Vec<crate::models::EntityRatingUpdate> = Vec::new();
+
+    if let Some(rec_id) = recording_id {
+        let catalog = state.catalog.read().await;
+        if let Ok(Some(rec)) = catalog.get_recording_detail(&rec_id).await {
+            recording = crate::models::EntityRatingUpdate {
+                id: rec_id.clone(),
+                rating: rec.rating,
+            };
+            let rg_ids: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                rec.releases
+                    .iter()
+                    .filter(|r| seen.insert(r.release_group_id.clone()))
+                    .map(|r| r.release_group_id.clone())
+                    .collect()
+            };
+            for a in &rec.artists {
+                if let Ok(Some(detail)) = catalog.get_artist_detail(&a.artist_id).await {
+                    artists.push(crate::models::EntityRatingUpdate {
+                        id: a.artist_id.clone(),
+                        rating: detail.rating,
+                    });
+                }
+            }
+            for rg_id in &rg_ids {
+                if let Ok(Some(detail)) = catalog.get_release_group_detail(rg_id).await {
+                    release_groups.push(crate::models::EntityRatingUpdate {
+                        id: rg_id.clone(),
+                        rating: detail.rating,
+                    });
+                }
+            }
+        }
+    }
+
     Ok(RecordingRatingUpdateResult {
+        recording,
         release_groups,
         artists,
     })
@@ -748,48 +604,6 @@ pub fn get_db_pool_debug_snapshot(
 #[tauri::command]
 pub fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssue>, String> {
     Ok(state.file_issues.all())
-}
-
-/// Query the database for sources whose recording has no track entries and
-/// push each one into the in-memory issue log.
-#[tauri::command]
-pub async fn find_orphan_sources(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<FileIssue>, String> {
-    let pool = state.db.raw_pool();
-    let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-        "SELECT s.id, s.recording_id, s.file_path, r.title
-         FROM source s
-         JOIN recording r ON r.id = s.recording_id
-         WHERE s.source_type = 'local_file'
-           AND s.file_path IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM track t WHERE t.recording_id = s.recording_id)",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("Failed to query orphan sources: {e}"))?;
-
-    let file_issues = state.file_issues.clone();
-    let mut result = Vec::new();
-    for (source_id, recording_id, file_path, title) in &rows {
-        let msg = format!(
-            "Recording \"{}\" has no album track — source is orphaned",
-            title.as_deref().unwrap_or("unknown")
-        );
-        file_issues.push_orphan_source(file_path, &msg, source_id, recording_id);
-        result.push(FileIssue {
-            file_path: file_path.clone(),
-            kind: crate::file_issues::FileIssueKind::OrphanSource,
-            message: msg,
-            source_id: Some(source_id.clone()),
-            recording_id: Some(recording_id.clone()),
-            frame_id: None,
-            field_name: None,
-            lofty_value: None,
-            corrected_value: None,
-        });
-    }
-    Ok(result)
 }
 
 /// Fix an orphan source by re-scanning its file metadata and re-creating the
@@ -825,7 +639,6 @@ pub async fn fix_orphan_source(
         source_path,
         state.acoustid_api_key.as_deref(),
         &state.write_serializer,
-        false,
         &state.file_issues,
     )
     .await
@@ -898,125 +711,10 @@ pub async fn resolve_duplicate_frame(
                     .await
                     .map_err(|e| format!("Failed to update recording title: {e}"))?;
             }
-            "TPE1" => {
-                // Replace the primary artist for this recording.
-                let mut conn = pool
-                    .acquire()
-                    .await
-                    .map_err(|e| format!("DB acquire error: {e}"))?;
-                let mut tx = conn
-                    .begin()
-                    .await
-                    .map_err(|e| format!("DB begin error: {e}"))?;
-                let artist_id =
-                    crate::library::import::get_or_create_artist(&mut tx, &chosen_value)
-                        .await
-                        .map_err(|e| format!("Artist error: {e}"))?;
-                sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
-                    .bind(&recording_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("Failed to clear recording artists: {e}"))?;
-                sqlx::query(
-                    "INSERT INTO recording_artist (recording_id, artist_id, position, role) \
-                     VALUES (?, ?, 0, 'main')",
-                )
-                .bind(&recording_id)
-                .bind(&artist_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("Failed to insert recording artist: {e}"))?;
-                tx.commit()
-                    .await
-                    .map_err(|e| format!("Failed to commit artist change: {e}"))?;
-            }
-            "TPE2" => {
-                // Replace the album artist on all release groups that contain this recording.
-                let mut conn = pool
-                    .acquire()
-                    .await
-                    .map_err(|e| format!("DB acquire error: {e}"))?;
-                let mut tx = conn
-                    .begin()
-                    .await
-                    .map_err(|e| format!("DB begin error: {e}"))?;
-                let artist_id =
-                    crate::library::import::get_or_create_artist(&mut tx, &chosen_value)
-                        .await
-                        .map_err(|e| format!("Artist error: {e}"))?;
-                let release_groups: Vec<String> = sqlx::query_scalar(
-                    "SELECT DISTINCT rg.id
-                     FROM track t
-                     JOIN medium m  ON m.id = t.medium_id
-                     JOIN release r ON r.id = m.release_id
-                     JOIN release_group rg ON rg.id = r.release_group_id
-                     WHERE t.recording_id = ?",
-                )
-                .bind(&recording_id)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| format!("Failed to find release groups: {e}"))?;
-                for rg_id in &release_groups {
-                    // Delete existing and re-insert at position 0
-                    sqlx::query("DELETE FROM release_group_artist WHERE release_group_id = ?")
-                        .bind(rg_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| format!("Failed to clear release group artists: {e}"))?;
-                    sqlx::query(
-                        "INSERT INTO release_group_artist (release_group_id, artist_id, position, role) \
-                         VALUES (?, ?, 0, 'main')",
-                    )
-                    .bind(rg_id)
-                    .bind(&artist_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("Failed to insert release group artist: {e}"))?;
-                }
-                tx.commit()
-                    .await
-                    .map_err(|e| format!("Failed to commit album artist change: {e}"))?;
-            }
-            "TALB" => {
-                // Update the album title on all release groups + releases containing
-                // this recording.
-                let mut conn = pool
-                    .acquire()
-                    .await
-                    .map_err(|e| format!("DB acquire error: {e}"))?;
-                let mut tx = conn
-                    .begin()
-                    .await
-                    .map_err(|e| format!("DB begin error: {e}"))?;
-                let release_groups: Vec<String> = sqlx::query_scalar(
-                    "SELECT DISTINCT rg.id
-                     FROM track t
-                     JOIN medium m  ON m.id = t.medium_id
-                     JOIN release r ON r.id = m.release_id
-                     JOIN release_group rg ON rg.id = r.release_group_id
-                     WHERE t.recording_id = ?",
-                )
-                .bind(&recording_id)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| format!("Failed to find release groups: {e}"))?;
-                for rg_id in &release_groups {
-                    sqlx::query("UPDATE release_group SET title = ? WHERE id = ?")
-                        .bind(&chosen_value)
-                        .bind(rg_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| format!("Failed to update release group title: {e}"))?;
-                    sqlx::query("UPDATE release SET title = ? WHERE release_group_id = ?")
-                        .bind(&chosen_value)
-                        .bind(rg_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| format!("Failed to update release title: {e}"))?;
-                }
-                tx.commit()
-                    .await
-                    .map_err(|e| format!("Failed to commit album title change: {e}"))?;
+            "TPE1" | "TPE2" | "TALB" => {
+                // The artist/album tables were dropped in migration 010; artist and album
+                // information is now derived from raw_tags_json at catalog-load time.
+                // The chosen value takes effect on the next source rescan.
             }
             other => return Err(format!("Unsupported frame ID: {other}")),
         }
@@ -1084,13 +782,11 @@ pub async fn play(
             s.file_path           AS file_path,
             r.id                  AS recording_id,
             r.title               AS title,
-            COALESCE(ra.credited_as, a.name) AS artist,
+            s.raw_tags_json,
             s.replay_gain_track_db,
             s.lufs
          FROM source s
          JOIN recording r ON r.id = s.recording_id
-         LEFT JOIN recording_artist ra ON ra.recording_id = r.id AND ra.position = 0
-         LEFT JOIN artist a ON a.id = ra.artist_id
          WHERE s.id = ?
            AND s.source_type = 'local_file'
            AND s.file_path IS NOT NULL",
@@ -1105,7 +801,11 @@ pub async fn play(
     let mut file_path: String = row.get("file_path");
     let recording_id: String = row.get("recording_id");
     let title: Option<String> = row.get("title");
-    let artist: Option<String> = row.get("artist");
+    let raw_tags_json: Option<String> = row.get("raw_tags_json");
+    let artist: Option<String> = raw_tags_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<Vec<(String, String)>>(j).ok())
+        .and_then(|tags| tags.into_iter().find(|(k, _)| k == "TPE1").map(|(_, v)| v));
     let replay_gain_track_db: Option<f64> = row.get("replay_gain_track_db");
     let lufs: Option<f64> = row.get("lufs");
 
@@ -1314,24 +1014,6 @@ pub async fn list_release_groups(
         .list_release_groups(artist_id.as_deref(), search)
         .await
         .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn prune_empty_library_entities_command(
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let mut tx = state
-        .db
-        .raw_pool()
-        .begin()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    prune_empty_library_entities(&mut tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    tx.commit().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1544,21 +1226,10 @@ async fn delete_recording_inner(db: &DbPool, id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
 
-    // track.recording_id has no ON DELETE CASCADE
-    sqlx::query("DELETE FROM track WHERE recording_id = ?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // CASCADE deletes source, recording_artist, recording_tag, user_rating, play_history
+    // CASCADE deletes source (and via source: source_rating), recording_tag, play_history
     sqlx::query("DELETE FROM recording WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    prune_empty_library_entities(&mut tx)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1621,7 +1292,6 @@ pub async fn merge_recordings(
     title: String,
     artist_choice: String,
     custom_artist_text: Option<String>,
-    chosen_rating: Option<i64>,
 ) -> Result<Vec<RecordingRow>, String> {
     let mut tx = state
         .db
@@ -1657,25 +1327,9 @@ pub async fn merge_recordings(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Apply chosen artist
+    // Apply chosen artist (credit text only; artist table was dropped in migration 010)
     match artist_choice.as_str() {
         "B" => {
-            // Copy duplicate's artist links and credit text to primary
-            sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
-                .bind(&primary_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query(
-                "INSERT INTO recording_artist (recording_id, artist_id, position, role, credited_as)
-                 SELECT ?, artist_id, position, role, credited_as
-                 FROM recording_artist WHERE recording_id = ?",
-            )
-            .bind(&primary_id)
-            .bind(&duplicate_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
             sqlx::query(
                 "UPDATE recording SET artist_credit_text =
                    (SELECT artist_credit_text FROM recording WHERE id = ?)
@@ -1693,11 +1347,6 @@ pub async fn merge_recordings(
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            sqlx::query("DELETE FROM recording_artist WHERE recording_id = ?")
-                .bind(&primary_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
             sqlx::query("UPDATE recording SET artist_credit_text = ? WHERE id = ?")
                 .bind(&text)
                 .bind(&primary_id)
@@ -1716,38 +1365,10 @@ pub async fn merge_recordings(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Apply chosen rating to primary
-    sqlx::query("DELETE FROM user_rating WHERE recording_id = ?")
-        .bind(&primary_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(stars) = chosen_rating {
-        sqlx::query(
-            "INSERT INTO user_rating (recording_id, stars, updated_at) VALUES (?, ?, datetime('now'))",
-        )
-        .bind(&primary_id)
-        .bind(stars)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    // track.recording_id has no ON DELETE CASCADE, so remove duplicate's track rows first
-    sqlx::query("DELETE FROM track WHERE recording_id = ?")
-        .bind(&duplicate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
     // Delete duplicate (CASCADE removes remaining child rows)
     sqlx::query("DELETE FROM recording WHERE id = ?")
         .bind(&duplicate_id)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    prune_empty_library_entities(&mut tx)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1762,220 +1383,6 @@ pub async fn merge_recordings(
         .await
         .map_err(|e| e.to_string())?;
     Ok(result)
-}
-
-#[tauri::command]
-pub async fn merge_release_groups(
-    state: tauri::State<'_, AppState>,
-    primary_id: String,
-    duplicate_id: String,
-) -> Result<String, String> {
-    if primary_id == duplicate_id {
-        return Err("Cannot merge a release group with itself".to_string());
-    }
-
-    let mut tx = state
-        .db
-        .raw_pool()
-        .begin()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // ── 1. Transfer release_group_rating if primary has none ──────────────
-    let primary_has_rating: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM release_group_rating WHERE release_group_id = ?",
-    )
-    .bind(&primary_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?
-        > 0;
-
-    if !primary_has_rating {
-        let dup_rating: Option<i64> =
-            sqlx::query_scalar("SELECT stars FROM release_group_rating WHERE release_group_id = ?")
-                .bind(&duplicate_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-
-        if let Some(stars) = dup_rating {
-            sqlx::query(
-                "INSERT OR REPLACE INTO release_group_rating (release_group_id, stars, updated_at)
-                 VALUES (?, ?, datetime('now'))",
-            )
-            .bind(&primary_id)
-            .bind(stars)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-    }
-
-    // ── 2. Get primary release to merge into ──────────────────────────────
-    let primary_release_id: String =
-        sqlx::query_scalar("SELECT id FROM release WHERE release_group_id = ? LIMIT 1")
-            .bind(&primary_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "Primary release group has no releases".to_string())?;
-
-    // Get all releases from the duplicate group (excluding the one that is the same as primary)
-    let dup_release_ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM release WHERE release_group_id = ? AND id != ?")
-            .bind(&duplicate_id)
-            .bind(&primary_release_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    // ── 3. Merge mediums from duplicate releases into the primary release ──
-    for dup_release_id in &dup_release_ids {
-        let dup_mediums: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT id, position FROM medium WHERE release_id = ? ORDER BY position",
-        )
-        .bind(dup_release_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        for (dup_medium_id, position) in &dup_mediums {
-            // Find or create a matching medium in the primary release
-            let target_medium_id: String = match sqlx::query_scalar(
-                "SELECT id FROM medium WHERE release_id = ? AND position = ?",
-            )
-            .bind(&primary_release_id)
-            .bind(position)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?
-            {
-                Some(id) => id,
-                None => {
-                    let new_id = uuid::Uuid::new_v4().to_string();
-                    sqlx::query(
-                        "INSERT INTO medium (id, release_id, position, format)
-                         VALUES (?, ?, ?, (SELECT format FROM medium WHERE id = ?))",
-                    )
-                    .bind(&new_id)
-                    .bind(&primary_release_id)
-                    .bind(position)
-                    .bind(dup_medium_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                    new_id
-                }
-            };
-
-            // Copy tracks from duplicate medium that don't already exist in the target
-            sqlx::query(
-                "INSERT OR IGNORE INTO track (id, medium_id, recording_id, position, title, duration_ms)
-                 SELECT ?, ?, recording_id, position, title, duration_ms
-                 FROM track
-                 WHERE medium_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM track t2
-                       WHERE t2.medium_id = ?
-                         AND t2.recording_id = track.recording_id
-                   )",
-            )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(&target_medium_id)
-            .bind(dup_medium_id)
-            .bind(&target_medium_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-    }
-
-    // ── 4. Delete duplicate releases and their group ──────────────────────
-    for dup_release_id in &dup_release_ids {
-        sqlx::query("DELETE FROM release WHERE id = ?")
-            .bind(dup_release_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Delete the duplicate release group (CASCADES to release_group_artist, release_group_rating)
-    sqlx::query("DELETE FROM release_group WHERE id = ?")
-        .bind(&duplicate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // ── 5. Prune orphaned entities ────────────────────────────────────────
-    prune_empty_library_entities(&mut tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    tx.commit().await.map_err(|e| e.to_string())?;
-
-    Ok(primary_id)
-}
-
-async fn prune_empty_library_entities(tx: &mut Transaction<'_, Sqlite>) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM medium
-         WHERE NOT EXISTS (
-             SELECT 1
-             FROM track
-             WHERE track.medium_id = medium.id
-         )",
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "DELETE FROM release
-         WHERE NOT EXISTS (
-             SELECT 1
-             FROM medium
-             WHERE medium.release_id = release.id
-         )",
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "DELETE FROM release_group
-         WHERE NOT EXISTS (
-             SELECT 1
-             FROM release
-             WHERE release.release_group_id = release_group.id
-         )",
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "DELETE FROM release_group_artist
-         WHERE artist_id IN (
-             SELECT id FROM artist
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM recording_artist
-                 WHERE recording_artist.artist_id = artist.id
-             )
-         )",
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "DELETE FROM artist
-         WHERE NOT EXISTS (
-             SELECT 1
-             FROM recording_artist
-             WHERE recording_artist.artist_id = artist.id
-         )",
-    )
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
 }
 
 fn validate_rating(stars: Option<i64>) -> Result<(), String> {
@@ -2092,33 +1499,7 @@ pub async fn check_artist_compound(
     state: tauri::State<'_, AppState>,
     artist_id: String,
 ) -> Result<CompoundArtistCheck, String> {
-    crate::library::artist_fixes::check_artist_compound(&state.db, &artist_id).await
-}
-
-#[tauri::command]
-pub async fn apply_artist_fix(
-    state: tauri::State<'_, AppState>,
-    artist_id: String,
-    individual_artist_names: Vec<String>,
-) -> Result<ArtistFixStats, String> {
-    let _permit = state
-        .write_serializer
-        .acquire()
-        .await
-        .map_err(|e| format!("Failed to acquire write lock: {e}"))?;
-
-    let result = crate::library::artist_fixes::apply_artist_fix(
-        &state.db,
-        &artist_id,
-        &individual_artist_names,
-    )
-    .await;
-
-    drop(_permit);
-
-    reload_catalog(&state).await;
-
-    result
+    crate::library::artist_fixes::check_artist_compound(&state.catalog, &artist_id).await
 }
 
 async fn split_recording_inner(
@@ -2166,7 +1547,6 @@ async fn split_recording_inner(
 
     // Read metadata from the first local_file source in the list
     let mut title = String::new();
-    let mut artist_name: Option<String> = None;
     let mut genre: Option<String> = None;
     let mut bpm: Option<f64> = None;
     let mut comment: Option<String> = None;
@@ -2184,7 +1564,6 @@ async fn split_recording_inner(
         if let Some(ref path) = file_path {
             if let Ok(meta) = crate::library::scanner::read_metadata(std::path::Path::new(path)) {
                 title = meta.meta.title.unwrap_or_default();
-                artist_name = meta.meta.artist;
                 genre = meta.meta.genre;
                 bpm = meta.meta.bpm;
                 comment = meta.meta.comment;
@@ -2219,25 +1598,6 @@ async fn split_recording_inner(
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
-
-    // Link the primary artist if we found one in the tags
-    if let Some(ref name) = artist_name {
-        let name = name.trim();
-        if !name.is_empty() {
-            let artist_id = crate::library::import::get_or_create_artist(&mut tx, name)
-                .await
-                .map_err(|e| e.to_string())?;
-            sqlx::query(
-                "INSERT INTO recording_artist (recording_id, artist_id, position, role)
-                 VALUES (?, ?, 0, 'main')",
-            )
-            .bind(&new_id)
-            .bind(&artist_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-    }
 
     // Move selected sources to the new recording
     for sid in source_ids_to_move {
@@ -2342,554 +1702,5 @@ mod tests {
         let (gain, source) = compute_normalization_gain(Some(0.0), None);
         assert!((gain - 1.0).abs() < f32::EPSILON);
         assert_eq!(source, "ReplayGain");
-    }
-
-    /// Regression: multi-disc releases where each disc has unanimous track_total
-    /// (but different values per disc) should NOT trigger "Sources disagree".
-    /// Previously the unanimous check compared source-claimed track_total against
-    /// DB track count per disc, falsely rejecting unanimous multi-disc layouts.
-    #[tokio::test]
-    async fn test_multi_disc_unanimous_completeness() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let pool = crate::db::init_pool(&db_path).await.unwrap();
-        let mut conn = pool.acquire("test".to_string()).await.unwrap();
-
-        let rg_id = "rg-test-unanimous";
-        let release_id = "rel-test-unanimous";
-
-        sqlx::query("INSERT INTO release_group (id, title) VALUES (?, ?)")
-            .bind(rg_id)
-            .bind("Test RG")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO release (id, release_group_id, title) VALUES (?, ?, ?)")
-            .bind(release_id)
-            .bind(rg_id)
-            .bind("Test Release")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-
-        // Disc 1: 3 tracks, all sources claim track_total=3
-        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('m1', ?, 1)")
-            .bind(release_id)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        // Disc 2: 2 tracks, all sources claim track_total=2
-        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('m2', ?, 2)")
-            .bind(release_id)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-
-        for i in 1..=3 {
-            let rec_id = format!("rec-d1-{i}");
-            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
-                .bind(&rec_id)
-                .bind(format!("D1 Track {i}"))
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO track (id, medium_id, recording_id, position) VALUES (?, 'm1', ?, ?)",
-            )
-            .bind(format!("trk-d1-{i}"))
-            .bind(&rec_id)
-            .bind(i)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
-                 VALUES (?, ?, 'local_file', ?, 3)",
-            )
-            .bind(format!("src-d1-{i}"))
-            .bind(&rec_id)
-            .bind(format!("/d1/track{i}.mp3"))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        }
-
-        for i in 1..=2 {
-            let rec_id = format!("rec-d2-{i}");
-            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
-                .bind(&rec_id)
-                .bind(format!("D2 Track {i}"))
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO track (id, medium_id, recording_id, position) VALUES (?, 'm2', ?, ?)",
-            )
-            .bind(format!("trk-d2-{i}"))
-            .bind(&rec_id)
-            .bind(i)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
-                 VALUES (?, ?, 'local_file', ?, 2)",
-            )
-            .bind(format!("src-d2-{i}"))
-            .bind(&rec_id)
-            .bind(format!("/d2/track{i}.mp3"))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        }
-
-        // ── Step 1: Run the same completeness query the command handler uses ──
-        let stats = sqlx::query(
-            "WITH release_source_stats AS (
-                SELECT
-                    t.id AS track_id,
-                    MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
-                    MAX(s.track_total) AS source_track_total
-                FROM medium m
-                JOIN track t ON t.medium_id = m.id
-                LEFT JOIN source s ON s.recording_id = t.recording_id
-                WHERE m.release_id = ?
-                GROUP BY t.id
-            )
-            SELECT
-                COUNT(DISTINCT source_track_total) AS distinct_track_totals,
-                COUNT(*) AS total_tracks,
-                COALESCE(SUM(has_source), 0) AS tracks_with_sources
-            FROM release_source_stats",
-        )
-        .bind(release_id)
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap();
-
-        let distinct: i64 = stats.get("distinct_track_totals");
-        let total_tracks: i64 = stats.get("total_tracks");
-        let with_sources: i64 = stats.get("tracks_with_sources");
-
-        // distinct=2 because discs report different track_total — this enters
-        // the `(_, _, _)` wildcard arm (the disagreement / multi-disc check).
-        assert_eq!(distinct, 2, "two distinct track_total values across discs");
-        assert_eq!(total_tracks, 5, "5 tracks in DB");
-        assert_eq!(with_sources, 5, "all tracks have sources");
-
-        // ── Step 2: Run the source_data query the wildcard arm uses ──
-        let source_data = sqlx::query(
-            "SELECT s.file_path, s.track_total,
-                    m.position AS disc_position,
-                    (SELECT MAX(m3.position) FROM medium m3
-                     WHERE m3.release_id = m.release_id) AS disc_total
-             FROM medium m
-             JOIN track t ON t.medium_id = m.id
-             JOIN source s ON s.recording_id = t.recording_id
-             WHERE m.release_id = ? AND s.track_total IS NOT NULL
-             ORDER BY s.track_total, m.position, s.file_path",
-        )
-        .bind(release_id)
-        .fetch_all(&mut *conn)
-        .await
-        .unwrap();
-
-        let release_disc_total: Option<i64> = source_data.first().and_then(|r| r.get("disc_total"));
-        assert_eq!(release_disc_total, Some(2));
-
-        // ── Step 3: Replicate the unanimous per-disc check ──
-        let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> = BTreeMap::new();
-        for row in &source_data {
-            if let Some(dp) = row.get::<Option<i64>, _>("disc_position") {
-                let tt: i64 = row.get("track_total");
-                *disc_map.entry(dp).or_default().entry(tt).or_default() += 1;
-            }
-        }
-
-        assert_eq!(disc_map.len(), 2, "both discs represented");
-        // Every disc has only one track_total claim — sources agree per disc.
-        assert!(
-            disc_map.values().all(|tts| tts.len() == 1),
-            "each disc should have unanimous track_total: {disc_map:?}"
-        );
-
-        // All DB tracks have sources → this should be Complete, not "Sources disagree".
-        assert!(
-            with_sources >= total_tracks,
-            "all tracks have sources, should be Complete not disagreement"
-        );
-    }
-
-    /// Verify that genuine intra-disc disagreement is still detected as disagreement.
-    #[tokio::test]
-    async fn test_multi_disc_intra_disc_disagreement() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let pool = crate::db::init_pool(&db_path).await.unwrap();
-        let mut conn = pool.acquire("test".to_string()).await.unwrap();
-
-        let rg_id = "rg-test-disagree";
-        let release_id = "rel-test-disagree";
-
-        sqlx::query("INSERT INTO release_group (id, title) VALUES (?, ?)")
-            .bind(rg_id)
-            .bind("Test RG")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO release (id, release_group_id, title) VALUES (?, ?, ?)")
-            .bind(release_id)
-            .bind(rg_id)
-            .bind("Test Release")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-
-        // Single disc, 2 tracks — one source says track_total=1, the other says 2
-        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('m3', ?, 1)")
-            .bind(release_id)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-
-        for i in 1..=2 {
-            let rec_id = format!("rec-{i}");
-            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
-                .bind(&rec_id)
-                .bind(format!("Track {i}"))
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO track (id, medium_id, recording_id, position) \
-                 VALUES (?, 'm3', ?, ?)",
-            )
-            .bind(format!("trk-{i}"))
-            .bind(&rec_id)
-            .bind(i)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-            let tt = if i == 1 { 1 } else { 2 };
-            sqlx::query(
-                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
-                 VALUES (?, ?, 'local_file', ?, ?)",
-            )
-            .bind(format!("src-{i}"))
-            .bind(&rec_id)
-            .bind(format!("/track{i}.mp3"))
-            .bind(tt)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        }
-
-        let stats = sqlx::query(
-            "WITH release_source_stats AS (
-                SELECT
-                    t.id AS track_id,
-                    MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
-                    MAX(s.track_total) AS source_track_total
-                FROM medium m
-                JOIN track t ON t.medium_id = m.id
-                LEFT JOIN source s ON s.recording_id = t.recording_id
-                WHERE m.release_id = ?
-                GROUP BY t.id
-            )
-            SELECT
-                COUNT(DISTINCT source_track_total) AS distinct_track_totals,
-                COUNT(*) AS total_tracks,
-                COALESCE(SUM(has_source), 0) AS tracks_with_sources
-            FROM release_source_stats",
-        )
-        .bind(release_id)
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap();
-
-        let distinct: i64 = stats.get("distinct_track_totals");
-        let total_tracks: i64 = stats.get("total_tracks");
-        let with_sources: i64 = stats.get("tracks_with_sources");
-
-        assert_eq!(
-            distinct, 2,
-            "two distinct track_total values = disagreement"
-        );
-        assert_eq!(total_tracks, 2);
-        assert_eq!(with_sources, 2);
-
-        // Single disc → release_disc_total = 1 → unanimous check bail out correctly
-        let source_data = sqlx::query(
-            "SELECT s.file_path, s.track_total,
-                    m.position AS disc_position,
-                    (SELECT MAX(m3.position) FROM medium m3
-                     WHERE m3.release_id = m.release_id) AS disc_total
-             FROM medium m
-             JOIN track t ON t.medium_id = m.id
-             JOIN source s ON s.recording_id = t.recording_id
-             WHERE m.release_id = ? AND s.track_total IS NOT NULL
-             ORDER BY s.track_total, m.position, s.file_path",
-        )
-        .bind(release_id)
-        .fetch_all(&mut *conn)
-        .await
-        .unwrap();
-
-        let release_disc_total: Option<i64> = source_data.first().and_then(|r| r.get("disc_total"));
-        assert_eq!(
-            release_disc_total,
-            Some(1),
-            "single disc, unanimous check bails out"
-        );
-    }
-
-    /// Regression: multi-disc release where sources unanimously claim more tracks
-    /// per disc than the DB has should produce Incomplete with phantom tracks,
-    /// not "Complete" (which was the false result from `with_sources >= total_tracks`
-    /// ignoring the phantom track).
-    #[tokio::test]
-    async fn test_multi_disc_phantom_tracks() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let pool = crate::db::init_pool(&db_path).await.unwrap();
-        let mut conn = pool.acquire("test".to_string()).await.unwrap();
-
-        let rg_id = "rg-phantom";
-        let release_id = "rel-phantom";
-
-        sqlx::query("INSERT INTO release_group (id, title) VALUES (?, ?)")
-            .bind(rg_id)
-            .bind("Test RG")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO release (id, release_group_id, title) VALUES (?, ?, ?)")
-            .bind(release_id)
-            .bind(rg_id)
-            .bind("Test Release")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-
-        // Disc 1: 3 tracks in DB, sources claim track_total=4 (phantom Track 4)
-        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('mp1', ?, 1)")
-            .bind(release_id)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        // Disc 2: 2 tracks in DB, sources claim track_total=2 (matches)
-        sqlx::query("INSERT INTO medium (id, release_id, position) VALUES ('mp2', ?, 2)")
-            .bind(release_id)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-
-        for i in 1..=3 {
-            let rec_id = format!("rec-p1-{i}");
-            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
-                .bind(&rec_id)
-                .bind(format!("P1 Track {i}"))
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO track (id, medium_id, recording_id, position) \
-                 VALUES (?, 'mp1', ?, ?)",
-            )
-            .bind(format!("trk-p1-{i}"))
-            .bind(&rec_id)
-            .bind(i)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
-                 VALUES (?, ?, 'local_file', ?, 4)",
-            )
-            .bind(format!("src-p1-{i}"))
-            .bind(&rec_id)
-            .bind(format!("/p1/track{i}.mp3"))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        }
-
-        for i in 1..=2 {
-            let rec_id = format!("rec-p2-{i}");
-            sqlx::query("INSERT INTO recording (id, title) VALUES (?, ?)")
-                .bind(&rec_id)
-                .bind(format!("P2 Track {i}"))
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            sqlx::query(
-                "INSERT INTO track (id, medium_id, recording_id, position) \
-                 VALUES (?, 'mp2', ?, ?)",
-            )
-            .bind(format!("trk-p2-{i}"))
-            .bind(&rec_id)
-            .bind(i)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO source (id, recording_id, source_type, file_path, track_total) \
-                 VALUES (?, ?, 'local_file', ?, 2)",
-            )
-            .bind(format!("src-p2-{i}"))
-            .bind(&rec_id)
-            .bind(format!("/p2/track{i}.mp3"))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        }
-
-        // ── Step 1: Completeness query ──
-        let stats = sqlx::query(
-            "WITH release_source_stats AS (
-                SELECT
-                    t.id AS track_id,
-                    MAX(CASE WHEN s.id IS NOT NULL THEN 1 ELSE 0 END) AS has_source,
-                    MAX(s.track_total) AS source_track_total
-                FROM medium m
-                JOIN track t ON t.medium_id = m.id
-                LEFT JOIN source s ON s.recording_id = t.recording_id
-                WHERE m.release_id = ?
-                GROUP BY t.id
-            )
-            SELECT
-                COUNT(DISTINCT source_track_total) AS distinct_track_totals,
-                COUNT(*) AS total_tracks,
-                COALESCE(SUM(has_source), 0) AS tracks_with_sources
-            FROM release_source_stats",
-        )
-        .bind(release_id)
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap();
-
-        let distinct: i64 = stats.get("distinct_track_totals");
-        let total_tracks: i64 = stats.get("total_tracks");
-        let with_sources: i64 = stats.get("tracks_with_sources");
-
-        assert_eq!(distinct, 2);
-        assert_eq!(total_tracks, 5, "5 DB tracks");
-        assert_eq!(with_sources, 5, "all DB tracks have sources");
-
-        // ── Step 2: Source_data query ──
-        let source_data = sqlx::query(
-            "SELECT s.file_path, s.track_total,
-                    m.position AS disc_position,
-                    (SELECT MAX(m3.position) FROM medium m3
-                     WHERE m3.release_id = m.release_id) AS disc_total
-             FROM medium m
-             JOIN track t ON t.medium_id = m.id
-             JOIN source s ON s.recording_id = t.recording_id
-             WHERE m.release_id = ? AND s.track_total IS NOT NULL
-             ORDER BY s.track_total, m.position, s.file_path",
-        )
-        .bind(release_id)
-        .fetch_all(&mut *conn)
-        .await
-        .unwrap();
-
-        let release_disc_total: Option<i64> = source_data.first().and_then(|r| r.get("disc_total"));
-        assert_eq!(release_disc_total, Some(2));
-
-        // ── Step 3: Replicate unanimous check ──
-        let mut disc_map: BTreeMap<i64, BTreeMap<i64, usize>> = BTreeMap::new();
-        for row in &source_data {
-            if let Some(dp) = row.get::<Option<i64>, _>("disc_position") {
-                let tt: i64 = row.get("track_total");
-                *disc_map.entry(dp).or_default().entry(tt).or_default() += 1;
-            }
-        }
-
-        assert_eq!(disc_map.len(), 2);
-        assert!(
-            disc_map.values().all(|tts| tts.len() == 1),
-            "unanimous per disc"
-        );
-
-        // ── Step 4: Per-disc actuals comparison ──
-        let disc_actuals: Vec<(i64, i64)> = sqlx::query(
-            "SELECT m.position, COUNT(t.id) AS track_count
-             FROM medium m
-             JOIN track t ON t.medium_id = m.id
-             WHERE m.release_id = ?
-             GROUP BY m.position
-             ORDER BY m.position",
-        )
-        .bind(release_id)
-        .fetch_all(&mut *conn)
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| (row.get("position"), row.get("track_count")))
-        .collect();
-
-        // Disc 1: claimed=4, actual=3 → mismatch.  Disc 2: claimed=2, actual=2 → match.
-        let all_match = disc_actuals.iter().all(|(pos, actual_count)| {
-            disc_map
-                .get(pos)
-                .and_then(|tts| tts.keys().next())
-                .map(|&claimed| claimed == *actual_count)
-                .unwrap_or(false)
-        });
-        assert!(!all_match, "disc 1 claimed 4 but DB has 3 — mismatch");
-
-        let has_deficit = disc_actuals.iter().any(|(pos, actual_count)| {
-            disc_map
-                .get(pos)
-                .and_then(|tts| tts.keys().next())
-                .map(|&claimed| claimed < *actual_count)
-                .unwrap_or(false)
-        });
-        assert!(!has_deficit, "no disc with source claims below DB count");
-
-        // ── Step 5: Phantom track detection ──
-        let mut phantom_found: Vec<(i64, i64)> = Vec::new();
-        for (pos, actual_count) in &disc_actuals {
-            if let Some(claimed_count) = disc_map.get(pos).and_then(|tts| tts.keys().next()) {
-                if *claimed_count > *actual_count {
-                    let positions: Vec<i64> = sqlx::query(
-                        "WITH RECURSIVE positions(n) AS (
-                            SELECT 1
-                            UNION ALL
-                            SELECT n + 1 FROM positions WHERE n < ?
-                        )
-                        SELECT p.n AS track_position
-                        FROM positions p
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM track t
-                            JOIN medium m2 ON t.medium_id = m2.id
-                            WHERE m2.release_id = ?
-                              AND m2.position = ?
-                              AND t.position = p.n
-                        )
-                        ORDER BY p.n",
-                    )
-                    .bind(claimed_count)
-                    .bind(release_id)
-                    .bind(pos)
-                    .fetch_all(&mut *conn)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .map(|row| row.get("track_position"))
-                    .collect();
-
-                    for tp in positions {
-                        phantom_found.push((*pos, tp));
-                    }
-                }
-            }
-        }
-
-        assert_eq!(
-            phantom_found,
-            vec![(1, 4)],
-            "disc 1 track 4 should be phantom"
-        );
     }
 }

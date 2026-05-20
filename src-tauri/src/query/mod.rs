@@ -2,7 +2,6 @@ use anyhow::{bail, Context};
 use pest::iterators::Pair;
 use pest::Parser;
 use pest_derive::Parser;
-use std::fmt::Write;
 
 // ── Pest parser ───────────────────────────────────────────────────────────────
 
@@ -112,15 +111,6 @@ pub fn parse(input: &str) -> anyhow::Result<ParsedQuery> {
         expr: expr.context("missing expression")?,
         limit,
     })
-}
-
-/// Compile a parsed query to a SQL WHERE clause fragment suitable for use in
-/// `SELECT … FROM smart_playlist_view WHERE {where_sql}`.
-/// Returns `(where_sql, limit)`.
-pub fn compile(query: &ParsedQuery) -> (String, Option<Limit>) {
-    let mut where_sql = String::new();
-    compile_expr(&query.expr, &mut where_sql);
-    (where_sql, query.limit.clone())
 }
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
@@ -322,181 +312,6 @@ fn extract_string(pair: Pair<Rule>) -> anyhow::Result<String> {
         Rule::ident => Ok(inner.as_str().to_owned()),
         r => bail!("string: unexpected rule {:?}", r),
     }
-}
-
-// ── SQL compiler ──────────────────────────────────────────────────────────────
-
-/// Escape a string value for safe embedding in a SQL literal.
-/// Doubles any single-quote characters.
-fn sql_esc(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-fn cmp_op_sql(op: CmpOp) -> &'static str {
-    match op {
-        CmpOp::Gte => ">=",
-        CmpOp::Lte => "<=",
-        CmpOp::Gt => ">",
-        CmpOp::Lt => "<",
-        CmpOp::Eq => "=",
-        CmpOp::Ne => "!=",
-    }
-}
-
-fn compile_expr(expr: &Expr, out: &mut String) {
-    match expr {
-        Expr::And(a, b) => {
-            write!(out, "(").unwrap();
-            compile_expr(a, out);
-            write!(out, " AND ").unwrap();
-            compile_expr(b, out);
-            write!(out, ")").unwrap();
-        }
-        Expr::Or(a, b) => {
-            write!(out, "(").unwrap();
-            compile_expr(a, out);
-            write!(out, " OR ").unwrap();
-            compile_expr(b, out);
-            write!(out, ")").unwrap();
-        }
-        Expr::Not(e) => {
-            write!(out, "NOT (").unwrap();
-            compile_expr(e, out);
-            write!(out, ")").unwrap();
-        }
-        Expr::Pred(pred) => compile_predicate(pred, out),
-    }
-}
-
-fn compile_predicate(pred: &Predicate, out: &mut String) {
-    match pred {
-        Predicate::RatingNull => {
-            write!(out, "rating IS NULL").unwrap();
-        }
-        Predicate::Rating(op, n) => {
-            write!(out, "rating {} {}", cmp_op_sql(*op), n).unwrap();
-        }
-        Predicate::AlbumRating(op, n) => {
-            write!(out, "album_rating {} {}", cmp_op_sql(*op), n).unwrap();
-        }
-        Predicate::LastPlayed(dir, n, unit) => {
-            let sql_unit = match unit {
-                TimeUnit::Days => "days",
-                TimeUnit::Weeks => "days", // SQLite uses days
-                TimeUnit::Months => "months",
-                TimeUnit::Years => "years",
-            };
-            // For Weeks, multiply n by 7
-            let n_adjusted = match unit {
-                TimeUnit::Weeks => n * 7,
-                _ => *n,
-            };
-            match dir {
-                LastPlayedDir::InLast => {
-                    write!(
-                        out,
-                        "(last_played IS NOT NULL AND last_played >= datetime('now', '-{} {}'))",
-                        n_adjusted, sql_unit
-                    )
-                    .unwrap();
-                }
-                LastPlayedDir::NotInLast => {
-                    write!(
-                        out,
-                        "(last_played IS NULL OR last_played < datetime('now', '-{} {}'))",
-                        n_adjusted, sql_unit
-                    )
-                    .unwrap();
-                }
-            }
-        }
-        Predicate::PlayCount(op, n) => {
-            write!(out, "play_count {} {}", cmp_op_sql(*op), n).unwrap();
-        }
-        Predicate::InPlaylist(name) => {
-            write!(
-                out,
-                "id IN (SELECT pt.recording_id FROM playlist_track pt \
-                 JOIN playlist p ON p.id = pt.playlist_id WHERE p.name = '{}')",
-                sql_esc(name)
-            )
-            .unwrap();
-        }
-        Predicate::NotInPlaylist(name) => {
-            write!(
-                out,
-                "id NOT IN (SELECT pt.recording_id FROM playlist_track pt \
-                 JOIN playlist p ON p.id = pt.playlist_id WHERE p.name = '{}')",
-                sql_esc(name)
-            )
-            .unwrap();
-        }
-        Predicate::HasTag(tag) => {
-            write!(
-                out,
-                "id IN (SELECT recording_id FROM recording_tag WHERE tag = '{}')",
-                sql_esc(tag)
-            )
-            .unwrap();
-        }
-        Predicate::Title(op, s) => match op {
-            StrOp::Contains => write!(
-                out,
-                "lower(title) LIKE '%{}%' ESCAPE '\\'",
-                sql_like_esc(&s.to_lowercase())
-            )
-            .unwrap(),
-            StrOp::Is => write!(out, "lower(title) = '{}'", sql_esc(&s.to_lowercase())).unwrap(),
-        },
-        Predicate::Genre(op, s) => match op {
-            StrOp::Contains => write!(
-                out,
-                "(genre IS NOT NULL AND lower(genre) LIKE '%{}%' ESCAPE '\\')",
-                sql_like_esc(&s.to_lowercase())
-            )
-            .unwrap(),
-            StrOp::Is => write!(out, "lower(genre) = '{}'", sql_esc(&s.to_lowercase())).unwrap(),
-        },
-        Predicate::Artist(op, s) => {
-            // smart_playlist_view doesn't include artist name — use a subquery
-            let pattern = match op {
-                StrOp::Contains => {
-                    format!("LIKE '%{}%' ESCAPE '\\'", sql_like_esc(&s.to_lowercase()))
-                }
-                StrOp::Is => format!("= '{}'", sql_esc(&s.to_lowercase())),
-            };
-            write!(
-                out,
-                "id IN (SELECT ra.recording_id FROM recording_artist ra \
-                 JOIN artist a ON a.id = ra.artist_id \
-                 WHERE lower(COALESCE(ra.credited_as, a.name)) {})",
-                pattern
-            )
-            .unwrap();
-        }
-        Predicate::Year(op, n) => {
-            // smart_playlist_view doesn't include year — use a subquery
-            write!(
-                out,
-                "id IN (SELECT DISTINCT t.recording_id FROM track t \
-                 JOIN medium m ON m.id = t.medium_id \
-                 JOIN release rel ON rel.id = m.release_id \
-                 WHERE rel.release_date IS NOT NULL \
-                 AND CAST(substr(rel.release_date, 1, 4) AS INTEGER) {} {})",
-                cmp_op_sql(*op),
-                n
-            )
-            .unwrap();
-        }
-    }
-}
-
-/// Escape special LIKE pattern characters %, _, \.
-fn sql_like_esc(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-        .replace('\'', "''")
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

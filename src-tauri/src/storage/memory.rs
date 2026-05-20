@@ -24,6 +24,13 @@ struct RawSource {
     replay_gain_track_db: Option<f64>,
     replay_gain_track_peak: Option<f64>,
     tags: Vec<(String, String)>,
+    rating: Option<i64>,
+}
+
+impl RawSource {
+    fn rating(&self) -> Option<f64> {
+        self.rating.map(|r| r as f64)
+    }
 }
 
 struct MemArtist {
@@ -58,12 +65,41 @@ struct MemRecording {
     track_position: Option<i64>,
     disc_position: Option<i64>,
     release_year: Option<String>,
-    // User data
-    rating: Option<i64>,
+    // User data (rating lives on sources; play data lives at recording level)
     play_count: i64,
     last_played: Option<String>,
     tags: Vec<String>,
-    album_rating: Option<f64>,
+}
+
+impl MemRecording {
+    /// Average of all source ratings for this recording.
+    fn avg_rating(&self) -> Option<f64> {
+        avg_f64(self.sources.iter().filter_map(|s| s.rating()))
+    }
+}
+
+// ── Hierarchical rating helpers ───────────────────────────────────────────────
+
+fn avg_f64(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let (sum, count) = values.fold((0.0f64, 0usize), |(s, c), v| (s + v, c + 1));
+    if count == 0 {
+        None
+    } else {
+        Some(sum / count as f64)
+    }
+}
+
+/// Release rating: average of all track ratings, all tracks equally weighted.
+/// In our model a track has exactly one recording, so this is the average of
+/// all recording avg_ratings in the release.
+fn release_avg_rating<'a>(recs: impl Iterator<Item = &'a MemRecording>) -> Option<f64> {
+    avg_f64(recs.filter_map(|r| r.avg_rating()))
+}
+
+/// Release group rating: average of its release ratings.
+/// We model one release per RG, so this delegates to release_avg_rating.
+fn rg_avg_rating(rg_indices: &[usize], all: &[MemRecording]) -> Option<f64> {
+    release_avg_rating(rg_indices.iter().map(|&i| &all[i]))
 }
 
 // ── Public catalog struct ─────────────────────────────────────────────────────
@@ -84,6 +120,50 @@ pub struct MemoryCatalog {
 }
 
 impl MemoryCatalog {
+    /// Returns the artist's name and sorted list of local-file source paths for all
+    /// recordings associated with the given artist ID.
+    pub fn source_paths_for_artist(&self, artist_id: &str) -> (Option<String>, Vec<String>) {
+        let name = self
+            .artists_by_id
+            .get(artist_id)
+            .map(|&i| self.artists[i].name.clone());
+        let mut paths: Vec<String> = Vec::new();
+        if let Some(rec_indices) = self.recordings_by_artist.get(artist_id) {
+            for &idx in rec_indices {
+                for src in &self.recordings[idx].sources {
+                    if src.source_type == "local_file" {
+                        if let Some(p) = &src.file_path {
+                            if !paths.contains(p) {
+                                paths.push(p.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        paths.sort();
+        (name, paths)
+    }
+
+    pub fn source_paths_for_release_group(&self, rg_id: &str) -> Vec<String> {
+        let mut paths: Vec<String> = Vec::new();
+        if let Some(rec_indices) = self.recordings_by_rg.get(rg_id) {
+            for &idx in rec_indices {
+                for src in &self.recordings[idx].sources {
+                    if src.source_type == "local_file" {
+                        if let Some(p) = &src.file_path {
+                            if !paths.contains(p) {
+                                paths.push(p.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        paths.sort();
+        paths
+    }
+
     pub async fn load_from_db(db: &DbPool) -> Result<Self> {
         let mut conn = db.acquire("memory_catalog.load").await?;
 
@@ -98,12 +178,12 @@ impl MemoryCatalog {
         let source_count = source_rows.len() as i64;
 
         // ── Load user data ────────────────────────────────────────────────────
-        let ratings: HashMap<String, i64> =
-            sqlx::query("SELECT recording_id, stars FROM user_rating")
+        let source_ratings: HashMap<String, i64> =
+            sqlx::query("SELECT source_id, stars FROM source_rating")
                 .fetch_all(&mut *conn)
                 .await?
                 .into_iter()
-                .map(|r| (r.get::<String, _>("recording_id"), r.get::<i64, _>("stars")))
+                .map(|r| (r.get::<String, _>("source_id"), r.get::<i64, _>("stars")))
                 .collect();
 
         let play_data: HashMap<String, (i64, String)> = sqlx::query(
@@ -136,19 +216,6 @@ impl MemoryCatalog {
                 .push(r.get::<String, _>("tag"));
         }
 
-        let album_ratings: HashMap<String, i64> =
-            sqlx::query("SELECT release_group_id, stars FROM release_group_rating")
-                .fetch_all(&mut *conn)
-                .await?
-                .into_iter()
-                .map(|r| {
-                    (
-                        r.get::<String, _>("release_group_id"),
-                        r.get::<i64, _>("stars"),
-                    )
-                })
-                .collect();
-
         let mut playlists: HashMap<String, HashSet<String>> = HashMap::new();
         for r in sqlx::query(
             "SELECT p.name, pt.recording_id
@@ -173,8 +240,10 @@ impl MemoryCatalog {
                 .as_deref()
                 .and_then(|j| serde_json::from_str(j).ok())
                 .unwrap_or_default();
+            let source_id: String = row.get("id");
+            let rating = source_ratings.get(&source_id).copied();
             let src = RawSource {
-                id: row.get("id"),
+                id: source_id,
                 source_type: row.get("source_type"),
                 file_path: row.get("file_path"),
                 format: row.get("format"),
@@ -182,6 +251,7 @@ impl MemoryCatalog {
                 replay_gain_track_db: row.get("replay_gain_track_db"),
                 replay_gain_track_peak: row.get("replay_gain_track_peak"),
                 tags,
+                rating,
             };
             rec_sources
                 .entry(row.get::<String, _>("recording_id"))
@@ -330,7 +400,6 @@ impl MemoryCatalog {
                 .and_then(|s| s.trim().parse::<i64>().ok());
 
             // User data
-            let rating = ratings.get(&recording_id).copied();
             let (play_count, last_played) = play_data
                 .get(&recording_id)
                 .map(|(c, d)| (*c, Some(d.clone())))
@@ -339,11 +408,6 @@ impl MemoryCatalog {
                 .get(&recording_id)
                 .cloned()
                 .unwrap_or_default();
-            let album_rating = release_group_id
-                .as_ref()
-                .and_then(|id| album_ratings.get(id))
-                .map(|s| *s as f64);
-
             recordings.push(MemRecording {
                 id: recording_id,
                 title,
@@ -360,11 +424,9 @@ impl MemoryCatalog {
                 track_position,
                 disc_position,
                 release_year,
-                rating,
                 play_count,
                 last_played,
                 tags,
-                album_rating,
             });
         }
 
@@ -607,13 +669,20 @@ fn eval_expr(
     expr: &Expr,
     rec: &MemRecording,
     playlists: &HashMap<String, HashSet<String>>,
+    rg_avg_ratings: &HashMap<String, f64>,
     now: i64,
 ) -> bool {
     match expr {
-        Expr::And(a, b) => eval_expr(a, rec, playlists, now) && eval_expr(b, rec, playlists, now),
-        Expr::Or(a, b) => eval_expr(a, rec, playlists, now) || eval_expr(b, rec, playlists, now),
-        Expr::Not(e) => !eval_expr(e, rec, playlists, now),
-        Expr::Pred(pred) => eval_pred(pred, rec, playlists, now),
+        Expr::And(a, b) => {
+            eval_expr(a, rec, playlists, rg_avg_ratings, now)
+                && eval_expr(b, rec, playlists, rg_avg_ratings, now)
+        }
+        Expr::Or(a, b) => {
+            eval_expr(a, rec, playlists, rg_avg_ratings, now)
+                || eval_expr(b, rec, playlists, rg_avg_ratings, now)
+        }
+        Expr::Not(e) => !eval_expr(e, rec, playlists, rg_avg_ratings, now),
+        Expr::Pred(pred) => eval_pred(pred, rec, playlists, rg_avg_ratings, now),
     }
 }
 
@@ -621,14 +690,20 @@ fn eval_pred(
     pred: &Predicate,
     rec: &MemRecording,
     playlists: &HashMap<String, HashSet<String>>,
+    rg_avg_ratings: &HashMap<String, f64>,
     now: i64,
 ) -> bool {
     match pred {
-        Predicate::RatingNull => rec.rating.is_none(),
-        Predicate::Rating(op, n) => rec.rating.map(|r| apply_cmp(*op, r, *n)).unwrap_or(false),
+        Predicate::RatingNull => rec.avg_rating().is_none(),
+        Predicate::Rating(op, n) => rec
+            .avg_rating()
+            .map(|r| apply_cmp(*op, r.round() as i64, *n))
+            .unwrap_or(false),
         Predicate::AlbumRating(op, n) => rec
-            .album_rating
-            .map(|r| apply_cmp(*op, r as i64, *n))
+            .release_group_id
+            .as_ref()
+            .and_then(|id| rg_avg_ratings.get(id))
+            .map(|&r| apply_cmp(*op, r as i64, *n))
             .unwrap_or(false),
         Predicate::PlayCount(op, n) => apply_cmp(*op, rec.play_count, *n),
         Predicate::LastPlayed(dir, n, unit) => {
@@ -762,7 +837,7 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
         primary_artist_id: rec.primary_artist_id.clone(),
         artist_credit_name: rec.artist_credit_name.clone(),
         genre: rec.genre.clone(),
-        rating: rec.rating,
+        rating: rec.avg_rating(),
         play_count: rec.play_count,
         last_played: rec.last_played.clone(),
         primary_source_id: primary_source.map(|s| s.id.clone()),
@@ -799,15 +874,11 @@ impl super::CatalogReader for MemoryCatalog {
                     .get(&a.id)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let ratings: Vec<i64> = rec_indices
-                    .iter()
-                    .filter_map(|&i| self.recordings[i].rating)
-                    .collect();
-                let rating = if ratings.is_empty() {
-                    None
-                } else {
-                    Some(ratings.iter().sum::<i64>() as f64 / ratings.len() as f64)
-                };
+                let rating = avg_f64(
+                    rec_indices
+                        .iter()
+                        .filter_map(|&i| self.recordings[i].avg_rating()),
+                );
                 let last_played = rec_indices
                     .iter()
                     .filter_map(|&i| self.recordings[i].last_played.clone())
@@ -871,15 +942,7 @@ impl super::CatalogReader for MemoryCatalog {
                     .get(&rg.id)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let ratings: Vec<i64> = rec_indices
-                    .iter()
-                    .filter_map(|&i| self.recordings[i].rating)
-                    .collect();
-                let rating = if ratings.is_empty() {
-                    None
-                } else {
-                    Some(ratings.iter().sum::<i64>() as f64 / ratings.len() as f64)
-                };
+                let rating = rg_avg_rating(rec_indices, &self.recordings);
                 let last_played = rec_indices
                     .iter()
                     .filter_map(|&i| self.recordings[i].last_played.clone())
@@ -923,10 +986,18 @@ impl super::CatalogReader for MemoryCatalog {
         let parsed = crate::query::parse(query)?;
         let now = now_unix();
 
+        let rg_avg_ratings: HashMap<String, f64> = self
+            .recordings_by_rg
+            .iter()
+            .filter_map(|(rg_id, indices)| {
+                rg_avg_rating(indices, &self.recordings).map(|r| (rg_id.clone(), r))
+            })
+            .collect();
+
         let mut recordings: Vec<RecordingRow> = self
             .recordings
             .iter()
-            .filter(|rec| eval_expr(&parsed.expr, rec, &self.playlists, now))
+            .filter(|rec| eval_expr(&parsed.expr, rec, &self.playlists, &rg_avg_ratings, now))
             .map(|rec| mem_recording_to_row(rec, self))
             .collect();
 
@@ -979,15 +1050,11 @@ impl super::CatalogReader for MemoryCatalog {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        let ratings: Vec<i64> = rec_indices
-            .iter()
-            .filter_map(|&i| self.recordings[i].rating)
-            .collect();
-        let rating = if ratings.is_empty() {
-            None
-        } else {
-            Some(ratings.iter().sum::<i64>() as f64 / ratings.len() as f64)
-        };
+        let rating = avg_f64(
+            rec_indices
+                .iter()
+                .filter_map(|&i| self.recordings[i].avg_rating()),
+        );
         let last_played = rec_indices
             .iter()
             .filter_map(|&i| self.recordings[i].last_played.clone())
@@ -1011,15 +1078,7 @@ impl super::CatalogReader for MemoryCatalog {
                     .get(&rg.id)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let rg_ratings: Vec<i64> = rg_recs
-                    .iter()
-                    .filter_map(|&i| self.recordings[i].rating)
-                    .collect();
-                let rg_rating = if rg_ratings.is_empty() {
-                    None
-                } else {
-                    Some(rg_ratings.iter().sum::<i64>() as f64 / rg_ratings.len() as f64)
-                };
+                let rg_rating = rg_avg_rating(rg_recs, &self.recordings);
                 ArtistReleaseGroup {
                     id: rg.id.clone(),
                     title: rg.title.clone(),
@@ -1107,16 +1166,7 @@ impl super::CatalogReader for MemoryCatalog {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        // Aggregate RG-level stats
-        let ratings: Vec<i64> = rec_indices
-            .iter()
-            .filter_map(|&i| self.recordings[i].rating)
-            .collect();
-        let rating = if ratings.is_empty() {
-            None
-        } else {
-            Some(ratings.iter().sum::<i64>() as f64 / ratings.len() as f64)
-        };
+        let rating = rg_avg_rating(rec_indices, &self.recordings);
         let last_played = rec_indices
             .iter()
             .filter_map(|&i| self.recordings[i].last_played.clone())
@@ -1322,7 +1372,7 @@ impl super::CatalogReader for MemoryCatalog {
             artist_credit_text: None,
             mbid: None,
             acoustid: None,
-            rating: rec.rating,
+            rating: rec.avg_rating(),
             play_count: rec.play_count,
             last_played: rec.last_played.clone(),
             artists,

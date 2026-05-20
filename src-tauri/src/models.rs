@@ -148,7 +148,7 @@ pub struct RecordingRow {
     pub primary_artist_id: Option<String>,
     pub artist_credit_name: Option<String>,
     pub genre: Option<String>,
-    pub rating: Option<i64>,
+    pub rating: Option<f64>,
     pub play_count: i64,
     pub last_played: Option<String>,
     pub primary_source_id: Option<String>,
@@ -201,8 +201,8 @@ pub struct PlayHistoryInput {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RatingUpdateRequest {
-    pub id: String,
+pub struct SourceRatingUpdateRequest {
+    pub source_id: String,
     pub stars: Option<i64>,
 }
 
@@ -214,6 +214,7 @@ pub struct EntityRatingUpdate {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordingRatingUpdateResult {
+    pub recording: EntityRatingUpdate,
     pub release_groups: Vec<EntityRatingUpdate>,
     pub artists: Vec<EntityRatingUpdate>,
 }
@@ -461,7 +462,7 @@ pub struct RecordingDetail {
     pub artist_credit_text: Option<String>,
     pub mbid: Option<String>,
     pub acoustid: Option<String>,
-    pub rating: Option<i64>,
+    pub rating: Option<f64>,
     pub play_count: i64,
     pub last_played: Option<String>,
     pub artists: Vec<RecordingArtistInfo>,
@@ -504,11 +505,4 @@ pub struct CompoundArtistCheck {
     pub total_sources_checked: usize,
     pub individual_artist_names: Vec<String>,
     pub source_examples: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ArtistFixStats {
-    pub recordings_updated: usize,
-    pub release_groups_updated: usize,
-    pub compound_artist_deleted: bool,
 }
