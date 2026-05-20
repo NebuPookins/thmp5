@@ -521,21 +521,24 @@ pub(crate) async fn prepare_import(
         ))
         .await
         .context("Failed to acquire DB connection for import path check")?;
-    let existing_source = sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
-        "SELECT id, file_size, file_mtime_ms FROM source WHERE file_path = ?",
+    let existing_source = sqlx::query_as::<_, (String, Option<i64>, Option<i64>, bool)>(
+        "SELECT id, file_size, file_mtime_ms, raw_tags_json IS NOT NULL FROM source WHERE file_path = ?",
     )
     .bind(&path_str)
     .fetch_optional(&mut *conn)
     .await
     .context("DB error checking existing path")?;
 
-    if let Some((_, existing_size, existing_mtime_ms)) = &existing_source {
-        if existing_size == &Some(file_size) && existing_mtime_ms == &Some(file_mtime_ms) {
+    if let Some((_, existing_size, existing_mtime_ms, has_raw_tags)) = &existing_source {
+        if existing_size == &Some(file_size)
+            && existing_mtime_ms == &Some(file_mtime_ms)
+            && *has_raw_tags
+        {
             return Ok(None);
         }
     }
 
-    let existing_source_id = existing_source.as_ref().map(|(id, _, _)| id.as_str());
+    let existing_source_id = existing_source.as_ref().map(|(id, _, _, _)| id.as_str());
     drop(conn);
 
     struct BlockingResult {
