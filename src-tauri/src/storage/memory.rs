@@ -639,10 +639,28 @@ fn deduplicate_raw_tags(
             continue;
         }
 
+        // ── Trailing-null resolution (generic, all frame types) ───────────
+        // Some taggers write a trailing NUL byte; if the only difference
+        // between duplicate entries is a trailing NUL, prefer the clean value.
+        let trimmed: Vec<&str> = values.iter().map(|v| v.trim_end_matches('\0')).collect();
+        let trimmed_set: std::collections::BTreeSet<&str> = trimmed.iter().copied().collect();
+        if trimmed_set.len() == 1 {
+            // Equivalent after stripping nulls — pick the non-null value.
+            let preferred = values
+                .iter()
+                .find(|v| !v.ends_with('\0'))
+                .map(|v| v.as_str())
+                .unwrap_or(trimmed[0]);
+            result.push((frame_id.clone(), preferred.to_string()));
+            continue;
+        }
+
         // ── TRCK special handling ─────────────────────────────────────────
         if frame_id == "TRCK" {
+            // Parse each distinct (trimmed) value as a track string.
+            let distinct_trimmed: Vec<&str> = trimmed_set.iter().copied().collect();
             let parsed: Vec<(Option<i64>, Option<i64>)> =
-                values.iter().map(|v| parse_trck(v)).collect();
+                distinct_trimmed.iter().map(|v| parse_trck(v)).collect();
             let ns: Vec<i64> = parsed.iter().filter_map(|(n, _)| *n).collect();
             let ms: Vec<i64> = parsed.iter().filter_map(|(_, m)| *m).collect();
             let ns_ok = ns.len() <= 1 || ns.iter().all(|&x| x == ns[0]);
@@ -671,8 +689,11 @@ fn deduplicate_raw_tags(
         let distinct: Vec<String> = {
             let mut seen = Vec::new();
             for v in values {
-                if !seen.contains(v) {
-                    seen.push(v.clone());
+                // Normalise trailing NUL so the issue message doesn't show
+                // confusing "\0" differences when the real conflict is elsewhere.
+                let normalised = v.trim_end_matches('\0').to_string();
+                if !seen.contains(&normalised) {
+                    seen.push(normalised);
                 }
             }
             seen
