@@ -331,8 +331,16 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
       if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); onBack(); }
       if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); onForward(); }
     }
+    function handleMouseUp(e: MouseEvent) {
+      if (e.button === 3) { e.preventDefault(); onBack(); }
+      if (e.button === 4) { e.preventDefault(); onForward(); }
+    }
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
   }, [onBack, onForward]);
 
   function artistLink(id: string, name: string) {
