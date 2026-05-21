@@ -142,6 +142,54 @@ impl FileIssueLog {
             .unwrap_or_default()
     }
 
+    /// Report that a source file has two or more raw tag entries with the same
+    /// frame ID but different values (e.g., two consecutive ID3v2 tags that
+    /// disagree).  Values should be the distinct raw values found, in file order.
+    pub fn push_duplicate_raw_tag(
+        &self,
+        file_path: impl Into<String>,
+        frame_id: impl Into<String>,
+        field_name: impl Into<String>,
+        values: Vec<String>,
+    ) {
+        let file_path = file_path.into();
+        let frame_id = frame_id.into();
+        let field_name = field_name.into();
+        if let Ok(mut issues) = self.issues.lock() {
+            // Dedup against existing DuplicateFrame issues for the same file+frame.
+            if issues.iter().any(|i| {
+                i.file_path == file_path
+                    && i.kind == FileIssueKind::DuplicateFrame
+                    && i.frame_id.as_deref() == Some(&frame_id)
+            }) {
+                return;
+            }
+            let value_list = values
+                .iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (first, last) = (
+                values.first().cloned().unwrap_or_default(),
+                values.last().cloned().unwrap_or_default(),
+            );
+            issues.push(FileIssue {
+                file_path,
+                kind: FileIssueKind::DuplicateFrame,
+                message: format!(
+                    "ID3v2 {field_name} (frame {frame_id}) appears {n} times with different values: {value_list}",
+                    n = values.len(),
+                ),
+                source_id: None,
+                recording_id: None,
+                frame_id: Some(frame_id),
+                field_name: Some(field_name),
+                lofty_value: Some(last),
+                corrected_value: Some(first),
+            });
+        }
+    }
+
     /// Remove issues that don't satisfy the predicate.
     pub fn retain<F>(&self, f: F)
     where

@@ -602,8 +602,11 @@ pub fn get_db_pool_debug_snapshot(
 }
 
 #[tauri::command]
-pub fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssue>, String> {
-    Ok(state.file_issues.all())
+pub async fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssue>, String> {
+    let mut issues = state.file_issues.all();
+    let catalog = state.catalog.read().await;
+    issues.extend(catalog.file_issues());
+    Ok(issues)
 }
 
 /// Fix an orphan source by re-scanning its file metadata and re-creating the

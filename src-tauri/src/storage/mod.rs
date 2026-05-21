@@ -1,5 +1,6 @@
 pub mod memory;
 
+use crate::file_issues::FileIssue;
 use crate::models::{
     ArtistDetail, ArtistRow, LibrarySummary, RecordingDetail, RecordingRow, ReleaseGroupDetail,
     ReleaseGroupRow, SmartPlaylistResult,
@@ -49,6 +50,12 @@ impl Catalog {
     pub fn source_paths_for_release_group(&self, rg_id: &str) -> Vec<String> {
         match self {
             Catalog::Memory(c) => c.source_paths_for_release_group(rg_id),
+        }
+    }
+
+    pub fn file_issues(&self) -> Vec<FileIssue> {
+        match self {
+            Catalog::Memory(c) => c.file_issues().to_vec(),
         }
     }
 }

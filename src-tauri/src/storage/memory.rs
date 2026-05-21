@@ -1,4 +1,6 @@
 use crate::db::DbPool;
+use crate::file_issues::FileIssue;
+use crate::library::scanner::frame_id_to_field_name;
 use crate::models::{
     ArtistDetail, ArtistReleaseGroup, ArtistRow, GuestAppearanceReleaseGroup, GuestAppearanceTrack,
     LibrarySummary, MediumDetail, MissingTrackDetail, RecordingArtistInfo, RecordingDetail,
@@ -135,6 +137,8 @@ pub struct MemoryCatalog {
     rg_disc_totals: HashMap<String, i64>,
     playlists: HashMap<String, HashSet<String>>,
     source_count: i64,
+    /// File issues derived from source metadata (e.g. duplicate tag frames).
+    file_issues: Vec<FileIssue>,
 }
 
 impl MemoryCatalog {
@@ -180,6 +184,12 @@ impl MemoryCatalog {
         }
         paths.sort();
         paths
+    }
+
+    /// File issues derived from source-metadata analysis (e.g. duplicate
+    /// ID3v2 tag frames) during the catalog rebuild.
+    pub fn file_issues(&self) -> &[FileIssue] {
+        &self.file_issues
     }
 
     pub async fn load_from_db(db: &DbPool) -> Result<Self> {
@@ -252,13 +262,24 @@ impl MemoryCatalog {
 
         // ── Group sources by recording_id ─────────────────────────────────────
         let mut rec_sources: HashMap<String, Vec<RawSource>> = HashMap::new();
+        let mut all_issues: Vec<FileIssue> = Vec::new();
         for row in source_rows {
             let raw_json: Option<String> = row.get("raw_tags_json");
-            let tags: Vec<(String, String)> = raw_json
+            let raw_tags: Vec<(String, String)> = raw_json
                 .as_deref()
                 .and_then(|j| serde_json::from_str(j).ok())
                 .unwrap_or_default();
             let source_id: String = row.get("id");
+            let file_path: Option<String> = row.get("file_path");
+
+            // Deduplicate raw tags that appear multiple times (consecutive ID3v2
+            // tags), so that downstream logic sees a single coherent value.
+            let (tags, dedup_issues) = file_path
+                .as_deref()
+                .map(|fp| deduplicate_raw_tags(fp, &source_id, &raw_tags))
+                .unwrap_or_else(|| (raw_tags, Vec::new()));
+            all_issues.extend(dedup_issues);
+
             let rating = source_ratings.get(&source_id).copied();
             let (play_count, last_played) = source_play_data
                 .get(&source_id)
@@ -560,6 +581,7 @@ impl MemoryCatalog {
             rg_disc_totals,
             playlists,
             source_count,
+            file_issues: all_issues,
         })
     }
 }
@@ -581,6 +603,104 @@ fn parse_trck(s: &str) -> (Option<i64>, Option<i64>) {
 fn parse_trck_total(s: &str) -> Option<i64> {
     s.split_once('/')
         .and_then(|(_, p)| p.trim().parse::<i64>().ok())
+}
+
+/// Resolve duplicate frame IDs in raw tag data (from consecutive ID3v2 tags).
+///
+/// When the same frame ID appears multiple times:
+/// - **TRCK**: if values are "N" and "N/M" with consistent N and M across all
+///   occurrences, silently take the "N/M" form so track_total is preserved.
+/// - Any other duplicate with identical values: deduplicate silently.
+/// - Any other duplicate with different values: emit a `FileIssue` and keep the
+///   first occurrence.
+///
+/// Returns (deduplicated_tags, newly_derived_file_issues).
+fn deduplicate_raw_tags(
+    file_path: &str,
+    source_id: &str,
+    tags: &[(String, String)],
+) -> (Vec<(String, String)>, Vec<FileIssue>) {
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (k, v) in tags {
+        if !groups.contains_key(k) {
+            order.push(k.clone());
+        }
+        groups.entry(k.clone()).or_default().push(v.clone());
+    }
+
+    let mut result: Vec<(String, String)> = Vec::new();
+    let mut issues: Vec<FileIssue> = Vec::new();
+
+    for frame_id in &order {
+        let values = &groups[frame_id];
+        if values.len() == 1 {
+            result.push((frame_id.clone(), values[0].clone()));
+            continue;
+        }
+
+        // ── TRCK special handling ─────────────────────────────────────────
+        if frame_id == "TRCK" {
+            let parsed: Vec<(Option<i64>, Option<i64>)> =
+                values.iter().map(|v| parse_trck(v)).collect();
+            let ns: Vec<i64> = parsed.iter().filter_map(|(n, _)| *n).collect();
+            let ms: Vec<i64> = parsed.iter().filter_map(|(_, m)| *m).collect();
+            let ns_ok = ns.len() <= 1 || ns.iter().all(|&x| x == ns[0]);
+            let ms_ok = ms.len() <= 1 || ms.iter().all(|&x| x == ms[0]);
+
+            if ns_ok && ms_ok {
+                // Prefer the value that has a "/" (contains the total).
+                if let Some(with_total) = values.iter().find(|v| v.contains('/')) {
+                    result.push((frame_id.clone(), with_total.clone()));
+                } else {
+                    result.push((frame_id.clone(), values[0].clone()));
+                }
+                continue;
+            }
+            // Inconsistent N or M — fall through to generic duplicate reporting.
+        }
+
+        // ── All values identical ──────────────────────────────────────────
+        let all_same = values.iter().all(|v| v == &values[0]);
+        if all_same {
+            result.push((frame_id.clone(), values[0].clone()));
+            continue;
+        }
+
+        // ── Genuine conflict — emit issue and keep first ──────────────────
+        let distinct: Vec<String> = {
+            let mut seen = Vec::new();
+            for v in values {
+                if !seen.contains(v) {
+                    seen.push(v.clone());
+                }
+            }
+            seen
+        };
+        let field_name = frame_id_to_field_name(frame_id);
+        let value_list = distinct
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        issues.push(FileIssue {
+            file_path: file_path.to_string(),
+            kind: crate::file_issues::FileIssueKind::DuplicateFrame,
+            message: format!(
+                "ID3v2 {field_name} (frame {frame_id}) appears {n} times with different values: {value_list}",
+                n = distinct.len(),
+            ),
+            source_id: Some(source_id.to_string()),
+            recording_id: None,
+            frame_id: Some(frame_id.clone()),
+            field_name: Some(field_name.to_string()),
+            lofty_value: Some(distinct.last().cloned().unwrap_or_default()),
+            corrected_value: Some(distinct.first().cloned().unwrap_or_default()),
+        });
+        result.push((frame_id.clone(), values[0].clone()));
+    }
+
+    (result, issues)
 }
 
 /// SHA-256-based deterministic ID, prefixed with `kind`.
