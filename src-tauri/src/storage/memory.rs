@@ -25,6 +25,8 @@ struct RawSource {
     replay_gain_track_peak: Option<f64>,
     tags: Vec<(String, String)>,
     rating: Option<i64>,
+    play_count: i64,
+    last_played: Option<String>,
 }
 
 impl RawSource {
@@ -61,20 +63,36 @@ struct MemRecording {
     artist_ids: Vec<String>,
     all_artist_names: Vec<String>,
     // Release info
-    release_group_id: Option<String>,
+    release_group_assocs: Vec<MemReleaseGroupAssoc>,
+    tags: Vec<String>,
+}
+
+struct MemReleaseGroupAssoc {
+    rg_id: String,
     track_position: Option<i64>,
     disc_position: Option<i64>,
     release_year: Option<String>,
-    // User data (rating lives on sources; play data lives at recording level)
-    play_count: i64,
-    last_played: Option<String>,
-    tags: Vec<String>,
 }
 
 impl MemRecording {
     /// Average of all source ratings for this recording.
     fn avg_rating(&self) -> Option<f64> {
         avg_f64(self.sources.iter().filter_map(|s| s.rating()))
+    }
+
+    fn total_play_count(&self) -> i64 {
+        self.sources.iter().map(|s| s.play_count).sum()
+    }
+
+    fn last_played(&self) -> Option<&str> {
+        self.sources
+            .iter()
+            .filter_map(|s| s.last_played.as_deref())
+            .max()
+    }
+
+    fn assoc_for_rg(&self, rg_id: &str) -> Option<&MemReleaseGroupAssoc> {
+        self.release_group_assocs.iter().find(|a| a.rg_id == rg_id)
     }
 }
 
@@ -186,9 +204,9 @@ impl MemoryCatalog {
                 .map(|r| (r.get::<String, _>("source_id"), r.get::<i64, _>("stars")))
                 .collect();
 
-        let play_data: HashMap<String, (i64, String)> = sqlx::query(
-            "SELECT recording_id, COUNT(*) AS play_count, MAX(played_at) AS last_played
-             FROM play_history GROUP BY recording_id",
+        let source_play_data: HashMap<String, (i64, String)> = sqlx::query(
+            "SELECT source_id, COUNT(*) AS play_count, MAX(played_at) AS last_played
+             FROM play_history GROUP BY source_id",
         )
         .fetch_all(&mut *conn)
         .await?
@@ -197,7 +215,7 @@ impl MemoryCatalog {
             let last: Option<String> = r.get("last_played");
             last.map(|lp| {
                 (
-                    r.get::<String, _>("recording_id"),
+                    r.get::<String, _>("source_id"),
                     (r.get::<i64, _>("play_count"), lp),
                 )
             })
@@ -242,6 +260,10 @@ impl MemoryCatalog {
                 .unwrap_or_default();
             let source_id: String = row.get("id");
             let rating = source_ratings.get(&source_id).copied();
+            let (play_count, last_played) = source_play_data
+                .get(&source_id)
+                .map(|(c, d)| (*c, Some(d.clone())))
+                .unwrap_or((0, None));
             let src = RawSource {
                 id: source_id,
                 source_type: row.get("source_type"),
@@ -252,6 +274,8 @@ impl MemoryCatalog {
                 replay_gain_track_peak: row.get("replay_gain_track_peak"),
                 tags,
                 rating,
+                play_count,
+                last_played,
             };
             rec_sources
                 .entry(row.get::<String, _>("recording_id"))
@@ -285,7 +309,6 @@ impl MemoryCatalog {
             let comment = tag_first(canonical_tags, "COMM").map(str::to_string);
 
             let primary_artist_name = tag_first(canonical_tags, "TPE1").map(str::to_string);
-            let album_artist_name = tag_first(canonical_tags, "TPE2").map(str::to_string);
 
             // All artist names: TPE1 first, then semicolon-split TXXX:ARTISTS
             let mut all_artist_names: Vec<String> = Vec::new();
@@ -338,72 +361,71 @@ impl MemoryCatalog {
             let primary_artist_id = artist_ids.first().cloned();
             let artist_credit_name = primary_artist_name.clone();
 
-            // Derive release group
-            let album_title = tag_first(canonical_tags, "TALB").map(str::to_string);
-            let rg_artist_name = album_artist_name
-                .as_ref()
-                .or(primary_artist_name.as_ref())
-                .cloned();
+            // Derive release groups from ALL sources, deduplicated by rg_id
+            let mut release_group_assocs: Vec<MemReleaseGroupAssoc> = Vec::new();
+            let mut seen_rg_ids = HashSet::new();
+            for source in &sources {
+                let album_title = tag_first(&source.tags, "TALB").map(str::to_string);
+                let source_album_artist = tag_first(&source.tags, "TPE2")
+                    .map(str::to_string)
+                    .or_else(|| tag_first(&source.tags, "TPE1").map(str::to_string));
+                if let (Some(album), Some(rg_artist)) = (&album_title, &source_album_artist) {
+                    let rg_id = tag_first(&source.tags, "TXXX:MusicBrainz Release Group Id")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| name_hash("rg", &format!("{}|{}", album, rg_artist)));
 
-            let release_year = tag_first(canonical_tags, "TDRC")
-                .or_else(|| tag_first(canonical_tags, "TYER"))
-                .map(|s| s.chars().take(4).collect::<String>());
+                    if seen_rg_ids.insert(rg_id.clone()) {
+                        let track_pos = tag_first(&source.tags, "TRCK")
+                            .map(parse_trck)
+                            .and_then(|(pos, _)| pos);
+                        let disc_pos = tag_first(&source.tags, "TPOS")
+                            .and_then(|s| s.split('/').next())
+                            .and_then(|s| s.trim().parse::<i64>().ok());
+                        let release_year = tag_first(&source.tags, "TDRC")
+                            .or_else(|| tag_first(&source.tags, "TYER"))
+                            .map(|s| s.chars().take(4).collect::<String>());
 
-            let release_group_id =
-                album_title
-                    .as_ref()
-                    .zip(rg_artist_name.as_ref())
-                    .map(|(album, artist)| {
-                        tag_first(canonical_tags, "TXXX:MusicBrainz Release Group Id")
-                            .map(str::to_string)
-                            .unwrap_or_else(|| name_hash("rg", &format!("{}|{}", album, artist)))
-                    });
-
-            if let Some(rg_id) = &release_group_id {
-                let rg_entry = rg_map.entry(rg_id.clone()).or_insert_with(|| {
-                    let rg_artist_id = rg_artist_name.as_ref().map(|n| {
-                        if primary_artist_name.as_ref() == Some(n) {
-                            primary_artist_id
-                                .clone()
-                                .unwrap_or_else(|| name_hash("artist", n))
-                        } else {
-                            primary_mbid
-                                .map(str::to_string)
-                                .unwrap_or_else(|| name_hash("artist", n))
-                        }
-                    });
-                    MemReleaseGroup {
-                        id: rg_id.clone(),
-                        title: album_title.clone().unwrap_or_default(),
-                        artist_id: rg_artist_id,
-                        artist_credit_name: rg_artist_name.clone(),
-                        release_date: None, // filled in below
-                    }
-                });
-                // Update release_date with minimum (earliest)
-                if let Some(yr) = &release_year {
-                    if !yr.is_empty() {
-                        rg_entry.release_date = Some(match &rg_entry.release_date {
-                            Some(existing) => existing.min(yr).clone(),
-                            None => yr.clone(),
+                        release_group_assocs.push(MemReleaseGroupAssoc {
+                            rg_id: rg_id.clone(),
+                            track_position: track_pos,
+                            disc_position: disc_pos,
+                            release_year: release_year.clone(),
                         });
+
+                        // Register in rg_map
+                        let rg_entry = rg_map.entry(rg_id.clone()).or_insert_with(|| {
+                            let rg_artist_id = source_album_artist.as_ref().map(|n| {
+                                if primary_artist_name.as_ref() == Some(n) {
+                                    primary_artist_id
+                                        .clone()
+                                        .unwrap_or_else(|| name_hash("artist", n))
+                                } else {
+                                    primary_mbid
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| name_hash("artist", n))
+                                }
+                            });
+                            MemReleaseGroup {
+                                id: rg_id.clone(),
+                                title: album_title.clone().unwrap_or_default(),
+                                artist_id: rg_artist_id,
+                                artist_credit_name: source_album_artist.clone(),
+                                release_date: None,
+                            }
+                        });
+                        // Update release_date with minimum (earliest)
+                        if let Some(yr) = &release_year {
+                            if !yr.is_empty() {
+                                rg_entry.release_date = Some(match &rg_entry.release_date {
+                                    Some(existing) => existing.min(yr).clone(),
+                                    None => yr.clone(),
+                                });
+                            }
+                        }
                     }
                 }
             }
 
-            // Parse TRCK
-            let (track_position, _track_total) = tag_first(canonical_tags, "TRCK")
-                .map(parse_trck)
-                .unwrap_or((None, None));
-            let disc_position = tag_first(canonical_tags, "TPOS")
-                .and_then(|s| s.split('/').next())
-                .and_then(|s| s.trim().parse::<i64>().ok());
-
-            // User data
-            let (play_count, last_played) = play_data
-                .get(&recording_id)
-                .map(|(c, d)| (*c, Some(d.clone())))
-                .unwrap_or((0, None));
             let tags = recording_tags
                 .get(&recording_id)
                 .cloned()
@@ -420,12 +442,7 @@ impl MemoryCatalog {
                 artist_credit_name,
                 artist_ids,
                 all_artist_names,
-                release_group_id,
-                track_position,
-                disc_position,
-                release_year,
-                play_count,
-                last_played,
+                release_group_assocs,
                 tags,
             });
         }
@@ -506,21 +523,22 @@ impl MemoryCatalog {
         let mut rg_disc_totals: HashMap<String, i64> = HashMap::new();
 
         for (i, rec) in recordings.iter().enumerate() {
-            // recordings_by_rg
-            if let Some(rg_id) = &rec.release_group_id {
-                recordings_by_rg.entry(rg_id.clone()).or_default().push(i);
-                // rg_disc_totals
-                let disc = rec.disc_position.unwrap_or(1);
-                let cur = rg_disc_totals.entry(rg_id.clone()).or_insert(0);
+            // recordings_by_rg, rg_disc_totals, artist_rg_ids
+            for assoc in &rec.release_group_assocs {
+                recordings_by_rg
+                    .entry(assoc.rg_id.clone())
+                    .or_default()
+                    .push(i);
+                let disc = assoc.disc_position.unwrap_or(1);
+                let cur = rg_disc_totals.entry(assoc.rg_id.clone()).or_insert(0);
                 if disc > *cur {
                     *cur = disc;
                 }
-                // artist_rg_ids
                 for aid in &rec.artist_ids {
                     artist_rg_ids
                         .entry(aid.clone())
                         .or_default()
-                        .insert(rg_id.clone());
+                        .insert(assoc.rg_id.clone());
                 }
             }
             // recordings_by_artist
@@ -700,13 +718,13 @@ fn eval_pred(
             .avg_rating()
             .map(|r| apply_cmp(*op, r.round() as i64, *n))
             .unwrap_or(false),
-        Predicate::AlbumRating(op, n) => rec
-            .release_group_id
-            .as_ref()
-            .and_then(|id| rg_avg_ratings.get(id))
-            .map(|&r| apply_cmp(*op, r as i64, *n))
-            .unwrap_or(false),
-        Predicate::PlayCount(op, n) => apply_cmp(*op, rec.play_count, *n),
+        Predicate::AlbumRating(op, n) => rec.release_group_assocs.iter().any(|assoc| {
+            rg_avg_ratings
+                .get(&assoc.rg_id)
+                .map(|&r| apply_cmp(*op, r as i64, *n))
+                .unwrap_or(false)
+        }),
+        Predicate::PlayCount(op, n) => apply_cmp(*op, rec.total_play_count(), *n),
         Predicate::LastPlayed(dir, n, unit) => {
             let days: i64 = match unit {
                 TimeUnit::Days => *n,
@@ -715,7 +733,7 @@ fn eval_pred(
                 TimeUnit::Years => n * 365,
             };
             let threshold = now - days * 86400;
-            match (dir, &rec.last_played) {
+            match (dir, rec.last_played()) {
                 (LastPlayedDir::InLast, Some(lp)) => sqlite_datetime_to_unix(lp)
                     .map(|t| t >= threshold)
                     .unwrap_or(false),
@@ -742,12 +760,14 @@ fn eval_pred(
             .map(|g| match_str(*op, g, s))
             .unwrap_or(false),
         Predicate::Artist(op, s) => rec.all_artist_names.iter().any(|n| match_str(*op, n, s)),
-        Predicate::Year(op, n) => rec
-            .release_year
-            .as_deref()
-            .and_then(|y| y.parse::<i64>().ok())
-            .map(|y| apply_cmp(*op, y, *n))
-            .unwrap_or(false),
+        Predicate::Year(op, n) => rec.release_group_assocs.iter().any(|assoc| {
+            assoc
+                .release_year
+                .as_deref()
+                .and_then(|y| y.parse::<i64>().ok())
+                .map(|y| apply_cmp(*op, y, *n))
+                .unwrap_or(false)
+        }),
     }
 }
 
@@ -811,25 +831,25 @@ fn disc_completeness(
 
 fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> RecordingRow {
     let primary_source = rec.sources.iter().find(|s| s.source_type == "local_file");
-    let releases = rec
-        .release_group_id
-        .as_ref()
-        .map(|rg_id| {
+    let releases: Vec<ReleaseInfo> = rec
+        .release_group_assocs
+        .iter()
+        .map(|assoc| {
             let rg_title = catalog
                 .rgs_by_id
-                .get(rg_id)
+                .get(&assoc.rg_id)
                 .map(|&idx| catalog.release_groups[idx].title.clone())
                 .unwrap_or_default();
-            let disc_total = catalog.rg_disc_totals.get(rg_id).copied();
-            vec![ReleaseInfo {
-                release_group_id: rg_id.clone(),
+            let disc_total = catalog.rg_disc_totals.get(&assoc.rg_id).copied();
+            ReleaseInfo {
+                release_group_id: assoc.rg_id.clone(),
                 release_group_title: rg_title,
-                track_position: rec.track_position,
-                disc_position: rec.disc_position,
+                track_position: assoc.track_position,
+                disc_position: assoc.disc_position,
                 disc_total,
-            }]
+            }
         })
-        .unwrap_or_default();
+        .collect();
 
     RecordingRow {
         id: rec.id.clone(),
@@ -839,8 +859,8 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
         artist_credit_name: rec.artist_credit_name.clone(),
         genre: rec.genre.clone(),
         rating: rec.avg_rating(),
-        play_count: rec.play_count,
-        last_played: rec.last_played.clone(),
+        play_count: rec.total_play_count(),
+        last_played: rec.last_played().map(String::from),
         primary_source_id: primary_source.map(|s| s.id.clone()),
         primary_source_path: primary_source.and_then(|s| s.file_path.clone()),
         tags: rec.tags.clone(),
@@ -882,7 +902,7 @@ impl super::CatalogReader for MemoryCatalog {
                 );
                 let last_played = rec_indices
                     .iter()
-                    .filter_map(|&i| self.recordings[i].last_played.clone())
+                    .filter_map(|&i| self.recordings[i].last_played().map(String::from))
                     .max();
                 let rg_count = self
                     .release_groups
@@ -946,7 +966,7 @@ impl super::CatalogReader for MemoryCatalog {
                 let rating = rg_avg_rating(rec_indices, &self.recordings);
                 let last_played = rec_indices
                     .iter()
-                    .filter_map(|&i| self.recordings[i].last_played.clone())
+                    .filter_map(|&i| self.recordings[i].last_played().map(String::from))
                     .max();
                 ReleaseGroupRow {
                     id: rg.id.clone(),
@@ -1058,7 +1078,7 @@ impl super::CatalogReader for MemoryCatalog {
         );
         let last_played = rec_indices
             .iter()
-            .filter_map(|&i| self.recordings[i].last_played.clone())
+            .filter_map(|&i| self.recordings[i].last_played().map(String::from))
             .max();
 
         // Primary release groups (this artist is primary RG artist)
@@ -1104,18 +1124,18 @@ impl super::CatalogReader for MemoryCatalog {
             if !is_guest {
                 continue;
             }
-            if let Some(rg_id) = &rec.release_group_id {
-                if primary_rg_ids.contains(rg_id.as_str()) {
+            for assoc in &rec.release_group_assocs {
+                if primary_rg_ids.contains(assoc.rg_id.as_str()) {
                     continue;
                 }
                 guest_rg_tracks
-                    .entry(rg_id.clone())
+                    .entry(assoc.rg_id.clone())
                     .or_default()
                     .push(GuestAppearanceTrack {
                         recording_id: rec.id.clone(),
                         recording_title: rec.title.clone(),
-                        track_position: rec.track_position,
-                        disc_position: rec.disc_position,
+                        track_position: assoc.track_position,
+                        disc_position: assoc.disc_position,
                     });
             }
         }
@@ -1170,7 +1190,7 @@ impl super::CatalogReader for MemoryCatalog {
         let rating = rg_avg_rating(rec_indices, &self.recordings);
         let last_played = rec_indices
             .iter()
-            .filter_map(|&i| self.recordings[i].last_played.clone())
+            .filter_map(|&i| self.recordings[i].last_played().map(String::from))
             .max();
 
         if rec_indices.is_empty() {
@@ -1192,8 +1212,9 @@ impl super::CatalogReader for MemoryCatalog {
         let mut disc_map: BTreeMap<i64, Vec<(i64, usize)>> = BTreeMap::new();
         for &rec_idx in rec_indices {
             let rec = &self.recordings[rec_idx];
-            let disc = rec.disc_position.unwrap_or(1);
-            let track = rec.track_position.unwrap_or(0);
+            let assoc = rec.assoc_for_rg(id);
+            let disc = assoc.and_then(|a| a.disc_position).unwrap_or(1);
+            let track = assoc.and_then(|a| a.track_position).unwrap_or(0);
             disc_map.entry(disc).or_default().push((track, rec_idx));
         }
 
@@ -1326,25 +1347,25 @@ impl super::CatalogReader for MemoryCatalog {
             })
             .collect();
 
-        let releases = rec
-            .release_group_id
-            .as_ref()
-            .map(|rg_id| {
+        let releases: Vec<ReleaseInfo> = rec
+            .release_group_assocs
+            .iter()
+            .map(|assoc| {
                 let rg_title = self
                     .rgs_by_id
-                    .get(rg_id)
+                    .get(&assoc.rg_id)
                     .map(|&idx| self.release_groups[idx].title.clone())
                     .unwrap_or_default();
-                let disc_total = self.rg_disc_totals.get(rg_id).copied();
-                vec![ReleaseInfo {
-                    release_group_id: rg_id.clone(),
+                let disc_total = self.rg_disc_totals.get(&assoc.rg_id).copied();
+                ReleaseInfo {
+                    release_group_id: assoc.rg_id.clone(),
                     release_group_title: rg_title,
-                    track_position: rec.track_position,
-                    disc_position: rec.disc_position,
+                    track_position: assoc.track_position,
+                    disc_position: assoc.disc_position,
                     disc_total,
-                }]
+                }
             })
-            .unwrap_or_default();
+            .collect();
 
         let sources: Vec<SourceDetail> = rec
             .sources
@@ -1374,8 +1395,8 @@ impl super::CatalogReader for MemoryCatalog {
             mbid: None,
             acoustid: None,
             rating: rec.avg_rating(),
-            play_count: rec.play_count,
-            last_played: rec.last_played.clone(),
+            play_count: rec.total_play_count(),
+            last_played: rec.last_played().map(String::from),
             artists,
             releases,
             sources,
