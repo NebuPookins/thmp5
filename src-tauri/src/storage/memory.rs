@@ -629,6 +629,7 @@ fn id3_field_name(frame_id: &str) -> String {
         other if other.starts_with("TXXX:") => {
             format!("User Text ({})", &other[5..])
         }
+        "UFID:http://musicbrainz.org" => "MusicBrainz Recording Id".into(),
         other => other.into(),
     }
 }

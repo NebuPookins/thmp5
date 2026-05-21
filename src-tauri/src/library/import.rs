@@ -324,24 +324,60 @@ pub(crate) async fn prepare_import(
         ))
         .await
         .context("Failed to acquire DB connection for import path check")?;
-    let existing_source = sqlx::query_as::<_, (String, Option<i64>, Option<i64>, bool)>(
-        "SELECT id, file_size, file_mtime_ms, raw_tags_json IS NOT NULL FROM source WHERE file_path = ?",
+    let existing_source = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<i64>,
+            Option<i64>,
+            bool,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, file_size, file_mtime_ms, raw_tags_json IS NOT NULL,
+                file_hash, fingerprint
+         FROM source WHERE file_path = ?",
     )
     .bind(&path_str)
     .fetch_optional(&mut *conn)
     .await
     .context("DB error checking existing path")?;
 
-    if let Some((_, existing_size, existing_mtime_ms, has_raw_tags)) = &existing_source {
-        if existing_size == &Some(file_size)
-            && existing_mtime_ms == &Some(file_mtime_ms)
-            && *has_raw_tags
-        {
-            return Ok(None);
-        }
+    let file_unchanged = existing_source
+        .as_ref()
+        .is_some_and(|(_, es, em, _, _, _)| es == &Some(file_size) && em == &Some(file_mtime_ms));
+
+    // Each operation has its own pre-requisite. If all are satisfied, skip entirely.
+    let has_hash = existing_source
+        .as_ref()
+        .and_then(|(_, _, _, _, h, _)| h.as_deref())
+        .is_some();
+    let has_raw_tags = existing_source
+        .as_ref()
+        .is_some_and(|(_, _, _, r, _, _)| *r);
+    let has_fingerprint = existing_source
+        .as_ref()
+        .and_then(|(_, _, _, _, _, f)| f.as_deref())
+        .is_some();
+
+    if file_unchanged && has_hash && has_raw_tags && has_fingerprint {
+        return Ok(None);
     }
 
-    let existing_source_id = existing_source.as_ref().map(|(id, _, _, _)| id.as_str());
+    let existing_source_id = existing_source
+        .as_ref()
+        .map(|(id, _, _, _, _, _)| id.as_str());
+    let existing_hash = existing_source
+        .as_ref()
+        .and_then(|(_, _, _, _, h, _)| h.clone());
+
+    // Only compute what's actually needed.
+    let needs_hash = !file_unchanged || !has_hash;
+    let needs_fingerprint = !file_unchanged || !has_fingerprint;
+    // Metadata re-read is needed whenever we reach the blocking task (raw_tags missing
+    // or file changed — otherwise the early-return above would have fired).
+
     drop(conn);
 
     struct BlockingResult {
@@ -356,16 +392,32 @@ pub(crate) async fn prepare_import(
     let blocking = tokio::task::spawn_blocking(move || {
         let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
         set_io_priority_idle();
-        let hash = file_sha256(&p).context("Failed to hash file")?;
-        let metadata_read = read_metadata(&p).context("Failed to read metadata")?;
-        let fp = match fingerprint::generate_fingerprint(&p) {
-            Ok(fp) => Some(fp),
-            Err(e) => {
-                tracing::warn!(path = %p.display(), "Fingerprint generation failed: {e}");
-                None
-            }
+
+        // Hash: compute only when needed (file changed or no existing hash).
+        let hash = if needs_hash {
+            file_sha256(&p).context("Failed to hash file")?
+        } else {
+            // Safe: needs_hash false implies existing_hash is Some.
+            existing_hash.unwrap()
         };
+
+        // Metadata and raw_tags_json: always needed (see early-return above).
+        let metadata_read = read_metadata(&p).context("Failed to read metadata")?;
         let raw_tags_json = build_raw_tags_json(&p, &metadata_read.meta, &metadata_read.all_tags);
+
+        // Fingerprint: only when needed (file changed or no existing fingerprint).
+        let fp = if needs_fingerprint {
+            match fingerprint::generate_fingerprint(&p) {
+                Ok(fp) => Some(fp),
+                Err(e) => {
+                    tracing::warn!(path = %p.display(), "Fingerprint generation failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok::<_, anyhow::Error>(BlockingResult {
             hash,
             meta: metadata_read.meta,
@@ -483,7 +535,7 @@ pub(crate) async fn store_prepared_import(
                 file_hash = excluded.file_hash,
                 format = excluded.format,
                 duration_ms = excluded.duration_ms,
-                fingerprint = excluded.fingerprint,
+                fingerprint = COALESCE(excluded.fingerprint, fingerprint),
                 file_size = excluded.file_size,
                 file_mtime_ms = excluded.file_mtime_ms,
                 replay_gain_track_db = excluded.replay_gain_track_db,
@@ -604,7 +656,7 @@ pub(crate) async fn store_prepared_import(
             file_hash = excluded.file_hash,
             format = excluded.format,
             duration_ms = excluded.duration_ms,
-            fingerprint = excluded.fingerprint,
+            fingerprint = COALESCE(excluded.fingerprint, fingerprint),
             file_size = excluded.file_size,
             file_mtime_ms = excluded.file_mtime_ms,
             track_total = excluded.track_total,

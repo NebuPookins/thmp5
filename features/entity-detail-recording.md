@@ -45,9 +45,6 @@ non-null. Displays a key-value table with rows for:
 - Comment
 - Artist credit (the raw `artist_credit_text` field, distinct from the
   computed `artist_credit_name`)
-- MBID (MusicBrainz Identifier, monospace), which should link to the appropriate
-  MusicBrainz page, e.g. https://musicbrainz.org/recording/8726b172-05c2-4350-a730-bbdef4b219b7
-- AcoustID (monospace)
 
 ## "Appears On" Section
 
@@ -78,14 +75,23 @@ card-style block with:
   when `replay_gain_track_db` is non-null (e.g. "ReplayGain: -8.23 dB (peak
   0.9999)")
 - **ID3 Tags table** — for `local_file` sources only, a complete dump of all
-  raw ID3 frames read from the file. Shows three columns:
+  tag frames stored from the last scan (from `source.raw_tags_json`). Shows
+  three columns:
   - Field (human-readable name, e.g. "Title", "Album", "Artist")
-  - Frame (the raw ID3 frame ID, monospace, e.g. "TIT2", "TALB", "TPE1")
+  - Frame (the raw ID3 frame ID or vorbis comment key, monospace,
+    e.g. "TIT2", "TALB", "TPE1")
   - Value (the tag value, with word-break for long values)
 
-  Tag reading is done on-demand per source via `list_all_tags` in the Rust
-  scanner, which tries `lofty` first and falls back to `taglib` C binding.
-  Non-local-file sources get an empty tag list.
+  Every tag present in the source file is shown here. This includes standard
+  metadata frames (TIT2, TPE1, TALB, etc.), user-text frames
+  (e.g. `TXXX:MusicBrainz Recording Id`, `TXXX:ACOUSTID_ID`, `UFID:http://musicbrainz.org`),
+  and any other tags the scanner captured at scan time. Non-local-file sources
+  get an empty tag list.
+
+  The MBID field (MusicBrainz Recording Identifier) should link to the
+  appropriate MusicBrainz page when one is present, e.g.
+  https://musicbrainz.org/recording/8726b172-05c2-4350-a730-bbdef4b219b7
+  AcoustID values are displayed in monospace.
 
 Empty source list shows "No sources." placeholder text.
 

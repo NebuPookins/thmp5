@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./EntityDetailView.css";
@@ -230,6 +230,51 @@ type Props = {
   onRefreshLibrary?: () => void;
   onSplitRecording?: (recordingId: string) => void;
 };
+
+// ── Tag value rendering helpers ──────────────────────────────────────────────
+
+const musicBrainzUrl = (entity: string, id: string): string =>
+  `https://musicbrainz.org/${entity}/${id}`;
+
+const frameIdToMusicBrainzEntity = (frameId: string): string | null => {
+  switch (frameId) {
+    case "UFID:http://musicbrainz.org":
+    case "TXXX:MusicBrainz Recording Id":
+    case "MUSICBRAINZ_TRACKID":
+      return "recording";
+    case "TXXX:MusicBrainz Artist Id":
+    case "TXXX:MusicBrainz Album Artist Id":
+      return "artist";
+    case "TXXX:MusicBrainz Album Id":
+      return "release";
+    case "TXXX:MusicBrainz Release Group Id":
+      return "release-group";
+    case "TXXX:MusicBrainz Release Track Id":
+      return "track";
+    default:
+      return null;
+  }
+};
+
+/** Render a MusicBrainz ID or AcoustID as a clickable link, plain text otherwise. */
+function renderTagValue(tag: SourceTagInfo): React.ReactNode {
+  const entity = frameIdToMusicBrainzEntity(tag.frame_id);
+  if (entity) {
+    const uuid = tag.value.trim();
+    if (/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(uuid)) {
+      return <a href={musicBrainzUrl(entity, uuid)} target="_blank" rel="noreferrer">{tag.value}</a>;
+    }
+  }
+  if (tag.frame_id === "TXXX:ACOUSTID_ID" || tag.frame_id === "ACOUSTID_ID") {
+    const id = tag.value.trim();
+    if (/^[\da-f]{16,}$/i.test(id)) {
+      return <a href={`https://acoustid.org/track/${id}`} target="_blank" rel="noreferrer">{tag.value}</a>;
+    }
+  }
+  return tag.value;
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
 
 export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanRecording, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
   const [loading, setLoading] = useState(true);
@@ -736,7 +781,7 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                             <tr key={i}>
                               <td>{tag.field_name}</td>
                               <td className="entity-detail-monospace">{tag.frame_id}</td>
-                              <td className="entity-detail-tag-value">{tag.value}</td>
+                              <td className="entity-detail-tag-value">{renderTagValue(tag)}</td>
                             </tr>
                           ))}
                         </tbody>

@@ -1310,6 +1310,17 @@ fn scan_all_id3_text_frames(path: &Path) -> Option<Vec<(String, String)>> {
                     format!("TXXX:{description}")
                 };
                 frames.push((key, value));
+            } else if frame_id == "UFID" && frame_size > 0 {
+                // UFID frame: owner identifier (null-terminated Latin-1 string)
+                // followed by identifier bytes (typically an ASCII UUID).
+                let payload = &tag_data[data_start..data_end];
+                if let Some(null_pos) = payload.iter().position(|&b| b == 0) {
+                    let owner = String::from_utf8_lossy(&payload[..null_pos]).to_string();
+                    let value = String::from_utf8_lossy(&payload[null_pos + 1..])
+                        .trim_end_matches('\0')
+                        .to_string();
+                    frames.push((format!("UFID:{owner}"), value));
+                }
             }
 
             pos = data_end;
