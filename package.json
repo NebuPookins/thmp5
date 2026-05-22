@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:icons": "tauri icon src-tauri/icons/icon-source.svg -o src-tauri/icons",
+    "build:icons": "[ -f src-tauri/icons/icon.png ] && [ src-tauri/icons/icon-source.svg -ot src-tauri/icons/icon.png ] || tauri icon src-tauri/icons/icon-source.svg -o src-tauri/icons",
     "build:app": "npm run build && npm run build:icons",
     "preview": "vite preview",
     "tauri": "tauri"
