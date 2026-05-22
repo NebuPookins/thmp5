@@ -117,7 +117,22 @@ pub(crate) fn id3v2_end_offset(file: &mut File) -> Option<u64> {
 }
 
 fn wave_mp3_data_range(file: &mut File) -> Result<Option<(u64, u64)>> {
-    let riff_offset = id3v2_end_offset(file).unwrap_or_default();
+    // Some files have multiple consecutive ID3v2 tags before the RIFF/WAVE
+    // header (e.g. ID3v2.3 followed by ID3v2.4).  Skip all of them.
+    let mut riff_offset = id3v2_end_offset(file).unwrap_or_default();
+    loop {
+        file.seek(SeekFrom::Start(riff_offset))?;
+        let mut tag_header = [0u8; 10];
+        if file.read_exact(&mut tag_header).is_err() || &tag_header[0..3] != b"ID3" {
+            break;
+        }
+        let size = ((tag_header[6] as u64) << 21)
+            | ((tag_header[7] as u64) << 14)
+            | ((tag_header[8] as u64) << 7)
+            | (tag_header[9] as u64);
+        riff_offset += 10 + size;
+    }
+
     file.seek(SeekFrom::Start(riff_offset))?;
 
     let mut header = [0u8; 12];
