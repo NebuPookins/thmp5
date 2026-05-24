@@ -314,6 +314,101 @@ fn extract_string(pair: Pair<Rule>) -> anyhow::Result<String> {
     }
 }
 
+// ── Compiler: Expr → SQL ─────────────────────────────────────────────────────
+
+/// Compile a parsed query to a SQL WHERE clause (and optional duration limit).
+fn compile(query: &ParsedQuery) -> (String, Option<String>) {
+    compile_expr(&query.expr)
+}
+
+fn compile_expr(expr: &Expr) -> (String, Option<String>) {
+    match expr {
+        Expr::And(a, b) => (
+            format!("({} AND {})", compile_expr(a).0, compile_expr(b).0),
+            None,
+        ),
+        Expr::Or(a, b) => (
+            format!("({} OR {})", compile_expr(a).0, compile_expr(b).0),
+            None,
+        ),
+        Expr::Not(a) => (format!("NOT ({})", compile_expr(a).0), None),
+        Expr::Pred(p) => compile_pred(p),
+    }
+}
+
+/// Compile a predicate to SQL.
+fn compile_pred(pred: &Predicate) -> (String, Option<String>) {
+    match pred {
+        Predicate::RatingNull => ("rating IS NULL".into(), None),
+        Predicate::Rating(op, n) => (format!("rating {} {}", cmp_sql(*op), n), None),
+        Predicate::AlbumRating(op, n) => (format!("album_rating {} {}", cmp_sql(*op), n), None),
+        Predicate::LastPlayed(dir, n, unit) => {
+            let dir_sql = match dir {
+                LastPlayedDir::InLast => "last_played >= datetime('now', '-{n} {unit}')",
+                LastPlayedDir::NotInLast => "(last_played IS NULL OR last_played < datetime('now', '-{n} {unit}'))",
+            };
+            let unit_str = match unit {
+                TimeUnit::Days => "days",
+                TimeUnit::Weeks => "days", // SQLite: weeks as days*7
+                TimeUnit::Months => "months",
+                TimeUnit::Years => "years",
+            };
+            let actual_n = match unit {
+                TimeUnit::Weeks => n * 7,
+                _ => *n,
+            };
+            let sql = dir_sql
+                .replace("{n}", &actual_n.to_string())
+                .replace("{unit}", unit_str);
+            (sql, None)
+        }
+        Predicate::PlayCount(op, n) => (format!("play_count {} {}", cmp_sql(*op), n), None),
+        Predicate::InPlaylist(list) => (format!("EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists p ON pt.playlist_id = p.id WHERE p.name = {list_esc} AND pt.recording_id = recording.id)", list_esc = escape_string(list)), None),
+        Predicate::NotInPlaylist(list) => (format!("NOT EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists p ON pt.playlist_id = p.id WHERE p.name = {list_esc} AND pt.recording_id = recording.id)", list_esc = escape_string(list)), None),
+        Predicate::HasTag(tag) => (format!("id IN (SELECT recording_id FROM recording_tag WHERE tag = {tag_esc})", tag_esc = escape_string(tag)), None),
+        Predicate::Title(op, s) => str_op_sql("title", *op, s),
+        Predicate::Artist(op, s) => str_op_sql("artist_credit_name", *op, s),
+        Predicate::Genre(op, s) => str_op_sql("genre", *op, s),
+        Predicate::Year(op, n) => (format!("year {} {}", cmp_sql(*op), n), None),
+    }
+}
+
+fn cmp_sql(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Gte => ">=",
+        CmpOp::Lte => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::Lt => "<",
+        CmpOp::Eq => "=",
+        CmpOp::Ne => "!=",
+    }
+}
+
+fn str_op_sql(field: &str, op: StrOp, s: &str) -> (String, Option<String>) {
+    match op {
+        StrOp::Contains => {
+            // Escape LIKE wildcards and the escape character itself.
+            let like_safe = s
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("'%{like_safe}%'");
+            (
+                format!("lower({field}) LIKE {pattern} ESCAPE '\\'", field = field,),
+                None,
+            )
+        }
+        StrOp::Is => (
+            format!("{field} = {esc}", field = field, esc = escape_string(s)),
+            None,
+        ),
+    }
+}
+
+fn escape_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -717,6 +717,7 @@ fn deduplicate_raw_tags(
             field_name: Some(field_name.to_string()),
             lofty_value: Some(distinct.last().cloned().unwrap_or_default()),
             corrected_value: Some(distinct.first().cloned().unwrap_or_default()),
+            backup_path: None,
         });
         result.push((frame_id.clone(), values[0].clone()));
     }

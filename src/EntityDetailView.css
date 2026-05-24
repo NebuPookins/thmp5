@@ -303,6 +303,24 @@
   max-width: 300px;
 }
 
+.entity-detail-tag-multivalue {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.entity-detail-tag-multivalue li {
+  display: inline;
+}
+
+.entity-detail-tag-multivalue li::after {
+  content: ", ";
+}
+
+.entity-detail-tag-multivalue li:last-child::after {
+  content: "";
+}
+
 .entity-detail-monospace {
   font-family: "IBM Plex Mono", "Cascadia Code", monospace;
   font-size: 0.78rem;
@@ -505,4 +523,144 @@
 
 .merge-search-result-title {
   font-weight: 600;
+}
+
+/* ── Inline tag editing ───────────────────────────────────────────── */
+
+.entity-detail-tag-value-clickable {
+  cursor: pointer;
+  border-bottom: 1px dashed rgba(149, 173, 198, 0.25);
+  transition: border-color 120ms ease;
+}
+
+.entity-detail-tag-value-clickable:hover {
+  border-bottom-color: rgba(73, 135, 255, 0.5);
+}
+
+.entity-detail-tag-edit-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(73, 135, 255, 0.4);
+  background: rgba(0, 0, 0, 0.3);
+  color: #d6e4f0;
+  font-size: 0.8rem;
+  font-family: inherit;
+  outline: none;
+}
+
+.entity-detail-tag-edit-input:focus {
+  border-color: rgba(73, 135, 255, 0.7);
+  box-shadow: 0 0 0 1px rgba(73, 135, 255, 0.15);
+}
+
+.entity-detail-tag-edit-textarea {
+  font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+  font-size: 0.78rem;
+  width: 100%;
+  min-width: 180px;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid rgba(73, 135, 255, 0.4);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.3);
+  color: #d6e4f0;
+  padding: 4px 6px;
+  outline: none;
+}
+
+.entity-detail-tag-edit-textarea:focus {
+  border-color: rgba(73, 135, 255, 0.7);
+  box-shadow: 0 0 0 1px rgba(73, 135, 255, 0.15);
+}
+
+.entity-detail-tag-delete-btn {
+  background: none;
+  border: none;
+  color: rgba(255, 100, 100, 0.5);
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 0.75rem;
+  line-height: 1;
+  transition: color 120ms ease;
+}
+
+.entity-detail-tag-delete-btn:hover:not(:disabled) {
+  color: rgba(255, 100, 100, 0.9);
+}
+
+.entity-detail-tag-delete-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* ── Add tag UI ────────────────────────────────────────────────────── */
+
+.entity-detail-add-tag {
+  margin-top: 6px;
+}
+
+.entity-detail-add-tag-form {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.entity-detail-add-tag-select {
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(149, 173, 198, 0.2);
+  background: rgba(0, 0, 0, 0.2);
+  color: #d6e4f0;
+  font-size: 0.8rem;
+  outline: none;
+  cursor: pointer;
+}
+
+.entity-detail-add-tag-select:focus {
+  border-color: rgba(73, 135, 255, 0.5);
+}
+
+.entity-detail-add-tag-input {
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(149, 173, 198, 0.2);
+  background: rgba(0, 0, 0, 0.2);
+  color: #d6e4f0;
+  font-size: 0.8rem;
+  outline: none;
+  flex: 1;
+  min-width: 120px;
+}
+
+.entity-detail-add-tag-input:focus {
+  border-color: rgba(73, 135, 255, 0.5);
+}
+
+/* ── Toast notification ────────────────────────────────────────────── */
+
+.entity-detail-toast {
+  position: sticky;
+  bottom: 0;
+  margin-top: 12px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  word-break: break-all;
+  z-index: 10;
+}
+
+.entity-detail-toast-success {
+  background: rgba(60, 200, 100, 0.15);
+  border: 1px solid rgba(60, 200, 100, 0.3);
+  color: #4ade80;
+}
+
+.entity-detail-toast-error {
+  background: rgba(255, 80, 80, 0.15);
+  border: 1px solid rgba(255, 80, 80, 0.3);
+  color: #f87171;
 }

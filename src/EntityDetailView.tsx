@@ -231,6 +231,36 @@ type Props = {
   onSplitRecording?: (recordingId: string) => void;
 };
 
+// ── Tag editing types ─────────────────────────────────────────────────────────
+
+type TagWriteResult = {
+  backup_path: string;
+  pre_audio_hash: number[];
+  post_audio_hash: number[];
+  pre_full_hash: number[];
+  frame_count: number;
+};
+
+type TagEditState = {
+  sourceIdx: number;
+  tagIdx: number;
+  initialValue: string;
+  currentValue: string;
+} | null;
+
+// Common editable text frame IDs.
+const COMMON_FRAME_IDS = [
+  { id: "TIT2", label: "Title" },
+  { id: "TPE1", label: "Artist" },
+  { id: "TALB", label: "Album" },
+  { id: "TPE2", label: "Album Artist" },
+  { id: "TRCK", label: "Track Number" },
+  { id: "TPOS", label: "Disc Number" },
+  { id: "TCON", label: "Genre" },
+  { id: "TDRC", label: "Year" },
+  { id: "COMM", label: "Comment" },
+];
+
 // ── Tag value rendering helpers ──────────────────────────────────────────────
 
 const musicBrainzUrl = (entity: string, id: string): string =>
@@ -256,22 +286,36 @@ const frameIdToMusicBrainzEntity = (frameId: string): string | null => {
   }
 };
 
-/** Render a MusicBrainz ID or AcoustID as a clickable link, plain text otherwise. */
-function renderTagValue(tag: SourceTagInfo): React.ReactNode {
-  const entity = frameIdToMusicBrainzEntity(tag.frame_id);
+/** Render a single value segment (link if MBID/AcoustID, plain text otherwise). */
+function renderTagValueSegment(segment: string, frameId: string): React.ReactNode {
+  const entity = frameIdToMusicBrainzEntity(frameId);
   if (entity) {
-    const uuid = tag.value.trim();
+    const uuid = segment.trim();
     if (/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(uuid)) {
-      return <a href={musicBrainzUrl(entity, uuid)} target="_blank" rel="noreferrer">{tag.value}</a>;
+      return <a href={musicBrainzUrl(entity, uuid)} target="_blank" rel="noreferrer">{segment}</a>;
     }
   }
-  if (tag.frame_id === "TXXX:ACOUSTID_ID" || tag.frame_id === "ACOUSTID_ID") {
-    const id = tag.value.trim();
+  if (frameId === "TXXX:ACOUSTID_ID" || frameId === "ACOUSTID_ID") {
+    const id = segment.trim();
     if (/^[\da-f]{16,}$/i.test(id)) {
-      return <a href={`https://acoustid.org/track/${id}`} target="_blank" rel="noreferrer">{tag.value}</a>;
+      return <a href={`https://acoustid.org/track/${id}`} target="_blank" rel="noreferrer">{segment}</a>;
     }
   }
-  return tag.value;
+  return segment;
+}
+
+/** Render a tag value, splitting on null-byte separators for multivalue frames. */
+function renderTagValue(tag: SourceTagInfo): React.ReactNode {
+  const segments = tag.value.split('\0').filter(s => s.length > 0);
+  if (segments.length === 0) return tag.value;
+  if (segments.length === 1) return renderTagValueSegment(segments[0], tag.frame_id);
+  return (
+    <ul className="entity-detail-tag-multivalue">
+      {segments.map((s, i) => (
+        <li key={i}>{renderTagValueSegment(s, tag.frame_id)}</li>
+      ))}
+    </ul>
+  );
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -283,6 +327,82 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
   const [releaseGroup, setReleaseGroup] = useState<ReleaseGroupDetail | null>(null);
   const [recording, setRecording] = useState<RecordingDetail | null>(null);
   const [showMergePanel, setShowMergePanel] = useState(false);
+
+  // Tag editing state
+  const [tagEdit, setTagEdit] = useState<TagEditState>(null);
+  const [tagEditBusy, setTagEditBusy] = useState(false);
+  const [addingTag, setAddingTag] = useState<{ sourceIdx: number; frameId: string; value: string } | null>(null);
+  const [toast, setToast] = useState<{ text: string; type: "success" | "error" } | null>(null);
+
+  function showToast(text: string, type: "success" | "error") {
+    setToast({ text, type });
+    setTimeout(() => setToast(null), 4000);
+  }
+
+  async function handleWriteTag(filePath: string, frameId: string, newValue: string) {
+    setTagEditBusy(true);
+    try {
+      const result = await invoke<TagWriteResult>("write_tag_frame", {
+        filePath,
+        frameId,
+        newValue,
+      });
+      showToast(`Updated ${frameId} → backup: ${result.backup_path}`, "success");
+      void load();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : String(e), "error");
+    } finally {
+      setTagEditBusy(false);
+      setTagEdit(null);
+    }
+  }
+
+  async function handleDeleteTag(filePath: string, frameId: string) {
+    if (!window.confirm(`Remove all "${frameId}" frames from this file?`)) return;
+    try {
+      const result = await invoke<TagWriteResult>("delete_tag_frame", {
+        filePath,
+        frameId,
+      });
+      showToast(`Deleted ${frameId} → backup: ${result.backup_path}`, "success");
+      void load();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : String(e), "error");
+    }
+  }
+
+  async function handleAddTag(filePath: string, frameId: string, value: string) {
+    try {
+      const result = await invoke<TagWriteResult>("write_tag_frame", {
+        filePath,
+        frameId,
+        newValue: value,
+      });
+      showToast(`Added ${frameId} → backup: ${result.backup_path}`, "success");
+      setAddingTag(null);
+      void load();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : String(e), "error");
+    }
+  }
+
+  function startEdit(sourceIdx: number, tagIdx: number, value: string) {
+    setTagEdit({ sourceIdx, tagIdx, initialValue: value, currentValue: value });
+  }
+
+  function cancelEdit() {
+    setTagEdit(null);
+  }
+
+  function confirmEdit(source: SourceDetail, tag: SourceTagInfo) {
+    if (!tagEdit || tagEdit.currentValue === tagEdit.initialValue) {
+      setTagEdit(null);
+      return;
+    }
+    if (source.file_path) {
+      handleWriteTag(source.file_path, tag.frame_id, tagEdit.currentValue);
+    }
+  }
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -752,7 +872,7 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
             {recording.sources.length === 0 ? (
               <p className="empty-browser-state">No sources.</p>
             ) : (
-              recording.sources.map((source) => (
+              recording.sources.map((source, sourceIdx) => (
                 <div
                   key={source.id}
                   className="entity-detail-source"
@@ -782,18 +902,130 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                             <th>Field</th>
                             <th>Frame</th>
                             <th>Value</th>
+                            <th></th>
                           </tr>
                         </thead>
                         <tbody>
-                          {source.tags.map((tag, i) => (
-                            <tr key={i}>
-                              <td>{tag.field_name}</td>
-                              <td className="entity-detail-monospace">{tag.frame_id}</td>
-                              <td className="entity-detail-tag-value">{renderTagValue(tag)}</td>
-                            </tr>
-                          ))}
+                          {source.tags.map((tag, i) => {
+                            const editState = tagEdit?.sourceIdx === sourceIdx && tagEdit?.tagIdx === i ? tagEdit : null;
+                            return (
+                              <tr key={i}>
+                                <td>{tag.field_name}</td>
+                                <td className="entity-detail-monospace">{tag.frame_id}</td>
+                                <td className="entity-detail-tag-value">
+                                  {editState ? (
+                                    tag.value.includes('\0') ? (
+                                      <textarea
+                                        className="entity-detail-tag-edit-textarea"
+                                        value={editState.currentValue.replace(/\0/g, '\n')}
+                                        onChange={(e) => setTagEdit({ ...editState, currentValue: e.target.value.replace(/\n/g, '\0') })}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Escape") cancelEdit();
+                                        }}
+                                        onBlur={() => confirmEdit(source, tag)}
+                                        autoFocus
+                                        disabled={tagEditBusy}
+                                        rows={tag.value.split('\0').filter(s => s.length > 0).length}
+                                      />
+                                    ) : (
+                                      <input
+                                        className="entity-detail-tag-edit-input"
+                                        type="text"
+                                        value={editState.currentValue}
+                                        onChange={(e) => setTagEdit({ ...editState, currentValue: e.target.value })}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter") confirmEdit(source, tag);
+                                          if (e.key === "Escape") cancelEdit();
+                                        }}
+                                        onBlur={() => confirmEdit(source, tag)}
+                                        autoFocus
+                                        disabled={tagEditBusy}
+                                      />
+                                    )
+                                  ) : (
+                                    <span
+                                      className="entity-detail-tag-value-clickable"
+                                      onClick={() => source.file_path && !tagEditBusy && startEdit(sourceIdx, i, tag.value)}
+                                      title={source.file_path ? "Click to edit" : undefined}
+                                    >
+                                      {renderTagValue(tag)}
+                                    </span>
+                                  )}
+                                </td>
+                                <td>
+                                  {source.file_path && (
+                                    <button
+                                      className="entity-detail-tag-delete-btn"
+                                      type="button"
+                                      disabled={tagEditBusy}
+                                      onClick={() => handleDeleteTag(source.file_path!, tag.frame_id)}
+                                      title="Delete this tag frame"
+                                    >
+                                      ✕
+                                    </button>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
+
+                      {/* Add-tag UI */}
+                      {source.file_path && (
+                        <div className="entity-detail-add-tag">
+                          {addingTag?.sourceIdx === sourceIdx ? (
+                            <div className="entity-detail-add-tag-form">
+                              <select
+                                className="entity-detail-add-tag-select"
+                                value={addingTag.frameId}
+                                onChange={(e) => setAddingTag({ ...addingTag, frameId: e.target.value })}
+                              >
+                                <option value="">Select frame…</option>
+                                {COMMON_FRAME_IDS.map((f) => (
+                                  <option key={f.id} value={f.id}>{f.label} ({f.id})</option>
+                                ))}
+                              </select>
+                              <input
+                                className="entity-detail-add-tag-input"
+                                type="text"
+                                placeholder="Value"
+                                value={addingTag.value}
+                                onChange={(e) => setAddingTag({ ...addingTag, value: e.target.value })}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && addingTag.frameId && addingTag.value) {
+                                    handleAddTag(source.file_path!, addingTag.frameId, addingTag.value);
+                                  }
+                                  if (e.key === "Escape") setAddingTag(null);
+                                }}
+                              />
+                              <button
+                                className="secondary-button"
+                                type="button"
+                                disabled={!addingTag.frameId || !addingTag.value}
+                                onClick={() => handleAddTag(source.file_path!, addingTag.frameId, addingTag.value)}
+                              >
+                                Add
+                              </button>
+                              <button
+                                className="secondary-button"
+                                type="button"
+                                onClick={() => setAddingTag(null)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              className="secondary-button"
+                              type="button"
+                              onClick={() => setAddingTag({ sourceIdx, frameId: "", value: "" })}
+                            >
+                              + Add tag
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -809,6 +1041,12 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
             >
               Split recording...
             </button>
+          )}
+
+          {toast && (
+            <div className={`entity-detail-toast entity-detail-toast-${toast.type}`}>
+              {toast.text}
+            </div>
           )}
         </div>
       </section>

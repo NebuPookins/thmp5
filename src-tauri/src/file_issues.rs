@@ -8,6 +8,7 @@ pub enum FileIssueKind {
     PlaybackError,
     OrphanSource,
     DuplicateFrame,
+    BackupFileExists,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -33,6 +34,9 @@ pub struct FileIssue {
     /// For DuplicateFrame issues: the corrected value (first tag).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrected_value: Option<String>,
+    /// For BackupFileExists issues: path to the `.thmp5bak` file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
 }
 
 /// Shared, in-memory log of files that have encountered problems.
@@ -58,6 +62,7 @@ impl FileIssueLog {
             field_name: None,
             lofty_value: None,
             corrected_value: None,
+            backup_path: None,
         });
     }
 
@@ -72,6 +77,7 @@ impl FileIssueLog {
             field_name: None,
             lofty_value: None,
             corrected_value: None,
+            backup_path: None,
         });
     }
 
@@ -92,6 +98,7 @@ impl FileIssueLog {
             field_name: None,
             lofty_value: None,
             corrected_value: None,
+            backup_path: None,
         });
     }
 
@@ -131,6 +138,7 @@ impl FileIssueLog {
                 field_name: Some(field_name),
                 lofty_value: Some(lofty_value),
                 corrected_value: Some(corrected_value),
+                backup_path: None,
             });
         }
     }
@@ -186,6 +194,7 @@ impl FileIssueLog {
                 field_name: Some(field_name),
                 lofty_value: Some(last),
                 corrected_value: Some(first),
+                backup_path: None,
             });
         }
     }
@@ -198,6 +207,22 @@ impl FileIssueLog {
         if let Ok(mut issues) = self.issues.lock() {
             issues.retain(f);
         }
+    }
+
+    /// Report that a `.thmp5bak` backup file exists from a previous tag edit.
+    pub fn push_backup_exists(&self, file_path: impl Into<String>, backup_path: impl Into<String>) {
+        self.push(FileIssue {
+            file_path: file_path.into(),
+            kind: FileIssueKind::BackupFileExists,
+            message: "Backup file from tag edit exists — delete it to clean up.".into(),
+            source_id: None,
+            recording_id: None,
+            frame_id: None,
+            field_name: None,
+            lofty_value: None,
+            corrected_value: None,
+            backup_path: Some(backup_path.into()),
+        });
     }
 
     fn push(&self, issue: FileIssue) {
@@ -280,5 +305,30 @@ mod tests {
         let issues = log.all();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].file_path, "/path/b.mp3");
+    }
+
+    #[test]
+    fn test_push_backup_exists() {
+        let log = FileIssueLog::new();
+        log.push_backup_exists("/path/song.mp3", "/path/song.mp3.20260522-140431.thmp5bak");
+        let issues = log.all();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].file_path, "/path/song.mp3");
+        assert_eq!(issues[0].kind, FileIssueKind::BackupFileExists);
+        assert_eq!(
+            issues[0].backup_path.as_deref(),
+            Some("/path/song.mp3.20260522-140431.thmp5bak")
+        );
+    }
+
+    #[test]
+    fn test_push_backup_exists_dedup() {
+        let log = FileIssueLog::new();
+        log.push_backup_exists("/path/song.mp3", "/path/song.mp3.20260522-140431.thmp5bak");
+        log.push_backup_exists("/path/song.mp3", "/path/song.mp3.20260522-140431.thmp5bak");
+        let issues = log.all();
+        // push_backup_exists uses the base push method, no dedup — caller
+        // (rescan_source) clears previous issues for the file before pushing.
+        assert_eq!(issues.len(), 2);
     }
 }

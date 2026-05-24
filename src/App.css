@@ -1268,6 +1268,11 @@ thead th {
   color: #b388ff;
 }
 
+.issue-kind-backup_file_exists {
+  background: rgba(72, 187, 187, 0.18);
+  color: #5cc5c5;
+}
+
 .fix-orphan-btn {
   margin-left: auto;
   font-size: 0.72rem;

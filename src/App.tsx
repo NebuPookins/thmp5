@@ -171,7 +171,7 @@ type CompoundArtistCheck = {
 
 type FileIssue = {
   file_path: string;
-  kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame";
+  kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists";
   message: string;
   source_id?: string;
   recording_id?: string;
@@ -179,6 +179,7 @@ type FileIssue = {
   field_name?: string;
   lofty_value?: string;
   corrected_value?: string;
+  backup_path?: string;
 };
 
 type QueueItem = RecordingRow;
@@ -568,6 +569,7 @@ function App() {
   const [settingsTab, setSettingsTab] = useState<"options" | "issues">("options");
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
   const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
+  const [deletingBackups, setDeletingBackups] = useState<Set<string>>(new Set());
   const [resolvingDuplicates, setResolvingDuplicates] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
@@ -2884,7 +2886,7 @@ function App() {
                       <li key={i} className="issue-item">
                         <div className="issue-item-header">
                           <span className={`issue-kind issue-kind-${issue.kind}`}>
-                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : issue.kind === "duplicate_frame" ? "Duplicate Tag" : "Playback"}
+                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : issue.kind === "duplicate_frame" ? "Duplicate Tag" : issue.kind === "backup_file_exists" ? "Backup" : "Playback"}
                           </span>
                           {issue.kind === "orphan_source" ? (
                             <button
@@ -2950,6 +2952,23 @@ function App() {
                                 {resolvingDuplicates.has(issue.file_path + issue.frame_id) ? "Applying…" : `Use: ${issue.lofty_value?.substring(0, 60)}`}
                               </button>
                             </div>
+                          ) : issue.kind === "backup_file_exists" ? (
+                            <button
+                              className="fix-orphan-btn"
+                              type="button"
+                              disabled={deletingBackups.has(issue.backup_path ?? "")}
+                              onClick={() => {
+                                const bp = issue.backup_path!;
+                                setDeletingBackups(prev => new Set(prev).add(bp));
+                                void (async () => {
+                                  await invoke("delete_backup_file", { backupPath: bp });
+                                  setFileIssues(prev => prev.filter(fi => fi.backup_path !== bp));
+                                  setDeletingBackups(prev => { const n = new Set(prev); n.delete(bp); return n; });
+                                })();
+                              }}
+                            >
+                              {deletingBackups.has(issue.backup_path ?? "") ? "Deleting…" : "Delete backup"}
+                            </button>
                           ) : null}
                         </div>
                         <span className="issue-path" title={issue.file_path}>

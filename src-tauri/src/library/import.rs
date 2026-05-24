@@ -294,6 +294,33 @@ pub async fn rescan_source(
         );
     }
 
+    // Detect backup files from tag edits (adjacent .thmp5bak files).
+    //
+    // Clear stale BackupFileExists issues for this file first, then
+    // re-scan for backup files.
+    file_issues.retain(|issue| {
+        !(issue.kind == FileIssueKind::BackupFileExists
+            && issue.file_path == path.display().to_string())
+    });
+    if let Some(parent) = path.parent() {
+        let file_name = path.file_name().map(|n| n.to_string_lossy());
+        if let Some(file_name) = file_name {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let entry_name = entry.file_name().to_string_lossy().to_string();
+                    if entry_name.starts_with(&format!("{}.", file_name.as_ref()))
+                        && entry_name.ends_with(".thmp5bak")
+                    {
+                        file_issues.push_backup_exists(
+                            path.display().to_string(),
+                            entry.path().display().to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     Ok(recording_id)
 }
 

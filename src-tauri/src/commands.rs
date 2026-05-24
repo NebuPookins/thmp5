@@ -1,6 +1,6 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::db::DbPool;
-use crate::file_issues::FileIssue;
+use crate::file_issues::{FileIssue, FileIssueKind};
 use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistRow, CompoundArtistCheck, DbPoolDebugSnapshot,
@@ -607,6 +607,92 @@ pub async fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<Fi
     let catalog = state.catalog.read().await;
     issues.extend(catalog.file_issues());
     Ok(issues)
+}
+
+/// Delete a `.thmp5bak` backup file created by a previous tag edit.
+#[tauri::command]
+pub async fn delete_backup_file(
+    state: tauri::State<'_, AppState>,
+    backup_path: String,
+) -> Result<(), String> {
+    let p = std::path::Path::new(&backup_path);
+    if p.exists() {
+        std::fs::remove_file(p).map_err(|e| format!("Failed to delete backup file: {e}"))?;
+    }
+    // Remove the corresponding issue from the log.
+    state.file_issues.retain(|issue| {
+        !(issue.kind == FileIssueKind::BackupFileExists
+            && issue.backup_path.as_deref() == Some(&backup_path))
+    });
+    Ok(())
+}
+
+/// Write (upsert) a single ID3v2 text frame in a file's tag section.
+#[tauri::command]
+pub async fn write_tag_frame(
+    _app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+    frame_id: String,
+    new_value: String,
+) -> Result<crate::library::tag_writer::TagWriteResult, String> {
+    let path_buf = std::path::Path::new(&file_path).to_path_buf();
+    let fid = frame_id.clone();
+    let nv = new_value.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::library::tag_writer::write_single_frame(&path_buf, &fid, &nv)
+    })
+    .await
+    .map_err(|e| format!("Tag write task panicked: {e}"))?
+    .map_err(|e| format!("Failed to write tag: {e}"))?;
+
+    // Re-read metadata and update DB via rescan (lightweight — skips
+    // AcoustID by passing None for the API key).
+    do_rescan_source(
+        &state.db,
+        std::path::Path::new(&file_path),
+        state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
+        &state.file_issues,
+    )
+    .await
+    .map_err(|e| format!("Failed to re-scan after tag edit: {e}"))?;
+
+    reload_catalog(&state).await;
+    Ok(result)
+}
+
+/// Delete all frames matching `frame_id` from a file's tag section.
+#[tauri::command]
+pub async fn delete_tag_frame(
+    _app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+    frame_id: String,
+) -> Result<crate::library::tag_writer::TagWriteResult, String> {
+    let path_buf = std::path::Path::new(&file_path).to_path_buf();
+    let fid = frame_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::library::tag_writer::delete_frame(&path_buf, &fid)
+    })
+    .await
+    .map_err(|e| format!("Tag delete task panicked: {e}"))?
+    .map_err(|e| format!("Failed to delete tag frame: {e}"))?;
+
+    do_rescan_source(
+        &state.db,
+        std::path::Path::new(&file_path),
+        state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
+        &state.file_issues,
+    )
+    .await
+    .map_err(|e| format!("Failed to re-scan after tag delete: {e}"))?;
+
+    reload_catalog(&state).await;
+    Ok(result)
 }
 
 /// Fix an orphan source by re-scanning its file metadata and re-creating the
