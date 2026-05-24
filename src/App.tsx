@@ -1240,9 +1240,49 @@ function App() {
     if (playable.length === 0) {
       return;
     }
-    const pick = playable[Math.floor(Math.random() * playable.length)];
-    setQueue((current) => [...current, pick]);
-  }, [autoDj, queue, recordings]);
+
+    const pickRandom = (items: RecordingRow[]): RecordingRow | undefined => {
+      if (items.length === 0) return undefined;
+      return items[Math.floor(Math.random() * items.length)];
+    };
+
+    const ratedHistory = history.filter((r) => r.rating !== null);
+
+    let pick: RecordingRow | undefined;
+
+    if (ratedHistory.length === 0) {
+      // No rated songs in history — try unrated, fallback to any
+      pick =
+        pickRandom(playable.filter((r) => r.rating === null)) ??
+        pickRandom(playable);
+    } else {
+      const avgRating =
+        ratedHistory.reduce((sum, r) => sum + r.rating!, 0) /
+        ratedHistory.length;
+
+      if (avgRating >= 2.5 && avgRating <= 3.5) {
+        // Middle ground — try a highly rated song (4+), fallback to any
+        pick =
+          pickRandom(playable.filter((r) => r.rating !== null && r.rating >= 4)) ??
+          pickRandom(playable);
+      } else if (avgRating < 2.5) {
+        // Listeners are being too harsh — try a 5, then a 4, then any
+        pick =
+          pickRandom(playable.filter((r) => r.rating !== null && r.rating >= 5)) ??
+          pickRandom(playable.filter((r) => r.rating !== null && r.rating >= 4)) ??
+          pickRandom(playable);
+      } else {
+        // avgRating > 3.5 — listeners are in a good mood, try something unrated
+        pick =
+          pickRandom(playable.filter((r) => r.rating === null)) ??
+          pickRandom(playable);
+      }
+    }
+
+    if (pick) {
+      setQueue((current) => [...current, pick]);
+    }
+  }, [autoDj, queue, recordings, history]);
 
   useEffect(() => {
     if (!currentTrack?.primary_source_id) {
