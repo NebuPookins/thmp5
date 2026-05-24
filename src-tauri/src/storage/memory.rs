@@ -329,21 +329,13 @@ impl MemoryCatalog {
             let bpm = tag_first(canonical_tags, "TBPM").and_then(|s| s.parse::<f64>().ok());
             let comment = tag_first(canonical_tags, "COMM").map(str::to_string);
 
-            let primary_artist_name = tag_first(canonical_tags, "TPE1").map(str::to_string);
+            let tpe1_name = tag_first(canonical_tags, "TPE1").map(str::to_string);
+            let all_artist_names = extract_artist_names(canonical_tags);
 
-            // All artist names: TPE1 first, then semicolon-split TXXX:ARTISTS
-            let mut all_artist_names: Vec<String> = Vec::new();
-            if let Some(n) = &primary_artist_name {
-                all_artist_names.push(n.clone());
-            }
-            if let Some(extra) = tag_first(canonical_tags, "TXXX:ARTISTS") {
-                for part in extra.split(';') {
-                    let t = part.trim();
-                    if !t.is_empty() && !all_artist_names.iter().any(|x| x == t) {
-                        all_artist_names.push(t.to_string());
-                    }
-                }
-            }
+            // primary_artist_name carries the credited-as name (TPE1) for
+            // comparisons like release-group artist matching; fall back to
+            // the first individual artist name if no TPE1 is present.
+            let primary_artist_name = tpe1_name.or_else(|| all_artist_names.first().cloned());
 
             // Derive artist IDs (MBID when present, hash fallback)
             let primary_mbid = tag_first(canonical_tags, "TXXX:MusicBrainz Artist Id");
@@ -590,6 +582,30 @@ impl MemoryCatalog {
 
 fn tag_first<'a>(tags: &'a [(String, String)], key: &str) -> Option<&'a str> {
     tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// Extract individual artist names from canonical tags.
+///
+/// Prefers [`TXXX:ARTISTS`] when available.  Null bytes separate individual
+/// artists in raw ID3v2 tags; the Lofty path joins them with `"; "`.  When a
+/// NUL byte is present we split on NUL only (so semicolons inside an artist
+/// name are preserved); otherwise split on `';'`.  Falls back to [`TPE1`] when
+/// `TXXX:ARTISTS` is absent.
+pub(crate) fn extract_artist_names(tags: &[(String, String)]) -> Vec<String> {
+    let tpe1_name = tag_first(tags, "TPE1");
+    let mut all = Vec::new();
+    if let Some(extra) = tag_first(tags, "TXXX:ARTISTS") {
+        let sep = if extra.contains('\0') { '\0' } else { ';' };
+        for part in extra.split(sep) {
+            let t = part.trim();
+            if !t.is_empty() {
+                all.push(t.to_string());
+            }
+        }
+    } else if let Some(n) = tpe1_name {
+        all.push(n.to_string());
+    }
+    all
 }
 
 /// Parse "N" or "N/M" track string; returns (position, total).
@@ -1561,5 +1577,87 @@ fn pseudo_shuffle<T>(v: &mut [T], seed: u64) {
             .wrapping_add(1442695040888963407);
         let j = (state >> 33) as usize % (i + 1);
         v.swap(i, j);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_artist_names;
+
+    #[test]
+    fn txxx_artists_null_separated_preferred_over_tpe1() {
+        let tags = vec![
+            ("TPE1".into(), "Saori Kobayashi & Mariko Nanba".into()),
+            (
+                "TXXX:ARTISTS".into(),
+                "Saori Kobayashi\0Mariko Nanba".into(),
+            ),
+        ];
+        let names = extract_artist_names(&tags);
+        assert_eq!(names, vec!["Saori Kobayashi", "Mariko Nanba"]);
+    }
+
+    #[test]
+    fn txxx_artists_semicolon_separated() {
+        let tags = vec![
+            ("TPE1".into(), "Various Artists".into()),
+            ("TXXX:ARTISTS".into(), "Artist A; Artist B".into()),
+        ];
+        let names = extract_artist_names(&tags);
+        assert_eq!(names, vec!["Artist A", "Artist B"]);
+    }
+
+    #[test]
+    fn fallback_to_tpe1_when_txxx_artists_missing() {
+        let tags = vec![("TPE1".into(), "Solo Artist".into())];
+        let names = extract_artist_names(&tags);
+        assert_eq!(names, vec!["Solo Artist"]);
+    }
+
+    #[test]
+    fn no_tpe1_no_txxx_artists_produces_empty_list() {
+        let tags = vec![("TIT2".into(), "Some Song".into())];
+        let names = extract_artist_names(&tags);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn semicolon_in_artist_name_preserved_when_null_delimiter_used() {
+        let tags = vec![
+            ("TPE1".into(), "Band, The".into()),
+            (
+                "TXXX:ARTISTS".into(),
+                "Band, The\0Feat. Semicolon; Band".into(),
+            ),
+        ];
+        let names = extract_artist_names(&tags);
+        assert_eq!(names, vec!["Band, The", "Feat. Semicolon; Band"]);
+    }
+
+    #[test]
+    fn tpe1_not_in_artist_list_when_txxx_artists_present() {
+        let tags = vec![
+            ("TPE1".into(), "Saori Kobayashi & Mariko Nanba".into()),
+            (
+                "TXXX:ARTISTS".into(),
+                "Saori Kobayashi\0Mariko Nanba".into(),
+            ),
+        ];
+        let names = extract_artist_names(&tags);
+        assert!(
+            !names.iter().any(|n| n == "Saori Kobayashi & Mariko Nanba"),
+            "TPE1 compound name must not appear when TXXX:ARTISTS is present"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains('\0')),
+            "no artist name should contain a raw NUL byte"
+        );
+    }
+
+    #[test]
+    fn single_artist_no_separator_in_txxx_artists() {
+        let tags = vec![("TXXX:ARTISTS".into(), "Single Artist".into())];
+        let names = extract_artist_names(&tags);
+        assert_eq!(names, vec!["Single Artist"]);
     }
 }
