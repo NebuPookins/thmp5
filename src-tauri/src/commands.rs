@@ -5,11 +5,12 @@ use crate::library::import::{import_paths as do_import, rescan_source as do_resc
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistRow, CompoundArtistCheck, DbPoolDebugSnapshot,
     ExternalCommand, FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest,
-    ImportProgress, ImportStats, InitialSetupRequest, LibrarySummary, PlayHistoryInput,
-    PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate, RecordingDetail,
-    RecordingRatingUpdateResult, RecordingRow, ReleaseGroupDetail, ReleaseGroupRow,
-    SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult, SourceRatingUpdateRequest,
-    VolumeRequest,
+    ImportProgress, ImportStats, InitialSetupRequest, LastFmAuthUrl, LastFmGetTrackLovedRequest,
+    LastFmLoveTrackRequest, LastFmNowPlayingRequest, LastFmScrobbleRequest, LastFmStatus,
+    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
+    RecordingDetail, RecordingRatingUpdateResult, RecordingRow, ReleaseGroupDetail,
+    ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult,
+    SourceRatingUpdateRequest, VolumeRequest,
 };
 use crate::query;
 use crate::storage::CatalogReader;
@@ -1472,6 +1473,337 @@ pub async fn merge_recordings(
         .await
         .map_err(|e| e.to_string())?;
     Ok(result)
+}
+
+// ── Last.fm scrobbling ─────────────────────────────────────────────────────────
+
+pub(crate) async fn load_lastfm_config(
+    db: &crate::db::DbPool,
+) -> Result<crate::lastfm::LastFmConfig, String> {
+    let mut conn = db
+        .acquire("lastfm.load_config")
+        .await
+        .map_err(|e| format!("DB error loading Last.fm config: {e}"))?;
+
+    let api_key: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_api_key'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| format!("DB query error for lastfm_api_key: {e}"))?;
+
+    let shared_secret: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_shared_secret'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| format!("DB query error for lastfm_shared_secret: {e}"))?;
+
+    match (api_key, shared_secret) {
+        (Some(api_key), Some(shared_secret)) => {
+            tracing::debug!("Loaded Last.fm config from app_config");
+            Ok(crate::lastfm::LastFmConfig {
+                api_key,
+                shared_secret,
+            })
+        }
+        _ => {
+            tracing::warn!(
+                "Last.fm not configured — missing api_key or shared_secret in app_config"
+            );
+            Err(
+                "Last.fm not configured. Enter your API key and shared secret in Settings."
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// Save the Last.fm API key and shared secret to app_config.
+#[tauri::command]
+pub async fn save_lastfm_credentials(
+    state: tauri::State<'_, AppState>,
+    api_key: String,
+    shared_secret: String,
+) -> Result<(), String> {
+    tracing::info!("Saving Last.fm credentials");
+    if api_key.trim().is_empty() || shared_secret.trim().is_empty() {
+        tracing::warn!("Attempted to save empty Last.fm credentials");
+        return Err("API key and shared secret must not be empty.".to_string());
+    }
+
+    let mut conn = state
+        .db
+        .acquire("lastfm.save_credentials")
+        .await
+        .map_err(|e| format!("DB error saving Last.fm credentials: {e}"))?;
+
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to start transaction: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO app_config (key, value) VALUES ('lastfm_api_key', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(api_key.trim())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("Failed to save lastfm_api_key: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO app_config (key, value) VALUES ('lastfm_shared_secret', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(shared_secret.trim())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("Failed to save lastfm_shared_secret: {e}"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit transaction: {e}"))?;
+    tracing::info!("Last.fm credentials saved successfully");
+    Ok(())
+}
+
+/// Returns the current Last.fm integration status.
+#[tauri::command]
+pub async fn get_lastfm_status(state: tauri::State<'_, AppState>) -> Result<LastFmStatus, String> {
+    tracing::debug!("get_lastfm_status called");
+    let mut conn = state
+        .db
+        .acquire("lastfm.get_status")
+        .await
+        .map_err(|e| format!("DB error getting Last.fm status: {e}"))?;
+
+    let api_key: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_api_key'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| format!("DB query error for lastfm_api_key: {e}"))?;
+    let configured = api_key.is_some();
+
+    let session_key: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_session_key'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| format!("DB query error for lastfm_session_key: {e}"))?;
+
+    let username: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_username'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| format!("DB query error for lastfm_username: {e}"))?;
+
+    tracing::debug!(
+        configured,
+        logged_in = session_key.is_some(),
+        "Last.fm status"
+    );
+    Ok(LastFmStatus {
+        configured,
+        logged_in: session_key.is_some(),
+        username,
+    })
+}
+
+/// Generate a Last.fm auth token and return the URL the user must visit to authorize the app.
+/// Stores the token in `state.lastfm_auth_token` for the subsequent `lastfm_complete_auth` call.
+#[tauri::command]
+pub async fn lastfm_get_auth_url(
+    state: tauri::State<'_, AppState>,
+) -> Result<LastFmAuthUrl, String> {
+    tracing::info!("lastfm_get_auth_url called");
+    let config = load_lastfm_config(&state.db).await?;
+
+    let token = crate::lastfm::get_token(&config).await?;
+    tracing::info!(token_prefix = %token.chars().take(8).collect::<String>(), "Obtained Last.fm auth token");
+
+    // Store the token in memory for the completion step
+    *state.lastfm_auth_token.lock().map_err(|e| e.to_string())? = Some(token.clone());
+
+    let url = format!(
+        "https://www.last.fm/api/auth/?api_key={}&token={}",
+        config.api_key, token
+    );
+    tracing::info!("Returning Last.fm auth URL");
+    Ok(LastFmAuthUrl { url })
+}
+
+/// Complete the Last.fm authentication by exchanging the previously-obtained token for a session key.
+/// Persists the session key and username to app_config.
+#[tauri::command]
+pub async fn lastfm_complete_auth(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    tracing::info!("lastfm_complete_auth called");
+    let config = load_lastfm_config(&state.db).await?;
+
+    let token = state
+        .lastfm_auth_token
+        .lock()
+        .map_err(|e| {
+            tracing::error!("Failed to lock lastfm_auth_token mutex: {e}");
+            e.to_string()
+        })?
+        .take()
+        .ok_or_else(|| {
+            tracing::warn!(
+                "No pending auth token found — lastfm_get_auth_url must be called first"
+            );
+            "No pending auth request. Call lastfm_get_auth_url first.".to_string()
+        })?;
+
+    tracing::info!(token_prefix = %token.chars().take(8).collect::<String>(), "Exchanging token for session");
+    let (session_key, username) = crate::lastfm::get_session(&config, &token).await?;
+    tracing::info!(%username, "Session obtained, persisting to app_config");
+
+    let mut conn = state
+        .db
+        .acquire("lastfm.complete_auth")
+        .await
+        .map_err(|e| format!("DB error on complete_auth: {e}"))?;
+
+    let mut tx = conn
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to start transaction: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO app_config (key, value) VALUES ('lastfm_session_key', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&session_key)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("Failed to save session_key: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO app_config (key, value) VALUES ('lastfm_username', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&username)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("Failed to save username: {e}"))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit transaction: {e}"))?;
+
+    tracing::info!(%username, "Last.fm auth complete — user is now logged in");
+    Ok(username)
+}
+
+/// Disconnect from Last.fm by removing the stored session key and username.
+#[tauri::command]
+pub async fn lastfm_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("lastfm_disconnect called");
+    let mut conn = state
+        .db
+        .acquire("lastfm.disconnect")
+        .await
+        .map_err(|e| format!("DB error disconnecting: {e}"))?;
+
+    sqlx::query("DELETE FROM app_config WHERE key IN ('lastfm_session_key', 'lastfm_username')")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("Failed to remove session data: {e}"))?;
+
+    tracing::info!("Last.fm session cleared");
+    Ok(())
+}
+
+/// Love (heart) a track on Last.fm.
+#[tauri::command]
+pub async fn lastfm_love_track(
+    state: tauri::State<'_, AppState>,
+    request: LastFmLoveTrackRequest,
+) -> Result<(), String> {
+    tracing::info!(artist = %request.artist, track = %request.track, "lastfm_love_track called");
+    let config = load_lastfm_config(&state.db).await?;
+    let session_key = load_lastfm_session_key(&state.db).await?;
+
+    let result =
+        crate::lastfm::love_track(&config, &session_key, &request.artist, &request.track).await;
+    if let Err(ref e) = result {
+        tracing::warn!("Love track failed: {e}");
+    }
+    result
+}
+
+/// Check whether the current user has loved a track on Last.fm.
+#[tauri::command]
+pub async fn lastfm_get_track_loved(
+    state: tauri::State<'_, AppState>,
+    request: LastFmGetTrackLovedRequest,
+) -> Result<bool, String> {
+    tracing::info!(artist = %request.artist, track = %request.track, "lastfm_get_track_loved called");
+    let config = load_lastfm_config(&state.db).await?;
+    let session_key = load_lastfm_session_key(&state.db).await?;
+    crate::lastfm::get_track_loved(&config, &session_key, &request.artist, &request.track).await
+}
+
+/// Update the "now playing" status on Last.fm for the currently playing track.
+#[tauri::command]
+pub async fn lastfm_now_playing(
+    state: tauri::State<'_, AppState>,
+    request: LastFmNowPlayingRequest,
+) -> Result<(), String> {
+    tracing::info!(artist = %request.artist, track = %request.track, album = ?request.album, "lastfm_now_playing called");
+    let config = load_lastfm_config(&state.db).await?;
+    let session_key = load_lastfm_session_key(&state.db).await?;
+
+    let result = crate::lastfm::now_playing(
+        &config,
+        &session_key,
+        &request.artist,
+        &request.track,
+        request.album.as_deref(),
+    )
+    .await;
+    if let Err(ref e) = result {
+        tracing::warn!("Now playing update failed: {e}");
+    }
+    result
+}
+
+/// Scrobble a track to Last.fm. `timestamp` is the UNIX second when the track started playing.
+#[tauri::command]
+pub async fn lastfm_scrobble(
+    state: tauri::State<'_, AppState>,
+    request: LastFmScrobbleRequest,
+) -> Result<(), String> {
+    tracing::info!(artist = %request.artist, track = %request.track, timestamp = %request.timestamp, "lastfm_scrobble called");
+    let config = load_lastfm_config(&state.db).await?;
+    let session_key = load_lastfm_session_key(&state.db).await?;
+
+    let result = crate::lastfm::scrobble(
+        &config,
+        &session_key,
+        &request.artist,
+        &request.track,
+        request.album.as_deref(),
+        request.timestamp,
+    )
+    .await;
+    if let Err(ref e) = result {
+        tracing::warn!("Scrobble failed: {e}");
+    }
+    result
+}
+
+pub(crate) async fn load_lastfm_session_key(db: &crate::db::DbPool) -> Result<String, String> {
+    let mut conn = db
+        .acquire("lastfm.load_session_key")
+        .await
+        .map_err(|e| format!("DB error loading session key: {e}"))?;
+    sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_session_key'")
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| format!("DB query error for session key: {e}"))?
+        .ok_or_else(|| {
+            tracing::warn!("No Last.fm session key in app_config");
+            "Not logged in to Last.fm. Connect in Settings.".to_string()
+        })
 }
 
 fn validate_rating(stars: Option<i64>) -> Result<(), String> {

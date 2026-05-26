@@ -5,6 +5,7 @@ mod db;
 pub mod file_issues;
 pub mod fingerprint;
 mod importer;
+mod lastfm;
 mod library;
 mod logging;
 mod models;
@@ -19,7 +20,8 @@ use file_issues::FileIssueLog;
 use importer::ImportManager;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
-use tauri::Manager;
+use std::sync::Mutex;
+use tauri::{Emitter, Manager};
 use tokio::sync::{RwLock, Semaphore};
 
 pub struct AppState {
@@ -39,6 +41,8 @@ pub struct AppState {
     /// Serializes write operations (rescan, delete) so only one DB writer is active at a time,
     /// preventing SQLITE_BUSY / "database is locked" errors under concurrent access.
     pub write_serializer: Arc<Semaphore>,
+    /// Temporary auth token stored between `lastfm_get_auth_url` and `lastfm_complete_auth`.
+    pub lastfm_auth_token: Mutex<Option<String>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -68,8 +72,116 @@ pub fn run() {
             }
             let file_issues = FileIssueLog::new();
             let write_serializer = Arc::new(Semaphore::new(1));
-            let player = AudioEngineHandle::new(app.handle().clone(), file_issues.clone())
-                .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
+
+            // Channel for the audio engine to send Last.fm events to a background listener.
+            let (lastfm_tx, mut lastfm_rx) = tokio::sync::mpsc::channel::<audio::LastFmAction>(256);
+            let db_for_lastfm = pool.clone();
+            let lastfm_app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(action) = lastfm_rx.recv().await {
+                    match action {
+                        audio::LastFmAction::NowPlaying { artist, track } => {
+                            let config =
+                                match crate::commands::load_lastfm_config(&db_for_lastfm).await {
+                                    Ok(c) => c,
+                                    Err(_) => continue,
+                                };
+                            let session_key = match crate::commands::load_lastfm_session_key(
+                                &db_for_lastfm,
+                            )
+                            .await
+                            {
+                                Ok(k) => k,
+                                Err(_) => continue,
+                            };
+                            let _ =
+                                lastfm::now_playing(&config, &session_key, &artist, &track, None)
+                                    .await;
+                            // Query loved status and push to frontend so the heart button updates.
+                            match lastfm::get_track_loved(&config, &session_key, &artist, &track)
+                                .await
+                            {
+                                Ok(loved) => {
+                                    let _ = lastfm_app_handle.emit("lastfm-loved-status", loved);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        artist,
+                                        track,
+                                        "Last.fm: loved status query failed: {e}"
+                                    );
+                                    let _ = lastfm_app_handle.emit("lastfm-loved-status", false);
+                                }
+                            }
+                        }
+                        audio::LastFmAction::Scrobble {
+                            artist,
+                            track,
+                            started_at_secs,
+                            played_ms,
+                            duration_ms,
+                        } => {
+                            tracing::info!(
+                                artist,
+                                track,
+                                started_at_secs,
+                                played_ms,
+                                duration_ms,
+                                "Last.fm scrobble received by listener"
+                            );
+                            // Only scrobble if track > 30s and played >= min(50%, 4 min).
+                            // If duration is unknown (0), use played_ms alone — scrobble
+                            // if at least 30s were played.
+                            if duration_ms > 0 && duration_ms < 30_000 {
+                                tracing::info!(
+                                    "Skipping scrobble: duration {}ms < 30s",
+                                    duration_ms
+                                );
+                                continue;
+                            }
+                            let min_play_ms = if duration_ms > 0 {
+                                std::cmp::min(duration_ms / 2, 240_000)
+                            } else {
+                                30_000
+                            };
+                            if played_ms < min_play_ms {
+                                tracing::info!(
+                                    "Skipping scrobble: played {}ms < min {}ms",
+                                    played_ms,
+                                    min_play_ms
+                                );
+                                continue;
+                            }
+                            let config =
+                                match crate::commands::load_lastfm_config(&db_for_lastfm).await {
+                                    Ok(c) => c,
+                                    Err(_) => continue,
+                                };
+                            let session_key = match crate::commands::load_lastfm_session_key(
+                                &db_for_lastfm,
+                            )
+                            .await
+                            {
+                                Ok(k) => k,
+                                Err(_) => continue,
+                            };
+                            let _ = lastfm::scrobble(
+                                &config,
+                                &session_key,
+                                &artist,
+                                &track,
+                                None,
+                                started_at_secs,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            });
+
+            let player =
+                AudioEngineHandle::new(app.handle().clone(), file_issues.clone(), Some(lastfm_tx))
+                    .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
             let mem_catalog =
                 tauri::async_runtime::block_on(storage::memory::MemoryCatalog::load_from_db(&pool))
                     .map_err(|e| format!("Failed to build in-memory catalog: {e}"))?;
@@ -89,6 +201,7 @@ pub fn run() {
                 file_issues,
                 pending_jobs: AtomicI64::new(0),
                 write_serializer,
+                lastfm_auth_token: Mutex::new(None),
             };
 
             if let Ok(Some(root_path)) =
@@ -157,6 +270,15 @@ pub fn run() {
             commands::get_release_group_detail,
             commands::get_recording_detail,
             commands::check_artist_compound,
+            commands::get_lastfm_status,
+            commands::save_lastfm_credentials,
+            commands::lastfm_get_auth_url,
+            commands::lastfm_complete_auth,
+            commands::lastfm_disconnect,
+            commands::lastfm_love_track,
+            commands::lastfm_get_track_loved,
+            commands::lastfm_now_playing,
+            commands::lastfm_scrobble,
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");

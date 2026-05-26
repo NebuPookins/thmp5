@@ -58,9 +58,12 @@ rusty-chromaprint = "0.3"
 thread-priority = "3"
 libc = "0.2"
 
-# HTTP client (AcoustID lookup)
+# HTTP client (AcoustID lookup, Last.fm scrobbling)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 base64 = "0.22"
+
+# Last.fm API signing (MD5)
+md-5 = "0.10"
 
 # Smart playlist query parser
 pest = "2"

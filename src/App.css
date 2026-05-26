@@ -366,6 +366,48 @@ button {
   opacity: 0.55;
 }
 
+.love-btn {
+  background: none;
+  border: none;
+  color: #a0aabf;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 4px;
+  transition: color 0.15s ease, transform 0.15s ease;
+  vertical-align: middle;
+}
+
+.love-btn:hover {
+  color: #e85d75;
+  transform: scale(1.2);
+}
+
+.love-btn-loved {
+  color: #e85d75;
+}
+
+.lastfm-hint {
+  color: #8b95a8;
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.lastfm-link {
+  color: #6a9bf5;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.lastfm-link:hover {
+  color: #8bb4ff;
+}
+
+.lastfm-connected {
+  color: #a0aabf;
+  font-size: 13px;
+}
+
 .filter-chip {
   border-radius: 999px;
   padding: 8px 12px;

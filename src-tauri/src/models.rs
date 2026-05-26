@@ -506,3 +506,44 @@ pub struct CompoundArtistCheck {
     pub individual_artist_names: Vec<String>,
     pub source_examples: Vec<String>,
 }
+
+// ── Last.fm scrobbling ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct LastFmStatus {
+    pub configured: bool,
+    pub logged_in: bool,
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LastFmAuthUrl {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LastFmLoveTrackRequest {
+    pub artist: String,
+    pub track: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LastFmNowPlayingRequest {
+    pub artist: String,
+    pub track: String,
+    pub album: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LastFmScrobbleRequest {
+    pub artist: String,
+    pub track: String,
+    pub album: Option<String>,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LastFmGetTrackLovedRequest {
+    pub artist: String,
+    pub track: String,
+}

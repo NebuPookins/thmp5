@@ -71,6 +71,26 @@ pub struct PlayerErrorEvent {
     pub message: String,
 }
 
+/// Events sent from the audio engine to a background task that handles
+/// Last.fm now-playing and scrobble API calls without frontend involvement.
+#[derive(Debug)]
+pub enum LastFmAction {
+    NowPlaying {
+        artist: String,
+        track: String,
+    },
+    Scrobble {
+        artist: String,
+        track: String,
+        /// UNIX timestamp (seconds) when the track started playing.
+        started_at_secs: i64,
+        /// Number of milliseconds of audio that were actually played.
+        played_ms: u64,
+        /// Total track duration in milliseconds.
+        duration_ms: u64,
+    },
+}
+
 /// Lock-free state accessible from the real-time cpal audio callback.
 /// The engine thread writes hot-path fields through atomics; the callback
 /// reads them without acquiring `SharedState`'s mutex.  The `current_track`
@@ -160,9 +180,15 @@ pub struct AudioEngineHandle {
 }
 
 impl AudioEngineHandle {
-    pub fn new(app: AppHandle, file_issues: FileIssueLog) -> Result<Self> {
+    pub fn new(
+        app: AppHandle,
+        file_issues: FileIssueLog,
+        lastfm_tx: Option<tokio::sync::mpsc::Sender<LastFmAction>>,
+    ) -> Result<Self> {
         let sleep_inhibitor = Arc::new(SleepInhibitor::new("thmp5", "Music playback in progress"));
-        let shared = Arc::new(Mutex::new(SharedState::new(sleep_inhibitor)));
+        let mut shared_state = SharedState::new(sleep_inhibitor);
+        shared_state.lastfm_tx = lastfm_tx;
+        let shared = Arc::new(Mutex::new(shared_state));
         let (tx, rx) = mpsc::channel();
         let command_shared = Arc::clone(&shared);
 
@@ -356,6 +382,10 @@ struct SharedState {
     current_artist: Option<String>,
     current_file_path: Option<String>,
     normalization_source: String,
+    /// Sender for Last.fm scrobble/now-playing events.
+    lastfm_tx: Option<tokio::sync::mpsc::Sender<LastFmAction>>,
+    /// UNIX second when the current track started playing (set in start_playback).
+    lastfm_track_started_at: Option<i64>,
 }
 
 impl SharedState {
@@ -367,6 +397,8 @@ impl SharedState {
             current_artist: None,
             current_file_path: None,
             normalization_source: String::from("None"),
+            lastfm_tx: None,
+            lastfm_track_started_at: None,
         }
     }
 
@@ -400,6 +432,7 @@ impl SharedState {
         self.current_artist = None;
         self.current_file_path = None;
         self.normalization_source = String::from("None");
+        self.lastfm_track_started_at = None;
     }
 }
 
@@ -505,6 +538,34 @@ fn handle_command(
             let mut state = shared
                 .lock()
                 .map_err(|_| anyhow!("Audio state lock poisoned"))?;
+            // Send scrobble before clearing if there's an active track.
+            if let (Some(artist), Some(track), Some(started_at), Some(ref tx)) = (
+                &state.current_artist,
+                &state.current_title,
+                state.lastfm_track_started_at,
+                &state.lastfm_tx,
+            ) {
+                let position_ms = ctx.position_ms();
+                let duration_ms = ctx.track_duration_ms.load(Ordering::Relaxed);
+                tracing::info!(
+                    artist,
+                    track,
+                    position_ms,
+                    duration_ms,
+                    "Sending scrobble on stop"
+                );
+                if let Err(e) = tx.try_send(LastFmAction::Scrobble {
+                    artist: artist.clone(),
+                    track: track.clone(),
+                    started_at_secs: started_at,
+                    played_ms: position_ms,
+                    duration_ms,
+                }) {
+                    tracing::warn!("Failed to send scrobble via channel: {e}");
+                }
+            } else {
+                tracing::info!("No active track metadata for scrobble on stop");
+            }
             state.clear_track(ctx);
         }
     }
@@ -561,13 +622,26 @@ fn start_playback(
     ctx.last_position_emit_ms
         .store(start_ms.saturating_sub(250), Ordering::Relaxed);
 
-    // Update SharedState metadata.
+    // Update SharedState metadata and emit Last.fm now-playing.
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
     {
         let mut state = shared.lock().unwrap();
         state.current_title = request.title.clone();
         state.current_artist = request.artist.clone();
         state.current_file_path = Some(request.file_path.clone());
         state.normalization_source = request.normalization_source.clone();
+        state.lastfm_track_started_at = Some(started_at);
+        if let (Some(artist), Some(track), Some(ref tx)) =
+            (&request.artist, &request.title, &state.lastfm_tx)
+        {
+            let _ = tx.try_send(LastFmAction::NowPlaying {
+                artist: artist.clone(),
+                track: track.clone(),
+            });
+        }
     }
 
     spawn_decoder_thread(
@@ -736,6 +810,33 @@ fn drain_events(
         let _ = app.emit(PLAYER_POSITION_EVENT, pos_ms);
     }
     while let Ok(event) = events.track_ended.try_recv() {
+        // Send Last.fm scrobble before clearing metadata.
+        if let Ok(state) = shared.lock() {
+            if let (Some(track), Some(artist), Some(started_at), Some(ref tx)) = (
+                &state.current_title,
+                &state.current_artist,
+                state.lastfm_track_started_at,
+                &state.lastfm_tx,
+            ) {
+                let duration_ms = ctx.track_duration_ms.load(Ordering::Relaxed);
+                tracing::info!(
+                    artist,
+                    track,
+                    position_ms = event.position_ms,
+                    duration_ms,
+                    "Sending scrobble on track end"
+                );
+                if let Err(e) = tx.try_send(LastFmAction::Scrobble {
+                    artist: artist.clone(),
+                    track: track.clone(),
+                    started_at_secs: started_at,
+                    played_ms: event.position_ms,
+                    duration_ms,
+                }) {
+                    tracing::warn!("Failed to send scrobble via channel: {e}");
+                }
+            }
+        }
         // Clear SharedState track metadata and release the sleep inhibitor.
         if let Ok(mut state) = shared.lock() {
             state.clear_track(ctx);

@@ -2,6 +2,7 @@ import { FormEvent, memo, useCallback, useEffect, useMemo, useReducer, useRef, u
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import "./App.css";
 
@@ -180,6 +181,12 @@ type FileIssue = {
   lofty_value?: string;
   corrected_value?: string;
   backup_path?: string;
+};
+
+type LastFmStatus = {
+  configured: boolean;
+  logged_in: boolean;
+  username: string | null;
 };
 
 type QueueItem = RecordingRow;
@@ -585,6 +592,14 @@ function App() {
   const [externalCommands, setExternalCommands] = useState<ExternalCommand[]>([]);
   const [newCmdName, setNewCmdName] = useState("");
   const [newCmdTemplate, setNewCmdTemplate] = useState("");
+  const [lastfmStatus, setLastfmStatus] = useState<LastFmStatus | null>(null);
+  const [lastfmAuthUrl, setLastfmAuthUrl] = useState<string | null>(null);
+  const [isLastfmConnecting, setIsLastfmConnecting] = useState(false);
+  const [isLastfmCompleting, setIsLastfmCompleting] = useState(false);
+  const [lastfmApiKeyInput, setLastfmApiKeyInput] = useState("");
+  const [lastfmSharedSecretInput, setLastfmSharedSecretInput] = useState("");
+  const [isSavingLastfmCredentials, setIsSavingLastfmCredentials] = useState(false);
+  const [currentTrackLoved, setCurrentTrackLoved] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [artistFixModal, setArtistFixModal] = useState<{ artistId: string; artistName: string } | null>(null);
   const [artistFixCheckResult, setArtistFixCheckResult] = useState<CompoundArtistCheck | null>(null);
@@ -969,15 +984,17 @@ function App() {
 
   async function loadBootstrap() {
     try {
-      const [bootstrapResult, currentPlayerState] = await Promise.all([
+      const [bootstrapResult, currentPlayerState, lastfmStatusResult] = await Promise.all([
         invoke<AppBootstrap>("get_app_bootstrap"),
         invoke<PlayerState>("get_player_state"),
+        invoke<LastFmStatus>("get_lastfm_status"),
       ]);
       setBootstrap(bootstrapResult);
       setQueueHistoryLimitInput(String(bootstrapResult.config.queue_history_limit));
       setMusicRootInput(bootstrapResult.config.music_root ?? "");
       setExternalCommands(bootstrapResult.config.external_commands ?? []);
       setPlayerState(currentPlayerState);
+      setLastfmStatus(lastfmStatusResult);
     } catch (loadError) {
       await reportPoolTimeout("loadBootstrap", loadError);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
@@ -1204,6 +1221,11 @@ function App() {
           }
         }
       });
+      const unlistenLoved = await listen<boolean>("lastfm-loved-status", (event) => {
+        if (isMounted) {
+          setCurrentTrackLoved(event.payload);
+        }
+      });
 
       return () => {
         unlistenState();
@@ -1211,6 +1233,7 @@ function App() {
         unlistenEnded();
         unlistenError();
         unlistenJobUpdate();
+        unlistenLoved();
       };
     }
 
@@ -1313,6 +1336,12 @@ function App() {
       () => setWaveformData(null),
     );
   }, [playerState.recording_id]);
+
+  // Reset loved status on track change; backend emits lastfm-loved-status with the actual value.
+  useEffect(() => {
+    if (!lastfmStatus?.logged_in) return;
+    setCurrentTrackLoved(false);
+  }, [playerState.recording_id, lastfmStatus?.logged_in]);
 
   // Draw waveform on canvas whenever data, position, or container size changes.
   useEffect(() => {
@@ -1891,6 +1920,75 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recordings]);
 
+  async function handleLoveTrack() {
+    if (!currentTrack?.artist_credit_name || !currentTrack?.title || !lastfmStatus?.logged_in) return;
+    try {
+      await invoke("lastfm_love_track", {
+        request: {
+          artist: currentTrack.artist_credit_name,
+          track: currentTrack.title,
+        },
+      });
+      setCurrentTrackLoved(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function handleSaveLastfmCredentials() {
+    if (isSavingLastfmCredentials) return;
+    setIsSavingLastfmCredentials(true);
+    try {
+      await invoke("save_lastfm_credentials", {
+        apiKey: lastfmApiKeyInput.trim(),
+        sharedSecret: lastfmSharedSecretInput.trim(),
+      });
+      setLastfmStatus((prev) => prev ? { ...prev, configured: true } : { configured: true, logged_in: false, username: null });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsSavingLastfmCredentials(false);
+    }
+  }
+
+  async function handleLastfmConnect() {
+    if (isLastfmConnecting) return;
+    setIsLastfmConnecting(true);
+    try {
+      const { url } = await invoke<{ url: string }>("lastfm_get_auth_url");
+      setLastfmAuthUrl(url);
+      await openUrl(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsLastfmConnecting(false);
+    }
+  }
+
+  async function handleLastfmCompleteAuth() {
+    if (isLastfmCompleting) return;
+    setIsLastfmCompleting(true);
+    try {
+      const username = await invoke<string>("lastfm_complete_auth");
+      setLastfmStatus({ configured: true, logged_in: true, username });
+      setLastfmAuthUrl(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsLastfmCompleting(false);
+    }
+  }
+
+  async function handleLastfmDisconnect() {
+    try {
+      await invoke("lastfm_disconnect");
+      setLastfmStatus({ configured: false, logged_in: false, username: null });
+      setLastfmAuthUrl(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function updateRecordingRating(recordingId: string, stars: number | null) {
     const ratingKey = `recording:${recordingId}`;
     const previousRecordings = recordings;
@@ -2052,6 +2150,14 @@ function App() {
                 recordingId={currentTrack.id}
                 value={currentTrack.rating}
               />
+              {lastfmStatus?.logged_in ? (
+                <button
+                  className={"love-btn" + (currentTrackLoved ? " love-btn-loved" : "")}
+                  onClick={() => { void handleLoveTrack(); }}
+                  title="Love on Last.fm"
+                  type="button"
+                >{currentTrackLoved ? "♥" : "♡"}</button>
+              ) : null}
               </span>
             ) : null}
           </div>
@@ -2864,6 +2970,67 @@ function App() {
                       {isSavingQueueSettings ? "Saving…" : "Save"}
                     </button>
                   </div>
+                </div>
+
+                <div className="modal-section">
+                  <p className="modal-section-label">Last.fm</p>
+                  {!lastfmStatus?.configured ? (
+                    <>
+                      <p className="lastfm-hint">Enter your Last.fm API credentials (get them at <span className="lastfm-link" onClick={() => { void openUrl("https://www.last.fm/api"); }} role="link" tabIndex={0}>last.fm/api</span>).</p>
+                      <div className="settings-row">
+                        <div>
+                          <label className="input-label" htmlFor="lastfm-api-key">API Key</label>
+                          <input
+                            id="lastfm-api-key"
+                            className="small-input"
+                            type="text"
+                            value={lastfmApiKeyInput}
+                            onChange={(e) => setLastfmApiKeyInput(e.currentTarget.value)}
+                            placeholder="your_api_key"
+                          />
+                        </div>
+                      </div>
+                      <div className="settings-row">
+                        <div>
+                          <label className="input-label" htmlFor="lastfm-shared-secret">Shared Secret</label>
+                          <input
+                            id="lastfm-shared-secret"
+                            className="small-input"
+                            type="text"
+                            value={lastfmSharedSecretInput}
+                            onChange={(e) => setLastfmSharedSecretInput(e.currentTarget.value)}
+                            placeholder="your_shared_secret"
+                          />
+                        </div>
+                      </div>
+                      <div className="settings-row">
+                        <button
+                          className="secondary-button"
+                          disabled={isSavingLastfmCredentials || !lastfmApiKeyInput.trim() || !lastfmSharedSecretInput.trim()}
+                          onClick={() => { void handleSaveLastfmCredentials(); }}
+                          type="button"
+                        >
+                          {isSavingLastfmCredentials ? "Saving…" : "Save Credentials"}
+                        </button>
+                      </div>
+                    </>
+                  ) : lastfmStatus.logged_in ? (
+                    <div className="settings-row">
+                      <span className="lastfm-connected">Connected as <strong>{lastfmStatus.username}</strong></span>
+                      <button className="secondary-button" onClick={() => { void handleLastfmDisconnect(); }} type="button">Disconnect</button>
+                    </div>
+                  ) : (
+                    <div className="settings-row">
+                      <button className="secondary-button" disabled={isLastfmConnecting} onClick={() => { void handleLastfmConnect(); }} type="button">
+                        {isLastfmConnecting ? "Connecting…" : "Connect to Last.fm"}
+                      </button>
+                      {lastfmAuthUrl ? (
+                        <button className="secondary-button" disabled={isLastfmCompleting} onClick={() => { void handleLastfmCompleteAuth(); }} type="button">
+                          {isLastfmCompleting ? "Completing…" : "Complete Login"}
+                        </button>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
 
                 <div className="modal-section">
