@@ -5,7 +5,7 @@ use crate::fingerprint::{self, AcoustIdMatch};
 use crate::models::{DuplicateFrameInfo, ImportStats, TrackMetadata};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use sqlx::{Connection, Sqlite, Transaction};
+use sqlx::Connection;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -108,8 +108,8 @@ pub async fn rescan_source(
         .acquire(format!("source_rescan.lookup path={path_str}"))
         .await
         .context("Failed to acquire DB connection for source rescan lookup")?;
-    let existing_source = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, recording_id
+    let existing_source = sqlx::query_scalar::<_, String>(
+        "SELECT id
          FROM source
          WHERE file_path = ? AND source_type = 'local_file'",
     )
@@ -119,7 +119,7 @@ pub async fn rescan_source(
     .context("Failed to load source for rescan")?
     .ok_or_else(|| anyhow::anyhow!("Source not found for path: {}", path.display()))?;
 
-    let (source_id, recording_id) = existing_source;
+    let source_id = existing_source;
     drop(conn);
     let (file_size, file_mtime_ms) = file_identity(path).context("Failed to read file metadata")?;
 
@@ -203,38 +203,7 @@ pub async fn rescan_source(
         "Rescan: read metadata"
     );
 
-    let title = blocking.meta.title.as_deref().unwrap_or("Unknown Title");
     let fingerprint_str = blocking.fp.as_ref().map(|f| f.fingerprint.as_str());
-
-    let acoustid_value = acoustid_match.as_ref().map(|a| a.acoustid.as_str());
-    let recording_mbid_value = acoustid_match
-        .as_ref()
-        .and_then(|a| a.recording_mbid.as_deref());
-
-    sqlx::query(
-        "UPDATE recording
-         SET title = ?,
-             duration_ms = ?,
-             genre = ?,
-             bpm = ?,
-             comment = ?,
-             acoustid = COALESCE(?, acoustid),
-             mbid = COALESCE(?, mbid)
-         WHERE id = ?",
-    )
-    .bind(title)
-    .bind(blocking.meta.duration_ms as i64)
-    .bind(&blocking.meta.genre)
-    .bind(blocking.meta.bpm)
-    .bind(&blocking.meta.comment)
-    .bind(acoustid_value)
-    .bind(recording_mbid_value)
-    .bind(&recording_id)
-    .execute(&mut *tx)
-    .await
-    .context("Failed to update recording during source rescan")?;
-
-    sync_tags_from_comment(&mut tx, &recording_id, blocking.meta.comment.as_deref()).await?;
 
     sqlx::query(
         "UPDATE source
@@ -274,7 +243,7 @@ pub async fn rescan_source(
         .await
         .context("Failed to commit source rescan transaction")?;
 
-    tracing::info!(path = %path.display(), recording_id = %recording_id, source_id = %source_id, "Rescanned source");
+    tracing::info!(path = %path.display(), source_id = %source_id, "Rescanned source");
     for warning in blocking.warnings {
         println!("[importer] rescan warning: {}: {}", path.display(), warning);
     }
@@ -321,7 +290,7 @@ pub async fn rescan_source(
         }
     }
 
-    Ok(recording_id)
+    Ok(source_id)
 }
 
 /// Returns `Ok(true)` if imported, `Ok(false)` if skipped (already exists).
@@ -505,118 +474,56 @@ pub(crate) async fn store_prepared_import(
         path_str,
         existing_source_id,
         hash,
-        meta,
+        mut meta,
         warnings,
         file_size,
         file_mtime_ms,
         fp,
-        acoustid_match,
+        acoustid_match: _,
         raw_tags_json,
     } = prepared;
 
-    let mut dup_conn = db
-        .acquire(format!("import.store.check_duplicate_hash path={path_str}"))
-        .await
-        .context("Failed to acquire DB connection for duplicate hash check")?;
-    let existing_with_hash = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, recording_id FROM source
-         WHERE file_hash = ?
-           AND (? IS NULL OR id != ?)
-         LIMIT 1",
-    )
-    .bind(&hash)
-    .bind(existing_source_id.as_deref())
-    .bind(existing_source_id.as_deref())
-    .fetch_optional(&mut *dup_conn)
-    .await
-    .context("DB error checking hash")?;
-    drop(dup_conn);
+    // Fallback: extract MusicBrainz Recording ID from raw_tags_json if the
+    // scanner (Lofty/TagLib) didn't populate it. The raw ID3 scanner always
+    // captures UFID:http://musicbrainz.org frames for ID3v2 files, so this
+    // is more reliable than relying solely on the Lofty/TagLib extraction path.
+    if meta.recording_mbid.is_none() {
+        if let Ok(tags) = serde_json::from_str::<Vec<(String, String)>>(&raw_tags_json) {
+            for (key, value) in &tags {
+                if key == "UFID:http://musicbrainz.org" && !value.is_empty() {
+                    meta.recording_mbid = Some(value.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    // Reverse: if the MBID was populated from the scanner (e.g. via Lofty or
+    // TagLib) but isn't in raw_tags_json yet, inject it so the catalog can
+    // group by MBID using raw_tags_json alone at load time.
+    let raw_tags_json = if meta.recording_mbid.is_some() {
+        let mut tags: Vec<(String, String)> =
+            serde_json::from_str(&raw_tags_json).unwrap_or_default();
+        let has_ufid = tags.iter().any(|(k, _)| k == "UFID:http://musicbrainz.org");
+        if !has_ufid {
+            if let Some(mbid) = &meta.recording_mbid {
+                tags.push(("UFID:http://musicbrainz.org".into(), mbid.clone()));
+            }
+        }
+        serde_json::to_string(&tags).unwrap_or(raw_tags_json)
+    } else {
+        raw_tags_json
+    };
 
     let _permit = serializer
         .acquire()
         .await
         .context("Failed to acquire write serializer for import")?;
 
-    if let Some((_matched_source_id, matched_recording_id)) = existing_with_hash {
-        // This file's content already exists at a different path (e.g. the file was moved or
-        // copied). Register the current path as an alternate source for the same recording
-        // rather than creating a duplicate recording.
-        let source_id = existing_source_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let fingerprint_str = fp.as_ref().map(|f| f.fingerprint.as_str());
-        let mut alt_conn = db
-            .acquire(format!("import.store.add_alternate_source path={path_str}"))
-            .await
-            .context("Failed to acquire DB connection for alternate source")?;
-        sqlx::query(
-            "INSERT INTO source (
-                id, recording_id, source_type, file_path, file_hash, format, duration_ms,
-                fingerprint, file_size, file_mtime_ms,
-                replay_gain_track_db, replay_gain_track_peak,
-                replay_gain_album_db, replay_gain_album_peak,
-                raw_tags_json
-             ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(file_path) DO UPDATE SET
-                recording_id = excluded.recording_id,
-                file_hash = excluded.file_hash,
-                format = excluded.format,
-                duration_ms = excluded.duration_ms,
-                fingerprint = COALESCE(excluded.fingerprint, fingerprint),
-                file_size = excluded.file_size,
-                file_mtime_ms = excluded.file_mtime_ms,
-                replay_gain_track_db = excluded.replay_gain_track_db,
-                replay_gain_track_peak = excluded.replay_gain_track_peak,
-                replay_gain_album_db = excluded.replay_gain_album_db,
-                replay_gain_album_peak = excluded.replay_gain_album_peak,
-                raw_tags_json = excluded.raw_tags_json",
-        )
-        .bind(&source_id)
-        .bind(&matched_recording_id)
-        .bind(&path_str)
-        .bind(&hash)
-        .bind(&meta.format)
-        .bind(meta.duration_ms as i64)
-        .bind(fingerprint_str)
-        .bind(file_size)
-        .bind(file_mtime_ms)
-        .bind(meta.replay_gain_track_db)
-        .bind(meta.replay_gain_track_peak)
-        .bind(meta.replay_gain_album_db)
-        .bind(meta.replay_gain_album_peak)
-        .bind(&raw_tags_json)
-        .execute(&mut *alt_conn)
-        .await
-        .context("Failed to insert alternate source")?;
-
-        tracing::debug!(
-            path = %path.display(),
-            recording_id = %matched_recording_id,
-            "Added as alternate source for existing recording (same file hash)"
-        );
-        for warning in warnings {
-            println!("[importer] import warning: {}: {}", path.display(), warning);
-        }
-        return Ok(true);
-    }
-
-    // ── 6. If re-importing (existing source found), look up the recording
-    //    to reuse so that we don't orphan the original recording. ─────────────
-    let existing_recording_id: Option<String> = if existing_source_id.is_some() {
-        let mut conn = db
-            .acquire(format!(
-                "import.store.lookup_recording_for_reimport path={path_str}"
-            ))
-            .await
-            .context("Failed to acquire DB connection for existing recording lookup")?;
-        sqlx::query_scalar::<_, String>("SELECT recording_id FROM source WHERE id = ?")
-            .bind(existing_source_id.as_deref().unwrap())
-            .fetch_optional(&mut *conn)
-            .await
-            .context("Failed to look up existing recording for source")?
-    } else {
-        None
-    };
+    let source_id = existing_source_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let fingerprint_str = fp.as_ref().map(|f| f.fingerprint.as_str());
 
     let mut conn = db
         .acquire(format!("import.store.transaction path={path_str}"))
@@ -627,59 +534,15 @@ pub(crate) async fn store_prepared_import(
         .await
         .context("Failed to start import transaction")?;
 
-    // ── 8. Find or create Recording ───────────────────────────────────────────
-    let recording_id = if let Some(ref rec_id) = existing_recording_id {
-        // Re-import of a file that already existed — update the existing recording
-        // in place rather than creating a new one (which would leave the original
-        // recording orphaned with no sources).
-        let title = meta.title.as_deref().unwrap_or("Unknown Title");
-        let acoustid_value = acoustid_match.as_ref().map(|a| a.acoustid.as_str());
-        let recording_mbid_value = acoustid_match
-            .as_ref()
-            .and_then(|a| a.recording_mbid.as_deref());
-        sqlx::query(
-            "UPDATE recording
-             SET title = ?,
-                 duration_ms = ?,
-                 genre = ?,
-                 bpm = ?,
-                 comment = ?,
-                 acoustid = COALESCE(?, acoustid),
-                 mbid = COALESCE(?, mbid)
-             WHERE id = ?",
-        )
-        .bind(title)
-        .bind(meta.duration_ms as i64)
-        .bind(&meta.genre)
-        .bind(meta.bpm)
-        .bind(&meta.comment)
-        .bind(acoustid_value)
-        .bind(recording_mbid_value)
-        .bind(rec_id)
-        .execute(&mut *tx)
-        .await
-        .context("Failed to update recording during re-import")?;
-
-        rec_id.clone()
-    } else {
-        find_or_create_recording(&mut tx, &meta, acoustid_match.as_ref()).await?
-    };
-    sync_tags_from_comment(&mut tx, &recording_id, meta.comment.as_deref()).await?;
-
-    let source_id = existing_source_id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let fingerprint_str = fp.as_ref().map(|f| f.fingerprint.as_str());
     sqlx::query(
         "INSERT INTO source (
-            id, recording_id, source_type, file_path, file_hash, format, duration_ms,
+            id, source_type, file_path, file_hash, format, duration_ms,
             fingerprint, file_size, file_mtime_ms, track_total,
             replay_gain_track_db, replay_gain_track_peak,
             replay_gain_album_db, replay_gain_album_peak,
             raw_tags_json
-         ) VALUES (?, ?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(file_path) DO UPDATE SET
-            recording_id = excluded.recording_id,
             file_hash = excluded.file_hash,
             format = excluded.format,
             duration_ms = excluded.duration_ms,
@@ -694,7 +557,6 @@ pub(crate) async fn store_prepared_import(
             raw_tags_json = excluded.raw_tags_json",
     )
     .bind(&source_id)
-    .bind(&recording_id)
     .bind(&path_str)
     .bind(&hash)
     .bind(&meta.format)
@@ -718,8 +580,6 @@ pub(crate) async fn store_prepared_import(
 
     tracing::debug!(
         path = %path.display(),
-        recording_id = %recording_id,
-        acoustid = acoustid_match.as_ref().map(|a| a.acoustid.as_str()).unwrap_or("none"),
         "Imported file"
     );
     for warning in warnings {
@@ -731,89 +591,6 @@ pub(crate) async fn store_prepared_import(
 // ─────────────────────────────────────────────────────────────────────────────
 // Recording deduplication (3 levels)
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Find an existing recording or create a new one.
-///
-/// Deduplication order:
-/// 1. AcoustID match — same acoustic fingerprint → same recording.
-/// 2. Create new.
-///
-/// SHA-256 deduplication (byte-for-byte identical files) is handled upstream
-/// in `store_prepared_import` before this function is called.
-async fn find_or_create_recording(
-    tx: &mut Transaction<'_, Sqlite>,
-    meta: &crate::models::TrackMetadata,
-    acoustid_match: Option<&AcoustIdMatch>,
-) -> Result<String> {
-    let title = meta.title.as_deref().unwrap_or("Unknown Title");
-    let duration = meta.duration_ms as i64;
-
-    // ── Level 1: AcoustID ────────────────────────────────────────────────────
-    if let Some(aid) = acoustid_match {
-        if let Some(id) =
-            sqlx::query_scalar::<_, String>("SELECT id FROM recording WHERE acoustid = ?")
-                .bind(&aid.acoustid)
-                .fetch_optional(&mut **tx)
-                .await?
-        {
-            tracing::debug!(acoustid = %aid.acoustid, recording_id = %id, "AcoustID hit");
-            return Ok(id);
-        }
-    }
-
-    // ── Level 2: create new ──────────────────────────────────────────────────
-    let id = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO recording (id, title, duration_ms, genre, bpm, comment, acoustid, mbid)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(title)
-    .bind(duration)
-    .bind(&meta.genre)
-    .bind(meta.bpm)
-    .bind(&meta.comment)
-    .bind(acoustid_match.as_ref().map(|a| a.acoustid.as_str()))
-    .bind(acoustid_match.and_then(|a| a.recording_mbid.as_deref()))
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(id)
-}
-
-/// Sync `recording_tag` rows from the recording's comment field.
-///
-/// Always updates `recording.comment` so rescans pick up changes, then
-/// replaces all tag rows with ones freshly parsed from the comment.
-async fn sync_tags_from_comment(
-    tx: &mut Transaction<'_, Sqlite>,
-    recording_id: &str,
-    comment: Option<&str>,
-) -> Result<()> {
-    sqlx::query("UPDATE recording SET comment = ? WHERE id = ?")
-        .bind(comment)
-        .bind(recording_id)
-        .execute(&mut **tx)
-        .await?;
-
-    sqlx::query("DELETE FROM recording_tag WHERE recording_id = ?")
-        .bind(recording_id)
-        .execute(&mut **tx)
-        .await?;
-
-    let tags = comment
-        .map(super::scanner::parse_comment_tags)
-        .unwrap_or_default();
-
-    for tag in tags {
-        sqlx::query("INSERT OR IGNORE INTO recording_tag (recording_id, tag) VALUES (?, ?)")
-            .bind(recording_id)
-            .bind(&tag)
-            .execute(&mut **tx)
-            .await?;
-    }
-    Ok(())
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilities
@@ -902,6 +679,18 @@ mod tests {
         meta: TrackMetadata,
         acoustid: Option<&str>,
     ) -> PreparedImport {
+        prepared_import_with_mbid(path, meta, acoustid, None)
+    }
+
+    fn prepared_import_with_mbid(
+        path: &Path,
+        mut meta: TrackMetadata,
+        acoustid: Option<&str>,
+        recording_mbid: Option<&str>,
+    ) -> PreparedImport {
+        if let Some(m) = recording_mbid {
+            meta.recording_mbid = Some(m.to_string());
+        }
         let (file_size, file_mtime_ms) = file_identity(path).unwrap();
         PreparedImport {
             path: path.to_path_buf(),
@@ -916,17 +705,17 @@ mod tests {
             acoustid_match: acoustid.map(|acoustid| AcoustIdMatch {
                 acoustid: acoustid.to_string(),
                 score: 1.0,
-                recording_mbid: None,
+                recording_mbid: recording_mbid.map(|s| s.to_string()),
             }),
             raw_tags_json: "[]".into(),
         }
     }
 
-    async fn recording_id_for_path(pool: &crate::db::DbPool, path: &Path) -> String {
+    async fn source_id_for_path(pool: &crate::db::DbPool, path: &Path) -> String {
         let path_str = path.to_string_lossy().to_string();
-        let mut conn = pool.acquire("test.recording_id_for_path").await.unwrap();
+        let mut conn = pool.acquire("test.source_id_for_path").await.unwrap();
         sqlx::query_scalar(
-            "SELECT recording_id FROM source WHERE file_path = ? AND source_type = 'local_file'",
+            "SELECT id FROM source WHERE file_path = ? AND source_type = 'local_file'",
         )
         .bind(path_str)
         .fetch_one(&mut *conn)
@@ -1004,7 +793,7 @@ mod tests {
 
         let file_path = tmp.path().join("test_dup.mp3");
         import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3(), &serializer).await;
-        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+        let _rec_id = source_id_for_path(&pool, &file_path).await;
 
         rescan_source(&pool, &file_path, None, &serializer, &file_issues)
             .await
@@ -1069,7 +858,7 @@ mod tests {
 
         let file_path = tmp.path().join("test_dup.mp3");
         import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3(), &serializer).await;
-        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+        let _rec_id = source_id_for_path(&pool, &file_path).await;
 
         rescan_source(&pool, &file_path, None, &serializer, &file_issues)
             .await
@@ -1111,7 +900,7 @@ mod tests {
 
         let file_path = tmp.path().join("test_dup.mp3");
         import_mp3_as_source(&pool, &file_path, &duplicate_frame_mp3(), &serializer).await;
-        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+        let _rec_id = source_id_for_path(&pool, &file_path).await;
 
         rescan_source(&pool, &file_path, None, &serializer, &file_issues)
             .await
@@ -1215,7 +1004,7 @@ mod tests {
         .await
         .unwrap();
 
-        let _rec_id = recording_id_for_path(&pool, &file_path).await;
+        let _rec_id = source_id_for_path(&pool, &file_path).await;
 
         rescan_source(&pool, &file_path, None, &serializer, &file_issues)
             .await
@@ -1233,6 +1022,192 @@ mod tests {
         assert!(
             dup_count > 0,
             "TagLib fallback should detect duplicate frames from raw ID3v2 bytes, got {dup_count}"
+        );
+    }
+
+    // ── MusicBrainz Recording ID grouping tests ────────────────────────
+    //
+    // Two files sharing the same MBID should appear as two sources for the
+    // same recording when viewed through the MemoryCatalog.  Grouping is no
+    // longer done at import time (the recording table is gone); it happens
+    // entirely in-memory at catalog load time.
+
+    #[tokio::test]
+    async fn test_same_mbid_creates_same_recording() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+
+        let mbid = "b6e3c72a-5f0c-4e5d-9f0a-123456789abc";
+
+        // Two files with different content → different SHA-256 → different hashes
+        let file1 = tmp.path().join("song1.mp3");
+        let file2 = tmp.path().join("song2.mp3");
+        write_tagged_mp3(&file1, "Song One", "Artist", "Album Artist", "Album");
+        write_tagged_mp3(&file2, "Song Two", "Artist", "Album Artist", "Album");
+
+        // Import both with different acoustids but the same recording_mbid
+        store_prepared_import(
+            &pool,
+            prepared_import_with_mbid(
+                &file1,
+                tagged_meta("Song One", "Artist", "Album Artist", "Album", 1),
+                Some("acoustid-a"),
+                Some(mbid),
+            ),
+            &serializer,
+        )
+        .await
+        .unwrap();
+
+        store_prepared_import(
+            &pool,
+            prepared_import_with_mbid(
+                &file2,
+                tagged_meta("Song Two", "Artist", "Album Artist", "Album", 1),
+                Some("acoustid-b"),
+                Some(mbid),
+            ),
+            &serializer,
+        )
+        .await
+        .unwrap();
+
+        // Verify via MemoryCatalog that both files land in the same recording.
+        let catalog = crate::storage::memory::MemoryCatalog::load_from_db(&pool)
+            .await
+            .unwrap();
+        let recs = crate::storage::CatalogReader::list_recordings(&catalog)
+            .await
+            .unwrap();
+
+        let file1_path = file1.to_string_lossy().to_string();
+        let file2_path = file2.to_string_lossy().to_string();
+        let matching = recs
+            .iter()
+            .find(|r| r.source_paths.contains(&file1_path) && r.source_paths.contains(&file2_path));
+
+        assert!(
+            matching.is_some(),
+            "two files with the same MusicBrainz Recording ID should be in the same recording, \
+             but no recording contains both {} and {}",
+            file1_path,
+            file2_path
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_mbid_from_ufid_tag_creates_same_recording() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let pool = init_pool(&db_path).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+
+        let mbid = "b6e3c72a-5f0c-4e5d-9f0a-987654321abc";
+
+        let ufid_payload = format!("http://musicbrainz.org\0{mbid}");
+        let ufid_frame = crate::library::scanner::id3_frame(b"UFID", ufid_payload.as_bytes());
+
+        fn meta_with_mbid(title: &str, recording_mbid: Option<String>) -> TrackMetadata {
+            let mut meta = tagged_meta(title, "Artist", "Album Artist", "Album", 1);
+            meta.recording_mbid = recording_mbid;
+            meta
+        }
+
+        fn write_mp3_with_ufid(
+            path: &Path,
+            title: &str,
+            artist: &str,
+            album_artist: &str,
+            album: &str,
+            ufid_frame: &[u8],
+        ) {
+            let title_data = utf8_text_frame(title);
+            let artist_data = utf8_text_frame(artist);
+            let album_artist_data = utf8_text_frame(album_artist);
+            let album_data = utf8_text_frame(album);
+            let track_data = utf8_text_frame("1/1");
+            let disc_data = utf8_text_frame("1/1");
+
+            let frames = vec![
+                crate::library::scanner::id3_frame(b"TIT2", &title_data),
+                crate::library::scanner::id3_frame(b"TPE1", &artist_data),
+                crate::library::scanner::id3_frame(b"TPE2", &album_artist_data),
+                crate::library::scanner::id3_frame(b"TALB", &album_data),
+                crate::library::scanner::id3_frame(b"TRCK", &track_data),
+                crate::library::scanner::id3_frame(b"TPOS", &disc_data),
+                ufid_frame.to_vec(),
+            ];
+            let mp3_data = crate::library::scanner::synth_mp3_with_id3(&frames);
+            std::fs::write(path, mp3_data).unwrap();
+        }
+
+        let file1 = tmp.path().join("ufid_song1.mp3");
+        let file2 = tmp.path().join("ufid_song2.mp3");
+        write_mp3_with_ufid(
+            &file1,
+            "UFID Song One",
+            "Artist",
+            "Album Artist",
+            "Album",
+            &ufid_frame,
+        );
+        write_mp3_with_ufid(
+            &file2,
+            "UFID Song Two",
+            "Artist",
+            "Album Artist",
+            "Album",
+            &ufid_frame,
+        );
+
+        // Import both with no AcoustID lookup — the MBID comes from meta.recording_mbid
+        // (populated from UFID:http://musicbrainz.org in the real scan path).
+        store_prepared_import(
+            &pool,
+            prepared_import_for_path(
+                &file1,
+                meta_with_mbid("UFID Song One", Some(mbid.into())),
+                None,
+            ),
+            &serializer,
+        )
+        .await
+        .unwrap();
+
+        store_prepared_import(
+            &pool,
+            prepared_import_for_path(
+                &file2,
+                meta_with_mbid("UFID Song Two", Some(mbid.into())),
+                None,
+            ),
+            &serializer,
+        )
+        .await
+        .unwrap();
+
+        // Verify via MemoryCatalog that both files land in the same recording.
+        let catalog = crate::storage::memory::MemoryCatalog::load_from_db(&pool)
+            .await
+            .unwrap();
+        let recs = crate::storage::CatalogReader::list_recordings(&catalog)
+            .await
+            .unwrap();
+
+        let file1_path = file1.to_string_lossy().to_string();
+        let file2_path = file2.to_string_lossy().to_string();
+        let matching = recs
+            .iter()
+            .find(|r| r.source_paths.contains(&file1_path) && r.source_paths.contains(&file2_path));
+
+        assert!(
+            matching.is_some(),
+            "two files sharing a UFID:http://musicbrainz.org tag should be in the same recording, \
+             but no recording contains both {} and {}",
+            file1_path,
+            file2_path
         );
     }
 }

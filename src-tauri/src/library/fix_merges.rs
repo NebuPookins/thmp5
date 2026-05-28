@@ -4,14 +4,15 @@ use crate::library::import::import_file;
 use crate::models::FixMergedRecordingsStats;
 use anyhow::Result;
 use sqlx::Row;
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::Semaphore;
 
-/// For each recording that has more than one local-file source, compare the
-/// Chromaprint fingerprints of those sources.  Any source whose fingerprint
-/// doesn't match the first source (bit error rate ≥ 0.4) is split off: its
-/// source row is deleted and the file is re-imported so it lands on the
-/// correct recording.  No network calls are made.
+/// For each MBID group (UFID:http://musicbrainz.org in raw_tags_json) that has
+/// more than one local-file source, compare the Chromaprint fingerprints of
+/// those sources.  Any source whose fingerprint doesn't match the first source
+/// (bit error rate ≥ 0.4) is split off: its source row is deleted and the file
+/// is re-imported so it lands on the correct recording.  No network calls are made.
 pub async fn fix_merged_recordings(
     db: &DbPool,
     acoustid_key: Option<&str>,
@@ -24,60 +25,87 @@ pub async fn fix_merged_recordings(
         errors: Vec::new(),
     };
 
-    let mut conn = db.acquire("fix_merges.list_recordings").await?;
-    let recording_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT recording_id FROM source
-         WHERE source_type = 'local_file'
-         GROUP BY recording_id
-         HAVING COUNT(*) > 1",
+    let mut conn = db.acquire("fix_merges.list_sources").await?;
+    let rows = sqlx::query(
+        "SELECT id, file_path, raw_tags_json FROM source
+         WHERE source_type = 'local_file' AND file_path IS NOT NULL",
     )
     .fetch_all(&mut *conn)
     .await?;
     drop(conn);
 
-    for recording_id in &recording_ids {
+    // Group sources by MBID extracted from raw_tags_json.
+    type SourceEntry = (String, String); // (id, file_path)
+    let mut mbid_groups: HashMap<String, Vec<SourceEntry>> = HashMap::new();
+
+    for row in &rows {
+        let id: String = row.get("id");
+        let file_path: String = row.get("file_path");
+        let raw_tags_json: Option<String> = row.get("raw_tags_json");
+
+        let mbid = match extract_single_mbid(&raw_tags_json) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        mbid_groups.entry(mbid).or_default().push((id, file_path));
+    }
+
+    for (mbid, sources) in &mbid_groups {
+        if sources.len() <= 1 {
+            continue;
+        }
         stats.recordings_checked += 1;
         if let Err(e) =
-            process_recording(db, recording_id, acoustid_key, serializer, &mut stats).await
+            process_mbid_group(db, mbid, sources, acoustid_key, serializer, &mut stats).await
         {
-            stats
-                .errors
-                .push(format!("recording {recording_id}: {e:#}"));
+            stats.errors.push(format!("MBID {mbid}: {e:#}"));
         }
     }
 
     Ok(stats)
 }
 
-async fn process_recording(
+/// Extract a single MBID from a source's raw_tags_json.
+///
+/// raw_tags_json is a JSON array of [key, value] pairs, e.g.:
+/// `[["UFID:http://musicbrainz.org","some-mbid"],["TIT2","Title"],...]`
+///
+/// If multiple distinct MBID values are present (erroneous), only the first is
+/// used for grouping.  The catalog's deduplicate_raw_tags step flags this as a
+/// FileIssue at load time.
+fn extract_single_mbid(raw_tags_json: &Option<String>) -> Option<String> {
+    let json_str = raw_tags_json.as_ref()?;
+    if json_str.is_empty() {
+        return None;
+    }
+    let pairs: Vec<Vec<String>> = serde_json::from_str(json_str).ok()?;
+    pairs
+        .into_iter()
+        .filter(|pair| pair.len() >= 2 && pair[0] == "UFID:http://musicbrainz.org")
+        .find_map(|pair| {
+            let v = pair[1].clone();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        })
+}
+
+async fn process_mbid_group(
     db: &DbPool,
-    recording_id: &str,
+    mbid: &str,
+    sources: &[(String, String)],
     acoustid_key: Option<&str>,
     serializer: &Semaphore,
     stats: &mut FixMergedRecordingsStats,
 ) -> Result<()> {
-    let mut conn = db
-        .acquire(format!("fix_merges.process recording_id={recording_id}"))
-        .await?;
-
-    let rows = sqlx::query(
-        "SELECT id, file_path FROM source
-         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL",
-    )
-    .bind(recording_id)
-    .fetch_all(&mut *conn)
-    .await?;
-    drop(conn);
-
-    if rows.len() <= 1 {
-        return Ok(());
-    }
-
-    // Collect (source_id, file_path) for sources whose files exist on disk.
-    let sources: Vec<(String, String)> = rows
-        .into_iter()
-        .map(|r| (r.get::<String, _>("id"), r.get::<String, _>("file_path")))
+    // Filter to sources whose files exist on disk.
+    let sources: Vec<(String, String)> = sources
+        .iter()
         .filter(|(_, path)| Path::new(path).exists())
+        .cloned()
         .collect();
 
     if sources.len() <= 1 {
@@ -93,7 +121,7 @@ async fn process_recording(
             .map_err(|e| anyhow::anyhow!("Blocking task panicked: {e}"))??;
 
     tracing::debug!(
-        recording_id,
+        mbid,
         reference_source = %ref_id,
         reference_path = %ref_path,
         "Using as fingerprint reference"
@@ -114,7 +142,7 @@ async fn process_recording(
 
         if !is_same {
             tracing::info!(
-                recording_id,
+                mbid,
                 source_id = %source_id,
                 path = %file_path,
                 "Fingerprint mismatch — will split"

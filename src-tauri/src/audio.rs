@@ -50,7 +50,6 @@ fn status_from_u8(v: u8) -> PlaybackStatus {
 
 #[derive(Debug, Clone)]
 pub struct PlayRequest {
-    pub recording_id: String,
     pub source_id: String,
     pub file_path: String,
     pub title: Option<String>,
@@ -61,7 +60,6 @@ pub struct PlayRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackEndedEvent {
-    pub recording_id: String,
     pub source_id: String,
     pub position_ms: u64,
 }
@@ -115,8 +113,6 @@ struct AudioCallbackCtx {
     /// Set to true by the cpal stream error callback to signal the engine
     /// thread that the output device died and needs to be rebuilt.
     stream_rebuild_needed: AtomicBool,
-    /// Metadata snapshot used by the callback to build track-ended events.
-    current_recording_id: Mutex<Option<String>>,
     current_source_id: Mutex<Option<String>>,
     /// Channels for sending events from the callback to the engine thread.
     position_tx: Sender<u64>,
@@ -144,7 +140,6 @@ impl AudioCallbackCtx {
             track_duration_ms: AtomicU64::new(0),
             stream_rebuild_needed: AtomicBool::new(false),
             current_track: Mutex::new(None),
-            current_recording_id: Mutex::new(None),
             current_source_id: Mutex::new(None),
             position_tx,
             state_tx,
@@ -330,7 +325,6 @@ impl AudioEngineHandle {
             let d = ctx.track_duration_ms.load(Ordering::Relaxed);
             (d > 0).then_some(d)
         };
-        let recording_id = ctx.current_recording_id.lock().ok().and_then(|r| r.clone());
         let source_id = ctx.current_source_id.lock().ok().and_then(|r| r.clone());
 
         // Metadata only kept in SharedState.
@@ -350,7 +344,6 @@ impl AudioEngineHandle {
 
         PlayerState {
             status,
-            recording_id,
             source_id,
             title,
             artist,
@@ -419,9 +412,6 @@ impl SharedState {
         if let Ok(mut track) = ctx.current_track.lock() {
             *track = None;
         }
-        if let Ok(mut id) = ctx.current_recording_id.lock() {
-            *id = None;
-        }
         if let Ok(mut id) = ctx.current_source_id.lock() {
             *id = None;
         }
@@ -470,7 +460,6 @@ fn handle_command(
     match command {
         AudioCommand::Play(request) => {
             tracing::info!(
-                recording_id = %request.recording_id,
                 source_id = %request.source_id,
                 path = %request.file_path,
                 "Beginning streaming track load"
@@ -499,12 +488,6 @@ fn handle_command(
                     .map_err(|_| anyhow!("Audio state lock poisoned"))?;
                 let norm_gain = f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed));
                 PlayRequest {
-                    recording_id: ctx
-                        .current_recording_id
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .ok_or_else(|| anyhow!("No active track to seek"))?,
                     source_id: ctx
                         .current_source_id
                         .lock()
@@ -609,10 +592,6 @@ fn start_playback(
         *guard = Some(Arc::clone(&buffer));
     }
     ctx.track_duration_ms.store(duration_ms, Ordering::Relaxed);
-    {
-        let mut guard = ctx.current_recording_id.lock().unwrap();
-        *guard = Some(request.recording_id.clone());
-    }
     {
         let mut guard = ctx.current_source_id.lock().unwrap();
         *guard = Some(request.source_id.clone());
@@ -848,7 +827,6 @@ fn drain_events(
             PLAYER_STATE_EVENT,
             PlayerState {
                 status: PlaybackStatus::Stopped,
-                recording_id: None,
                 source_id: None,
                 title: None,
                 artist: None,
@@ -1123,11 +1101,6 @@ where
             ctx.status.store(STATUS_PLAYING, Ordering::Release);
             let _ = ctx.state_tx.send(PlayerState {
                 status: PlaybackStatus::Playing,
-                recording_id: ctx
-                    .current_recording_id
-                    .try_lock()
-                    .ok()
-                    .and_then(|r| r.clone()),
                 source_id: ctx
                     .current_source_id
                     .try_lock()
@@ -1152,12 +1125,6 @@ where
             if buffer.finished {
                 // Track ended naturally – notify engine thread and clear state.
                 let ended = TrackEndedEvent {
-                    recording_id: ctx
-                        .current_recording_id
-                        .try_lock()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .unwrap_or_default(),
                     source_id: ctx
                         .current_source_id
                         .try_lock()
@@ -1175,9 +1142,6 @@ where
                 if let Ok(mut t) = ctx.current_track.try_lock() {
                     *t = None;
                 }
-                if let Ok(mut id) = ctx.current_recording_id.try_lock() {
-                    *id = None;
-                }
                 if let Ok(mut id) = ctx.current_source_id.try_lock() {
                     *id = None;
                 }
@@ -1194,7 +1158,6 @@ where
             ctx.status.store(STATUS_LOADING, Ordering::Release);
             let _ = ctx.state_tx.send(PlayerState {
                 status: PlaybackStatus::Loading,
-                recording_id: None,
                 source_id: None,
                 title: None,
                 artist: None,
@@ -1614,7 +1577,6 @@ impl Default for PlayerState {
     fn default() -> Self {
         Self {
             status: PlaybackStatus::Stopped,
-            recording_id: None,
             source_id: None,
             title: None,
             artist: None,

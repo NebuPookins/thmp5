@@ -1,5 +1,4 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
-use crate::db::DbPool;
 use crate::file_issues::{FileIssue, FileIssueKind};
 use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
@@ -303,26 +302,23 @@ pub async fn rescan_sources_for_recording(
     state: tauri::State<'_, AppState>,
     recording_id: String,
 ) -> Result<(), String> {
+    // Resolve recording_id to source paths via the in-memory catalog.
     let paths: Vec<String> = {
-        let mut conn = state
-            .db
-            .acquire(format!(
-                "command.rescan_sources_for_recording recording_id={recording_id}"
-            ))
+        let catalog = state.catalog.read().await;
+        let recs = catalog
+            .list_recordings()
             .await
-            .map_err(|e| e.to_string())?;
-        sqlx::query_scalar(
-            "SELECT DISTINCT s.file_path
-             FROM source s
-             WHERE s.recording_id = ?
-               AND s.source_type = 'local_file'
-               AND s.file_path IS NOT NULL
-             ORDER BY s.file_path",
-        )
-        .bind(&recording_id)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?
+            .map_err(|e| format!("Failed to list recordings: {e}"))?;
+        let matching = recs.iter().find(|r| r.id == recording_id);
+        match matching {
+            Some(rec) => rec
+                .source_paths
+                .iter()
+                .filter(|p| !p.is_empty())
+                .cloned()
+                .collect(),
+            None => return Err("Recording not found in catalog.".to_string()),
+        }
     };
 
     if paths.is_empty() {
@@ -467,16 +463,15 @@ pub async fn record_play_history(
     let mut conn = state
         .db
         .acquire(format!(
-            "command.record_play_history recording_id={}",
-            input.recording_id
+            "command.record_play_history source_id={}",
+            input.source_id
         ))
         .await
         .map_err(|e| e.to_string())?;
     sqlx::query(
-        "INSERT INTO play_history (recording_id, source_id, duration_played_ms)
-         VALUES (?, ?, ?)",
+        "INSERT INTO play_history (source_id, duration_played_ms)
+         VALUES (?, ?)",
     )
-    .bind(input.recording_id)
     .bind(input.source_id)
     .bind(input.duration_played_ms)
     .execute(&mut *conn)
@@ -524,16 +519,25 @@ pub async fn set_source_rating(
             .map_err(|e| e.to_string())?;
     }
 
-    // Look up the recording_id that owns this source, before releasing the connection.
-    let recording_id: Option<String> = sqlx::query("SELECT recording_id FROM source WHERE id = ?")
-        .bind(&request.source_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?
-        .map(|r| r.get("recording_id"));
+    // Look up the source's file path to find the recording in the catalog.
+    let source_path: Option<String> =
+        sqlx::query_scalar("SELECT file_path FROM source WHERE id = ?")
+            .bind(&request.source_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?
+            .flatten();
 
     drop(conn);
     reload_catalog(&state).await;
+
+    // Find which recording this source belongs to via the in-memory catalog.
+    let catalog = state.catalog.read().await;
+    let recs = catalog.list_recordings().await.map_err(|e| e.to_string())?;
+    let rec = source_path.as_ref().and_then(|path| {
+        recs.iter()
+            .find(|r| r.source_paths.iter().any(|p| p == path))
+    });
 
     let mut recording = crate::models::EntityRatingUpdate {
         id: String::new(),
@@ -542,22 +546,27 @@ pub async fn set_source_rating(
     let mut artists: Vec<crate::models::EntityRatingUpdate> = Vec::new();
     let mut release_groups: Vec<crate::models::EntityRatingUpdate> = Vec::new();
 
-    if let Some(rec_id) = recording_id {
-        let catalog = state.catalog.read().await;
-        if let Ok(Some(rec)) = catalog.get_recording_detail(&rec_id).await {
+    if let Some(rec) = rec {
+        let rec_detail = catalog
+            .get_recording_detail(&rec.id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(rec_detail) = rec_detail {
             recording = crate::models::EntityRatingUpdate {
-                id: rec_id.clone(),
-                rating: rec.rating,
+                id: rec.id.clone(),
+                rating: rec_detail.rating,
             };
             let rg_ids: Vec<String> = {
                 let mut seen = std::collections::HashSet::new();
-                rec.releases
+                rec_detail
+                    .releases
                     .iter()
                     .filter(|r| seen.insert(r.release_group_id.clone()))
                     .map(|r| r.release_group_id.clone())
                     .collect()
             };
-            for a in &rec.artists {
+            for a in &rec_detail.artists {
                 if let Ok(Some(detail)) = catalog.get_artist_detail(&a.artist_id).await {
                     artists.push(crate::models::EntityRatingUpdate {
                         id: a.artist_id.clone(),
@@ -575,6 +584,7 @@ pub async fn set_source_rating(
             }
         }
     }
+    drop(catalog);
 
     Ok(RecordingRatingUpdateResult {
         recording,
@@ -781,33 +791,13 @@ pub async fn resolve_duplicate_frame(
 
     // Only do DB work if the user picked the lofty value over the auto-corrected one.
     if chosen_value == lofty && chosen_value != corrected {
-        let pool = state.db.raw_pool();
-        let recording_id: String = sqlx::query_scalar(
-            "SELECT recording_id FROM source WHERE file_path = ? AND source_type = 'local_file'",
-        )
-        .bind(&file_path)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("DB error: {e}"))?
-        .flatten()
-        .ok_or_else(|| format!("Source not found: {file_path}"))?;
-
-        match frame_id.as_str() {
-            "TIT2" => {
-                sqlx::query("UPDATE recording SET title = ? WHERE id = ?")
-                    .bind(&chosen_value)
-                    .bind(&recording_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| format!("Failed to update recording title: {e}"))?;
-            }
-            "TPE1" | "TPE2" | "TALB" => {
-                // The artist/album tables were dropped in migration 010; artist and album
-                // information is now derived from raw_tags_json at catalog-load time.
-                // The chosen value takes effect on the next source rescan.
-            }
-            other => return Err(format!("Unsupported frame ID: {other}")),
-        }
+        // The recording table has been removed; all metadata is derived from
+        // raw_tags_json at catalog-load time.  The user's chosen value will
+        // take effect on the next source rescan (which rebuilds raw_tags_json).
+        // No recording-table UPDATE is needed for any frame type.
+        _ = &file_path;
+        _ = &frame_id;
+        _ = &chosen_value;
     }
 
     // Remove the resolved issue from the in-memory log.
@@ -870,13 +860,11 @@ pub async fn play(
         "SELECT
             s.id                  AS source_id,
             s.file_path           AS file_path,
-            r.id                  AS recording_id,
-            r.title               AS title,
             s.raw_tags_json,
+            s.fingerprint,
             s.replay_gain_track_db,
             s.lufs
          FROM source s
-         JOIN recording r ON r.id = s.recording_id
          WHERE s.id = ?
            AND s.source_type = 'local_file'
            AND s.file_path IS NOT NULL",
@@ -889,13 +877,21 @@ pub async fn play(
 
     let mut source_id: String = row.get("source_id");
     let mut file_path: String = row.get("file_path");
-    let recording_id: String = row.get("recording_id");
-    let title: Option<String> = row.get("title");
     let raw_tags_json: Option<String> = row.get("raw_tags_json");
-    let artist: Option<String> = raw_tags_json
+    let fingerprint: Option<String> = row.get("fingerprint");
+
+    let tags: Vec<(String, String)> = raw_tags_json
         .as_deref()
-        .and_then(|j| serde_json::from_str::<Vec<(String, String)>>(j).ok())
-        .and_then(|tags| tags.into_iter().find(|(k, _)| k == "TPE1").map(|(_, v)| v));
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    let title: Option<String> = tags
+        .iter()
+        .find(|(k, _)| k == "TIT2")
+        .map(|(_, v)| v.clone());
+    let artist: Option<String> = tags
+        .iter()
+        .find(|(k, _)| k == "TPE1")
+        .map(|(_, v)| v.clone());
     let replay_gain_track_db: Option<f64> = row.get("replay_gain_track_db");
     let lufs: Option<f64> = row.get("lufs");
 
@@ -903,7 +899,8 @@ pub async fn play(
     let (mut normalization_gain, mut normalization_source) =
         compute_normalization_gain(replay_gain_track_db, lufs);
 
-    // If the file is missing, try to fall back to another source for the same recording.
+    // If the file is missing, try to fall back to another source for the same
+    // recording using fingerprint (Chromaprint) or MBID from raw_tags.
     if !std::path::Path::new(&file_path).exists() {
         tracing::warn!(
             source_id = %source_id,
@@ -911,33 +908,90 @@ pub async fn play(
             "Source file missing; searching for alternatives"
         );
 
-        let alts = sqlx::query(
-            "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs FROM source s
-             WHERE s.recording_id = ?
-               AND s.id != ?
-               AND s.source_type = 'local_file'
-               AND s.file_path IS NOT NULL
-             ORDER BY s.file_path",
-        )
-        .bind(&recording_id)
-        .bind(&source_id)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?;
+        // Try fingerprint-based fallback first, then MBID-based if no fingerprint.
+        let mut alt = if fingerprint.is_some() {
+            let alts = sqlx::query(
+                "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs
+                 FROM source s
+                 WHERE s.fingerprint = (SELECT fingerprint FROM source WHERE id = ?)
+                   AND s.id != ?
+                   AND s.source_type = 'local_file'
+                   AND s.file_path IS NOT NULL
+                 ORDER BY s.file_path",
+            )
+            .bind(&source_id)
+            .bind(&source_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let mut found_alt: Option<(String, String, Option<f64>, Option<f64>)> = None;
-        for alt in &alts {
-            let alt_id: String = alt.get("id");
-            let alt_path: String = alt.get("file_path");
-            if std::path::Path::new(&alt_path).exists() {
-                let alt_rg: Option<f64> = alt.get("replay_gain_track_db");
-                let alt_lufs: Option<f64> = alt.get("lufs");
-                found_alt = Some((alt_id, alt_path, alt_rg, alt_lufs));
-                break;
+            let mut found: Option<(String, String, Option<f64>, Option<f64>)> = None;
+            for alt in &alts {
+                let alt_id: String = alt.get("id");
+                let alt_path: String = alt.get("file_path");
+                if std::path::Path::new(&alt_path).exists() {
+                    found = Some((
+                        alt_id,
+                        alt_path,
+                        alt.get("replay_gain_track_db"),
+                        alt.get("lufs"),
+                    ));
+                    break;
+                }
+            }
+            found
+        } else {
+            None
+        };
+
+        // Fall back to MBID-based lookup if fingerprint produced no result.
+        if alt.is_none() {
+            let mbid = tags
+                .iter()
+                .find(|(k, _)| k == "UFID:http://musicbrainz.org")
+                .map(|(_, v)| v.clone());
+            if let Some(mbid) = mbid {
+                let alts = sqlx::query(
+                    "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs
+                     FROM source s
+                     WHERE s.id != ?
+                       AND s.source_type = 'local_file'
+                       AND s.file_path IS NOT NULL
+                     ORDER BY s.file_path",
+                )
+                .bind(&source_id)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                for alt_row in alts {
+                    let alt_raw_tags: Option<String> = alt_row.get("raw_tags_json");
+                    let has_mbid = alt_raw_tags
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<Vec<(String, String)>>(j).ok())
+                        .map(|t| {
+                            t.iter()
+                                .any(|(k, v)| k == "UFID:http://musicbrainz.org" && v == &mbid)
+                        })
+                        .unwrap_or(false);
+                    if has_mbid {
+                        let alt_id: String = alt_row.get("id");
+                        let alt_path: String = alt_row.get("file_path");
+                        if std::path::Path::new(&alt_path).exists() {
+                            alt = Some((
+                                alt_id,
+                                alt_path,
+                                alt_row.get("replay_gain_track_db"),
+                                alt_row.get("lufs"),
+                            ));
+                            break;
+                        }
+                    }
+                }
             }
         }
 
-        if let Some((alt_id, alt_path, alt_rg, alt_lufs)) = found_alt {
+        if let Some((alt_id, alt_path, alt_rg, alt_lufs)) = alt {
             // Remove the stale source row silently.
             sqlx::query("DELETE FROM source WHERE id = ?")
                 .bind(&source_id)
@@ -953,7 +1007,6 @@ pub async fn play(
             );
             source_id = alt_id;
             file_path = alt_path;
-            // Update normalization gain from the alternative source.
             let (alt_gain, alt_src) = compute_normalization_gain(alt_rg, alt_lufs);
             normalization_gain = alt_gain;
             normalization_source = alt_src;
@@ -967,7 +1020,6 @@ pub async fn play(
 
     tracing::info!(
         source_id = %source_id,
-        recording_id = %recording_id,
         path = %file_path,
         "Resolved play request"
     );
@@ -975,7 +1027,6 @@ pub async fn play(
     state
         .player
         .play(EnginePlayRequest {
-            recording_id,
             source_id,
             file_path,
             title,
@@ -1109,19 +1160,18 @@ pub async fn list_release_groups(
 #[tauri::command]
 pub async fn get_waveform(
     state: tauri::State<'_, AppState>,
-    recording_id: String,
+    source_id: String,
 ) -> Result<Vec<f32>, String> {
     let mut conn = state
         .db
-        .acquire(format!("command.get_waveform recording_id={recording_id}"))
+        .acquire(format!("command.get_waveform source_id={source_id}"))
         .await
         .map_err(|e| e.to_string())?;
     let file_path: Option<String> = sqlx::query_scalar(
         "SELECT file_path FROM source
-         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
-         ORDER BY file_path LIMIT 1",
+         WHERE id = ? AND source_type = 'local_file' AND file_path IS NOT NULL",
     )
-    .bind(&recording_id)
+    .bind(&source_id)
     .fetch_optional(&mut *conn)
     .await
     .map_err(|e| e.to_string())?
@@ -1147,19 +1197,18 @@ pub async fn get_waveform(
 #[tauri::command]
 pub async fn get_cover_art(
     state: tauri::State<'_, AppState>,
-    recording_id: String,
+    source_id: String,
 ) -> Result<Option<String>, String> {
     let mut conn = state
         .db
-        .acquire(format!("command.get_cover_art recording_id={recording_id}"))
+        .acquire(format!("command.get_cover_art source_id={source_id}"))
         .await
         .map_err(|e| e.to_string())?;
     let file_path: Option<String> = sqlx::query_scalar(
         "SELECT file_path FROM source
-         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
-         ORDER BY file_path LIMIT 1",
+         WHERE id = ? AND source_type = 'local_file' AND file_path IS NOT NULL",
     )
-    .bind(&recording_id)
+    .bind(&source_id)
     .fetch_optional(&mut *conn)
     .await
     .map_err(|e| e.to_string())?
@@ -1279,200 +1328,6 @@ pub async fn delete_playlist(state: tauri::State<'_, AppState>, id: i64) -> Resu
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-#[tauri::command]
-pub async fn delete_recording(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
-    state.pending_jobs.fetch_add(1, Ordering::Relaxed);
-    emit_job_update(&app, &state, "delete");
-
-    let _permit = state
-        .write_serializer
-        .acquire()
-        .await
-        .map_err(|e| format!("Failed to acquire write lock for delete: {e}"))?;
-
-    let result = delete_recording_inner(&state.db, &id).await;
-    drop(_permit);
-
-    state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
-    emit_job_update(&app, &state, "delete");
-
-    reload_catalog(&state).await;
-    result
-}
-
-async fn delete_recording_inner(db: &DbPool, id: &str) -> Result<(), String> {
-    let mut conn = db
-        .acquire(format!("command.delete_recording_inner id={id}"))
-        .await
-        .map_err(|e| e.to_string())?;
-    conn.set_busy_timeout(std::time::Duration::from_secs(30))
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
-
-    // CASCADE deletes source (and via source: source_rating), recording_tag, play_history
-    sqlx::query("DELETE FROM recording WHERE id = ?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    tx.commit().await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn compare_recordings(
-    state: tauri::State<'_, AppState>,
-    recording_id_a: String,
-    recording_id_b: String,
-) -> Result<f32, String> {
-    let mut conn = state
-        .db
-        .acquire("command.compare_recordings")
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let path_a: String = sqlx::query_scalar(
-        "SELECT file_path FROM source
-         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
-         ORDER BY file_path LIMIT 1",
-    )
-    .bind(&recording_id_a)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?
-    .flatten()
-    .ok_or_else(|| "Recording A has no local file".to_string())?;
-
-    let path_b: String = sqlx::query_scalar(
-        "SELECT file_path FROM source
-         WHERE recording_id = ? AND source_type = 'local_file' AND file_path IS NOT NULL
-         ORDER BY file_path LIMIT 1",
-    )
-    .bind(&recording_id_b)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?
-    .flatten()
-    .ok_or_else(|| "Recording B has no local file".to_string())?;
-
-    tokio::task::spawn_blocking(move || {
-        let a = crate::fingerprint::raw_fingerprint(std::path::Path::new(&path_a))
-            .map_err(|e| e.to_string())?;
-        let b = crate::fingerprint::raw_fingerprint(std::path::Path::new(&path_b))
-            .map_err(|e| e.to_string())?;
-        Ok(crate::fingerprint::ber(&a, &b))
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-pub async fn merge_recordings(
-    state: tauri::State<'_, AppState>,
-    primary_id: String,
-    duplicate_id: String,
-    title: String,
-    artist_choice: String,
-    custom_artist_text: Option<String>,
-) -> Result<Vec<RecordingRow>, String> {
-    let mut tx = state
-        .db
-        .raw_pool()
-        .begin()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Transfer unique tags from duplicate to primary
-    sqlx::query(
-        "INSERT OR IGNORE INTO recording_tag (recording_id, tag)
-         SELECT ?, tag FROM recording_tag WHERE recording_id = ?",
-    )
-    .bind(&primary_id)
-    .bind(&duplicate_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Rebind play history
-    sqlx::query("UPDATE play_history SET recording_id = ? WHERE recording_id = ?")
-        .bind(&primary_id)
-        .bind(&duplicate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Move sources to primary recording
-    sqlx::query("UPDATE source SET recording_id = ? WHERE recording_id = ?")
-        .bind(&primary_id)
-        .bind(&duplicate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Apply chosen artist (credit text only; artist table was dropped in migration 010)
-    match artist_choice.as_str() {
-        "B" => {
-            sqlx::query(
-                "UPDATE recording SET artist_credit_text =
-                   (SELECT artist_credit_text FROM recording WHERE id = ?)
-                 WHERE id = ?",
-            )
-            .bind(&duplicate_id)
-            .bind(&primary_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-        "custom" => {
-            let text = custom_artist_text
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            sqlx::query("UPDATE recording SET artist_credit_text = ? WHERE id = ?")
-                .bind(&text)
-                .bind(&primary_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        _ => {} // "A": keep primary's existing artist
-    }
-
-    // Apply chosen title
-    sqlx::query("UPDATE recording SET title = ? WHERE id = ?")
-        .bind(&title)
-        .bind(&primary_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Delete duplicate (CASCADE removes remaining child rows)
-    sqlx::query("DELETE FROM recording WHERE id = ?")
-        .bind(&duplicate_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    tx.commit().await.map_err(|e| e.to_string())?;
-
-    reload_catalog(&state).await;
-    let result = state
-        .catalog
-        .read()
-        .await
-        .list_recordings()
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(result)
 }
 
 // ── Last.fm scrobbling ─────────────────────────────────────────────────────────
@@ -1923,121 +1778,10 @@ pub async fn check_artist_compound(
     crate::library::artist_fixes::check_artist_compound(&state.catalog, &artist_id).await
 }
 
-async fn split_recording_inner(
-    db: &DbPool,
-    recording_id: &str,
-    source_ids_to_move: &[String],
-) -> Result<String, String> {
-    let mut conn = db
-        .acquire(format!("command.split_recording_inner id={recording_id}"))
-        .await
-        .map_err(|e| e.to_string())?;
-    conn.set_busy_timeout(std::time::Duration::from_secs(30))
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
-
-    // Validate: at least one source must remain on the original
-    let total_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source WHERE recording_id = ?")
-        .bind(recording_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if source_ids_to_move.len() as i64 >= total_count {
-        return Err("At least one source must remain on the original recording".to_string());
-    }
-
-    // Validate: all source_ids belong to this recording
-    for sid in source_ids_to_move {
-        let exists: bool = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM source WHERE id = ? AND recording_id = ?",
-        )
-        .bind(sid)
-        .bind(recording_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?
-            > 0;
-        if !exists {
-            return Err(format!(
-                "Source {sid} does not belong to recording {recording_id}"
-            ));
-        }
-    }
-
-    // Read metadata from the first local_file source in the list
-    let mut title = String::new();
-    let mut genre: Option<String> = None;
-    let mut bpm: Option<f64> = None;
-    let mut comment: Option<String> = None;
-    let mut duration_ms: Option<i64> = None;
-
-    for sid in source_ids_to_move {
-        let file_path: Option<String> = sqlx::query_scalar(
-            "SELECT file_path FROM source WHERE id = ? AND source_type = 'local_file'",
-        )
-        .bind(sid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        if let Some(ref path) = file_path {
-            if let Ok(meta) = crate::library::scanner::read_metadata(std::path::Path::new(path)) {
-                title = meta.meta.title.unwrap_or_default();
-                genre = meta.meta.genre;
-                bpm = meta.meta.bpm;
-                comment = meta.meta.comment;
-                duration_ms = Some(meta.meta.duration_ms as i64);
-                break; // First source with readable tags wins
-            }
-        }
-    }
-
-    // If no tags could be read, fall back to the original recording's title
-    if title.is_empty() {
-        title = sqlx::query_scalar::<_, Option<String>>("SELECT title FROM recording WHERE id = ?")
-            .bind(recording_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| "Split Recording".to_string());
-    }
-
-    // Create the new recording
-    let new_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO recording (id, title, duration_ms, genre, bpm, comment)
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&new_id)
-    .bind(&title)
-    .bind(duration_ms)
-    .bind(&genre)
-    .bind(bpm)
-    .bind(&comment)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Move selected sources to the new recording
-    for sid in source_ids_to_move {
-        sqlx::query("UPDATE source SET recording_id = ? WHERE id = ?")
-            .bind(&new_id)
-            .bind(sid)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    tx.commit().await.map_err(|e| e.to_string())?;
-    Ok(new_id)
-}
-
 #[tauri::command]
 pub async fn split_recording(
     state: tauri::State<'_, AppState>,
-    recording_id: String,
+    _recording_id: String,
     source_ids_to_move: Vec<String>,
 ) -> Result<String, String> {
     if source_ids_to_move.is_empty() {
@@ -2050,11 +1794,60 @@ pub async fn split_recording(
         .await
         .map_err(|e| format!("Failed to acquire write lock for split: {e}"))?;
 
-    let result = split_recording_inner(&state.db, &recording_id, &source_ids_to_move).await;
-    drop(_permit);
+    // Remove the MBID from each moved source's raw_tags_json so the catalog
+    // will group them independently on the next load.
+    {
+        let mut conn = state
+            .db
+            .acquire("command.split_recording")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
 
+        for sid in &source_ids_to_move {
+            let raw_json: Option<String> =
+                sqlx::query_scalar("SELECT raw_tags_json FROM source WHERE id = ?")
+                    .bind(sid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .flatten();
+
+            if let Some(json) = raw_json {
+                if let Ok(mut tags) = serde_json::from_str::<Vec<(String, String)>>(&json) {
+                    tags.retain(|(k, _)| k != "UFID:http://musicbrainz.org");
+                    let new_json = serde_json::to_string(&tags).unwrap_or(json);
+                    sqlx::query("UPDATE source SET raw_tags_json = ? WHERE id = ?")
+                        .bind(&new_json)
+                        .bind(sid)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+    }
+
+    drop(_permit);
     reload_catalog(&state).await;
-    result
+
+    // Return the recording ID that the catalog assigns to one of the moved sources.
+    let catalog = state.catalog.read().await;
+    let recs = catalog.list_recordings().await.map_err(|e| e.to_string())?;
+    drop(catalog);
+
+    if let Some(first_sid) = source_ids_to_move.first() {
+        for rec in &recs {
+            if rec.primary_source_id.as_deref() == Some(first_sid) {
+                return Ok(rec.id.clone());
+            }
+        }
+    }
+
+    // Fallback: return a placeholder; the frontend will refresh from the catalog.
+    Ok(uuid::Uuid::new_v4().to_string())
 }
 
 #[cfg(test)]

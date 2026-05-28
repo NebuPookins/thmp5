@@ -785,6 +785,11 @@ fn read_metadata_with_lofty(path: &Path) -> Result<(TrackMetadata, Vec<Duplicate
         if !artists_values.is_empty() {
             meta.artists = Some(artists_values.join("; "));
         }
+
+        // MusicBrainz Recording ID from UFID:http://musicbrainz.org
+        meta.recording_mbid = tag
+            .get_string(&ItemKey::MusicBrainzTrackId)
+            .map(|s| s.to_string());
     }
 
     // If the file has an ID3v2 tag with duplicate text frames, Lofty may have
@@ -885,6 +890,18 @@ pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
     if result.meta.artists.is_none() {
         if let Some(tp) = result.all_tags.iter().find(|t| t.key == "ARTISTS") {
             result.meta.artists = Some(tp.value.clone());
+        }
+    }
+
+    // Extract MUSICBRAINZ_TRACKID from all_tags (C++ TagLib helper path) if not
+    // already set by the Lofty path directly.
+    if result.meta.recording_mbid.is_none() {
+        if let Some(tp) = result
+            .all_tags
+            .iter()
+            .find(|t| t.key == "MUSICBRAINZ_TRACKID")
+        {
+            result.meta.recording_mbid = Some(tp.value.clone());
         }
     }
 

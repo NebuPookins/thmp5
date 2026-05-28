@@ -17,12 +17,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Internal data structures ──────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct RawSource {
     id: String,
     source_type: String,
     file_path: Option<String>,
     format: Option<String>,
     duration_ms: Option<i64>,
+    file_hash: Option<String>,
+    fingerprint: Option<String>,
     replay_gain_track_db: Option<f64>,
     replay_gain_track_peak: Option<f64>,
     tags: Vec<(String, String)>,
@@ -53,6 +56,7 @@ struct MemReleaseGroup {
 
 struct MemRecording {
     id: String,
+    mbid: Option<String>,
     title: String,
     duration_ms: Option<i64>,
     genre: Option<String>,
@@ -197,7 +201,8 @@ impl MemoryCatalog {
 
         // ── Load source rows ──────────────────────────────────────────────────
         let source_rows = sqlx::query(
-            "SELECT id, recording_id, source_type, file_path, format, duration_ms,
+            "SELECT id, source_type, file_path, format, duration_ms,
+                    file_hash, fingerprint,
                     replay_gain_track_db, replay_gain_track_peak, raw_tags_json
              FROM source",
         )
@@ -232,21 +237,10 @@ impl MemoryCatalog {
         })
         .collect();
 
-        let mut recording_tags: HashMap<String, Vec<String>> = HashMap::new();
-        for r in
-            sqlx::query("SELECT recording_id, tag FROM recording_tag ORDER BY recording_id, tag")
-                .fetch_all(&mut *conn)
-                .await?
-        {
-            recording_tags
-                .entry(r.get::<String, _>("recording_id"))
-                .or_default()
-                .push(r.get::<String, _>("tag"));
-        }
-
+        // Playlists now reference source_id directly (no recording_id).
         let mut playlists: HashMap<String, HashSet<String>> = HashMap::new();
         for r in sqlx::query(
-            "SELECT p.name, pt.recording_id
+            "SELECT p.name, pt.source_id
              FROM playlist p JOIN playlist_track pt ON pt.playlist_id = p.id",
         )
         .fetch_all(&mut *conn)
@@ -255,13 +249,13 @@ impl MemoryCatalog {
             playlists
                 .entry(r.get::<String, _>("name"))
                 .or_default()
-                .insert(r.get::<String, _>("recording_id"));
+                .insert(r.get::<String, _>("source_id"));
         }
 
         drop(conn);
 
-        // ── Group sources by recording_id ─────────────────────────────────────
-        let mut rec_sources: HashMap<String, Vec<RawSource>> = HashMap::new();
+        // ── Build RawSource vector from rows ──────────────────────────────────
+        let mut all_sources: Vec<RawSource> = Vec::with_capacity(source_rows.len());
         let mut all_issues: Vec<FileIssue> = Vec::new();
         for row in source_rows {
             let raw_json: Option<String> = row.get("raw_tags_json");
@@ -285,23 +279,162 @@ impl MemoryCatalog {
                 .get(&source_id)
                 .map(|(c, d)| (*c, Some(d.clone())))
                 .unwrap_or((0, None));
-            let src = RawSource {
+            all_sources.push(RawSource {
                 id: source_id,
                 source_type: row.get("source_type"),
                 file_path: row.get("file_path"),
                 format: row.get("format"),
                 duration_ms: row.get("duration_ms"),
+                file_hash: row.get("file_hash"),
+                fingerprint: row.get("fingerprint"),
                 replay_gain_track_db: row.get("replay_gain_track_db"),
                 replay_gain_track_peak: row.get("replay_gain_track_peak"),
                 tags,
                 rating,
                 play_count,
                 last_played,
-            };
-            rec_sources
-                .entry(row.get::<String, _>("recording_id"))
+            });
+        }
+
+        // ── Group sources into recordings (union-find) ───────────────────────
+        // Phase 1 — MBID grouping: sources sharing a UFID:http://musicbrainz.org
+        //   value are united (even if a single source erroneously asserts
+        //   multiple MBIDs, the deduplicate_raw_tags step above has already
+        //   collapsed them to one value and raised a FileIssue).
+        // Phase 2 — file_hash grouping: sources with identical SHA-256 are
+        //   always the same recording (byte-identical content).
+        // Phase 3 — fingerprint grouping: Chromaprint-identical sources are
+        //   united ONLY when they do not sit in different MBID components
+        //   (e.g. pure silence on two different albums with different MBIDs
+        //   must produce separate recordings).
+
+        let mut parent: Vec<usize> = (0..all_sources.len()).collect();
+        let mut rank: Vec<usize> = vec![0; all_sources.len()];
+
+        // Phase 1: MBID
+        {
+            let mut mbid_map: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, src) in all_sources.iter().enumerate() {
+                for (key, value) in &src.tags {
+                    if key == "UFID:http://musicbrainz.org" {
+                        mbid_map.entry(value.clone()).or_default().push(i);
+                    }
+                }
+            }
+            for indices in mbid_map.values() {
+                if indices.len() >= 2 {
+                    let anchor = indices[0];
+                    for &idx in &indices[1..] {
+                        union_find(&mut parent, &mut rank, anchor, idx);
+                    }
+                }
+            }
+        }
+
+        // Phase 2: file_hash
+        {
+            let mut hash_map: HashMap<&str, Vec<usize>> = HashMap::new();
+            for (i, src) in all_sources.iter().enumerate() {
+                if let Some(ref h) = src.file_hash {
+                    if !h.is_empty() {
+                        hash_map.entry(h.as_str()).or_default().push(i);
+                    }
+                }
+            }
+            for indices in hash_map.values() {
+                if indices.len() >= 2 {
+                    let anchor = indices[0];
+                    for &idx in &indices[1..] {
+                        union_find(&mut parent, &mut rank, anchor, idx);
+                    }
+                }
+            }
+        }
+
+        // Phase 3: fingerprint (with MBID conflict detection)
+        {
+            // Compute per-component MBIDs after Phase 1+2.
+            let mut comp_mbids: HashMap<usize, HashSet<String>> = HashMap::new();
+            for (i, src) in all_sources.iter().enumerate() {
+                let root = union_find_find(&mut parent, i);
+                for (key, value) in &src.tags {
+                    if key == "UFID:http://musicbrainz.org" {
+                        comp_mbids.entry(root).or_default().insert(value.clone());
+                    }
+                }
+            }
+
+            let mut fp_map: HashMap<&str, Vec<usize>> = HashMap::new();
+            for (i, src) in all_sources.iter().enumerate() {
+                if let Some(ref fp) = src.fingerprint {
+                    if !fp.is_empty() {
+                        fp_map.entry(fp.as_str()).or_default().push(i);
+                    }
+                }
+            }
+
+            for indices in fp_map.values() {
+                if indices.len() < 2 {
+                    continue;
+                }
+
+                // Collect distinct roots in this fingerprint group.
+                let roots: HashSet<usize> = indices
+                    .iter()
+                    .map(|&i| union_find_find(&mut parent, i))
+                    .collect();
+                if roots.len() < 2 {
+                    continue;
+                }
+
+                // Check MBID conflict: how many roots carry a non-empty MBID set?
+                let mbid_roots: Vec<&usize> = roots
+                    .iter()
+                    .filter(|r| comp_mbids.get(r).map(|s| !s.is_empty()).unwrap_or(false))
+                    .collect();
+
+                let ok_to_union = if mbid_roots.is_empty() {
+                    // No MBID-bearing roots → safe.
+                    true
+                } else {
+                    // One or more MBID-bearing roots; check they agree.
+                    let all_mbids: HashSet<&str> = mbid_roots
+                        .iter()
+                        .flat_map(|r| comp_mbids.get(r).unwrap().iter().map(|s| s.as_str()))
+                        .collect();
+                    all_mbids.len() <= 1
+                };
+
+                if ok_to_union {
+                    // Find the first source that belongs to a non-root, then
+                    // union two arbitrary elements to merge the components.
+                    let anchor_root = roots.iter().next().copied().unwrap();
+                    for other_root in roots.iter().copied() {
+                        if other_root == anchor_root {
+                            continue;
+                        }
+                        let anchor_idx = *indices
+                            .iter()
+                            .find(|&&i| union_find_find(&mut parent, i) == anchor_root)
+                            .unwrap();
+                        let other_idx = *indices
+                            .iter()
+                            .find(|&&i| union_find_find(&mut parent, i) == other_root)
+                            .unwrap();
+                        union_find(&mut parent, &mut rank, anchor_idx, other_idx);
+                    }
+                }
+                // else: conflicting MBIDs → keep separate recordings.
+            }
+        }
+
+        // ── Build groups from union-find ─────────────────────────────────────
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in 0..all_sources.len() {
+            groups
+                .entry(union_find_find(&mut parent, i))
                 .or_default()
-                .push(src);
+                .push(i);
         }
 
         // ── Build MemRecording, MemArtist, MemReleaseGroup ───────────────────
@@ -309,9 +442,21 @@ impl MemoryCatalog {
         // rg_id -> (MemReleaseGroup, min release_date across recordings)
         let mut rg_map: HashMap<String, MemReleaseGroup> = HashMap::new();
 
-        let mut recordings: Vec<MemRecording> = Vec::with_capacity(rec_sources.len());
+        let mut recordings: Vec<MemRecording> = Vec::with_capacity(groups.len());
 
-        for (recording_id, mut sources) in rec_sources {
+        for (_root, indices) in &groups {
+            let mut sources: Vec<RawSource> =
+                indices.iter().map(|&i| all_sources[i].clone()).collect();
+
+            // Compute deterministic recording ID from group contents.
+            let recording_id = compute_recording_id(&sources);
+
+            // Derive common MBID (None when sources disagree or have none).
+            let mbid = compute_common_mbid(&sources);
+
+            // Derive tags from source comment tags instead of recording_tag table.
+            let tags = derive_tags_from_comments(&sources);
+
             // Stable canonical source: smallest file_path among local_file sources.
             sources.sort_by(|a, b| a.file_path.cmp(&b.file_path));
             let canonical = sources
@@ -439,12 +584,9 @@ impl MemoryCatalog {
                 }
             }
 
-            let tags = recording_tags
-                .get(&recording_id)
-                .cloned()
-                .unwrap_or_default();
             recordings.push(MemRecording {
                 id: recording_id,
+                mbid,
                 title,
                 duration_ms,
                 genre,
@@ -762,6 +904,103 @@ fn derive_sort_name(name: &str) -> String {
     }
 }
 
+// ── Union-find helpers ────────────────────────────────────────────────────────
+
+fn union_find_find(parent: &mut [usize], x: usize) -> usize {
+    if parent[x] != x {
+        parent[x] = union_find_find(parent, parent[x]);
+    }
+    parent[x]
+}
+
+fn union_find(parent: &mut [usize], rank: &mut [usize], a: usize, b: usize) {
+    let ra = union_find_find(parent, a);
+    let rb = union_find_find(parent, b);
+    if ra == rb {
+        return;
+    }
+    if rank[ra] < rank[rb] {
+        parent[ra] = rb;
+    } else if rank[ra] > rank[rb] {
+        parent[rb] = ra;
+    } else {
+        parent[rb] = ra;
+        rank[ra] += 1;
+    }
+}
+
+/// Compute a deterministic recording ID for a group of sources.
+///
+/// Strategy:
+///   1. If all sources with an MBID agree on the same MBID → hash the MBID.
+///   2. Otherwise sort all source IDs and hash their concatenation.
+/// This produces a stable identifier across restarts.
+fn compute_recording_id(sources: &[RawSource]) -> String {
+    // Check for a common MBID across all MBID-bearing sources.
+    let mbids: HashSet<&str> = sources
+        .iter()
+        .flat_map(|s| s.tags.iter())
+        .filter(|(k, _)| k == "UFID:http://musicbrainz.org")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if mbids.len() == 1 {
+        let mbid = mbids.into_iter().next().unwrap();
+        let mut h = Sha256::new();
+        h.update(b"mbid:");
+        h.update(mbid.as_bytes());
+        return format!("mem-rec-{}", hex::encode(&h.finalize()[..8]));
+    }
+
+    // Fallback: hash the sorted concatenation of all source IDs.
+    let mut source_ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
+    source_ids.sort();
+    let mut h = Sha256::new();
+    h.update(b"sources:");
+    for sid in &source_ids {
+        h.update(sid.as_bytes());
+        h.update(b",");
+    }
+    format!("mem-rec-{}", hex::encode(&h.finalize()[..8]))
+}
+
+/// Return the common MBID if all MBID-bearing sources in the group agree on
+/// the same value, or `None` otherwise (including when no source has an MBID).
+fn compute_common_mbid(sources: &[RawSource]) -> Option<String> {
+    let mbids: HashSet<&str> = sources
+        .iter()
+        .flat_map(|s| s.tags.iter())
+        .filter(|(k, _)| k == "UFID:http://musicbrainz.org")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if mbids.len() == 1 {
+        mbids.into_iter().next().map(String::from)
+    } else {
+        None
+    }
+}
+
+/// Extract tags from COMM (comment) fields across all sources in a group.
+/// Tags are comma-separated within the comment text.
+fn derive_tags_from_comments(sources: &[RawSource]) -> Vec<String> {
+    let mut tag_set = Vec::new();
+    for source in sources {
+        for (key, value) in &source.tags {
+            if key == "COMM" {
+                // The COMM value may have the format "description\0content"
+                // or just plain content. Take the last segment after NUL.
+                let content = value.split('\0').last().unwrap_or(value);
+                for part in content.split(',') {
+                    let t = part.trim().to_string();
+                    if !t.is_empty() && !tag_set.contains(&t) {
+                        tag_set.push(t);
+                    }
+                }
+            }
+        }
+    }
+    tag_set
+}
+
 /// Convert a SQLite datetime string ("YYYY-MM-DD HH:MM:SS") to Unix seconds.
 fn sqlite_datetime_to_unix(s: &str) -> Option<i64> {
     if s.len() < 19 {
@@ -904,11 +1143,11 @@ fn eval_pred(
         }
         Predicate::InPlaylist(name) => playlists
             .get(name.as_str())
-            .map(|s| s.contains(rec.id.as_str()))
+            .map(|playlist_sources| rec.sources.iter().any(|s| playlist_sources.contains(&s.id)))
             .unwrap_or(false),
         Predicate::NotInPlaylist(name) => !playlists
             .get(name.as_str())
-            .map(|s| s.contains(rec.id.as_str()))
+            .map(|playlist_sources| rec.sources.iter().any(|s| playlist_sources.contains(&s.id)))
             .unwrap_or(false),
         Predicate::HasTag(tag) => rec.tags.iter().any(|t| t == tag),
         Predicate::Title(op, s) => match_str(*op, &rec.title, s),
@@ -1550,7 +1789,7 @@ impl super::CatalogReader for MemoryCatalog {
             artist_credit_name: rec.artist_credit_name.clone(),
             primary_artist_id: rec.primary_artist_id.clone(),
             artist_credit_text: None,
-            mbid: None,
+            mbid: rec.mbid.clone(),
             acoustid: None,
             rating: rec.avg_rating(),
             play_count: rec.total_play_count(),

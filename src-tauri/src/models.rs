@@ -16,7 +16,6 @@ pub enum PlaybackStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlayerState {
     pub status: PlaybackStatus,
-    pub recording_id: Option<String>,
     pub source_id: Option<String>,
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -195,8 +194,7 @@ pub struct QueueSettingsUpdate {
 
 #[derive(Debug, Deserialize)]
 pub struct PlayHistoryInput {
-    pub recording_id: String,
-    pub source_id: Option<String>,
+    pub source_id: String,
     pub duration_played_ms: Option<i64>,
 }
 
@@ -264,6 +262,8 @@ pub struct TrackMetadata {
     pub replay_gain_album_peak: Option<f64>,
     /// TXXX=ARTISTS — semicolon-separated list of additional artists.
     pub artists: Option<String>,
+    /// MusicBrainz Recording ID from UFID:http://musicbrainz.org tag.
+    pub recording_mbid: Option<String>,
 }
 
 /// Describes a duplicate-frame override applied during metadata reading.
