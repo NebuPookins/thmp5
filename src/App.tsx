@@ -1309,7 +1309,7 @@ function App() {
   useEffect(() => {
     if (!lastfmStatus?.logged_in) return;
     setCurrentTrackLoved(false);
-  }, [playerState.recording_id, lastfmStatus?.logged_in]);
+  }, [playerState.source_id, lastfmStatus?.logged_in]);
 
   // Draw waveform on canvas whenever data, position, or container size changes.
   useEffect(() => {
