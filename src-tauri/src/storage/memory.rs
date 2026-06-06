@@ -483,7 +483,7 @@ impl MemoryCatalog {
             let primary_artist_name = tpe1_name.or_else(|| all_artist_names.first().cloned());
 
             // Derive artist IDs (MBID when present, hash fallback)
-            let primary_mbid = tag_first(canonical_tags, "TXXX:MusicBrainz Artist Id");
+            let primary_mbid = mbid_tag(canonical_tags, "TXXX:MusicBrainz Artist Id");
             let mut artist_ids: Vec<String> = Vec::new();
             for (i, name) in all_artist_names.iter().enumerate() {
                 let id = if i == 0 {
@@ -528,7 +528,7 @@ impl MemoryCatalog {
                     .map(str::to_string)
                     .or_else(|| tag_first(&source.tags, "TPE1").map(str::to_string));
                 if let (Some(album), Some(rg_artist)) = (&album_title, &source_album_artist) {
-                    let rg_id = tag_first(&source.tags, "TXXX:MusicBrainz Release Group Id")
+                    let rg_id = mbid_tag(&source.tags, "TXXX:MusicBrainz Release Group Id")
                         .map(str::to_string)
                         .unwrap_or_else(|| name_hash("rg", &format!("{}|{}", album, rg_artist)));
 
@@ -724,6 +724,13 @@ impl MemoryCatalog {
 
 fn tag_first<'a>(tags: &'a [(String, String)], key: &str) -> Option<&'a str> {
     tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// Like `tag_first`, but returns `None` for absent or empty values.
+/// Used for MusicBrainz ID tags where an empty string must not be treated as a
+/// valid identifier (otherwise all untagged sources collapse into one entity).
+fn mbid_tag<'a>(tags: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    tag_first(tags, key).filter(|v| !v.is_empty())
 }
 
 /// Extract individual artist names from canonical tags.

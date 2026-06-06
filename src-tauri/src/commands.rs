@@ -952,7 +952,7 @@ pub async fn play(
                 .map(|(_, v)| v.clone());
             if let Some(mbid) = mbid {
                 let alts = sqlx::query(
-                    "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs
+                    "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs, s.raw_tags_json
                      FROM source s
                      WHERE s.id != ?
                        AND s.source_type = 'local_file'
