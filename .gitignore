@@ -24,6 +24,12 @@ dist-ssr
 *.sln
 *.sw?
 
+# Sizzle worktrees
+.sizzle-worktrees/
+
+# Misc project files
+todo.md
+
 # Generated Tauri icon assets
 src-tauri/icons/*.png
 src-tauri/icons/*.ico
