@@ -10,6 +10,8 @@
     "build": "tsc && vite build",
     "build:icons": "[ -f src-tauri/icons/icon.png ] && [ src-tauri/icons/icon-source.svg -ot src-tauri/icons/icon.png ] || tauri icon src-tauri/icons/icon-source.svg -o src-tauri/icons",
     "build:app": "npm run build && npm run build:icons",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -26,6 +28,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^4.1.8"
   }
 }
