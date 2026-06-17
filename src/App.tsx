@@ -129,6 +129,7 @@ type RecordingRatingUpdateResult = {
   recording: EntityRatingUpdate;
   release_groups: EntityRatingUpdate[];
   artists: EntityRatingUpdate[];
+  affected_recordings: EntityRatingUpdate[];
 };
 
 type SmartPlaylistResult = {
@@ -517,6 +518,22 @@ function applyAggregateRatings<T extends { id: string; rating: number | null }>(
       ? { ...row, rating: ratingsById.get(row.id) ?? null }
       : row
   ));
+}
+
+function applyPredictedRatings<T extends { id: string; predicted_rating: number | null }>(
+  rows: T[],
+  updates: EntityRatingUpdate[],
+): T[] {
+  if (updates.length === 0) {
+    return rows;
+  }
+
+  const predictedById = new Map(updates.map((update) => [update.id, update.rating] as const));
+  return rows.map((row) =>
+    predictedById.has(row.id)
+      ? { ...row, predicted_rating: predictedById.get(row.id) ?? null }
+      : row,
+  );
 }
 
 // ── Detail view navigation stack ──────────────────────────────────────────────
@@ -1848,6 +1865,26 @@ function App() {
       );
       setArtists((current) => applyAggregateRatings(current, updateResult.artists));
       setReleaseGroups((current) => applyAggregateRatings(current, updateResult.release_groups));
+      // Refresh predicted ratings for recordings sharing an artist or album
+      // with the rated track (e.g. other tracks on the same album).
+      if (updateResult.affected_recordings.length > 0) {
+        setRecordings((current) => applyPredictedRatings(current, updateResult.affected_recordings));
+        setHistory((current) => applyPredictedRatings(current, updateResult.affected_recordings));
+        setQueue((current) => applyPredictedRatings(current, updateResult.affected_recordings));
+        setCurrentTrack((current) =>
+          current
+            ? (applyPredictedRatings([current], updateResult.affected_recordings)[0] ?? current)
+            : current,
+        );
+        setSmartResult((current) =>
+          current
+            ? {
+                ...current,
+                recordings: applyPredictedRatings(current.recordings, updateResult.affected_recordings),
+              }
+            : current,
+        );
+      }
     } catch (ratingError) {
       setRecordings(previousRecordings);
       setHistory(previousHistory);

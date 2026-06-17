@@ -216,6 +216,10 @@ pub struct RecordingRatingUpdateResult {
     pub recording: EntityRatingUpdate,
     pub release_groups: Vec<EntityRatingUpdate>,
     pub artists: Vec<EntityRatingUpdate>,
+    /// Predicted ratings for recordings that share an artist or release group
+    /// with the rated recording, so the frontend can refresh their displayed
+    /// predicted-rating stars without a full re-fetch.
+    pub affected_recordings: Vec<EntityRatingUpdate>,
 }
 
 #[derive(Debug, Deserialize)]

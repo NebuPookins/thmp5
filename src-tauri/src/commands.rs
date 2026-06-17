@@ -545,6 +545,7 @@ pub async fn set_source_rating(
     };
     let mut artists: Vec<crate::models::EntityRatingUpdate> = Vec::new();
     let mut release_groups: Vec<crate::models::EntityRatingUpdate> = Vec::new();
+    let mut affected_recordings: Vec<crate::models::EntityRatingUpdate> = Vec::new();
 
     if let Some(rec) = rec {
         let rec_detail = catalog
@@ -582,6 +583,34 @@ pub async fn set_source_rating(
                     });
                 }
             }
+
+            // Collect predicted ratings for all recordings that share an artist
+            // or release group with the rated recording, so the frontend can
+            // refresh their predicted-rating stars.
+            let artist_set: std::collections::HashSet<&str> =
+                rec.artist_ids.iter().map(|s| s.as_str()).collect();
+            let rg_id_set: std::collections::HashSet<&str> =
+                rg_ids.iter().map(|s| s.as_str()).collect();
+
+            for sibling in &recs {
+                if sibling.id == rec.id {
+                    continue;
+                }
+                let shares_artist = sibling
+                    .artist_ids
+                    .iter()
+                    .any(|aid| artist_set.contains(aid.as_str()));
+                let shares_album = sibling
+                    .releases
+                    .iter()
+                    .any(|r| rg_id_set.contains(r.release_group_id.as_str()));
+                if shares_artist || shares_album {
+                    affected_recordings.push(crate::models::EntityRatingUpdate {
+                        id: sibling.id.clone(),
+                        rating: sibling.predicted_rating,
+                    });
+                }
+            }
         }
     }
     drop(catalog);
@@ -590,6 +619,7 @@ pub async fn set_source_rating(
         recording,
         release_groups,
         artists,
+        affected_recordings,
     })
 }
 
