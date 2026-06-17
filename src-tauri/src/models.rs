@@ -148,6 +148,7 @@ pub struct RecordingRow {
     pub artist_credit_name: Option<String>,
     pub genre: Option<String>,
     pub rating: Option<f64>,
+    pub predicted_rating: Option<f64>,
     pub play_count: i64,
     pub last_played: Option<String>,
     pub primary_source_id: Option<String>,

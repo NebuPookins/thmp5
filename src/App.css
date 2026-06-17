@@ -361,6 +361,10 @@ button {
   color: #efb15a;
 }
 
+.rating-star-predicted {
+  color: #d4dce6;
+}
+
 .rating-star:disabled {
   cursor: wait;
   opacity: 0.55;

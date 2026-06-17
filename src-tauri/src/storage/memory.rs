@@ -126,6 +126,25 @@ fn rg_avg_rating(rg_indices: &[usize], all: &[MemRecording]) -> Option<f64> {
     release_avg_rating(rg_indices.iter().map(|&i| &all[i]))
 }
 
+/// Predicted rating for a recording: collects the average rating of every artist
+/// and the average rating of every album the recording appears on, filters out
+/// null values, and returns the mean. Returns None if all inputs are null.
+fn compute_predicted_rating(
+    artist_avg_ratings: &[Option<f64>],
+    album_avg_ratings: &[Option<f64>],
+) -> Option<f64> {
+    let values: Vec<f64> = artist_avg_ratings
+        .iter()
+        .chain(album_avg_ratings.iter())
+        .filter_map(|&r| r)
+        .collect();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
 // ── Public catalog struct ─────────────────────────────────────────────────────
 
 pub struct MemoryCatalog {
@@ -1255,6 +1274,31 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
         })
         .collect();
 
+    let artist_ratings: Vec<Option<f64>> = rec
+        .artist_ids
+        .iter()
+        .map(|aid| {
+            catalog.recordings_by_artist.get(aid).and_then(|indices| {
+                avg_f64(
+                    indices
+                        .iter()
+                        .filter_map(|&i| catalog.recordings[i].avg_rating()),
+                )
+            })
+        })
+        .collect();
+    let album_ratings: Vec<Option<f64>> = rec
+        .release_group_assocs
+        .iter()
+        .map(|assoc| {
+            catalog
+                .recordings_by_rg
+                .get(&assoc.rg_id)
+                .and_then(|indices| rg_avg_rating(indices, &catalog.recordings))
+        })
+        .collect();
+    let predicted_rating = compute_predicted_rating(&artist_ratings, &album_ratings);
+
     RecordingRow {
         id: rec.id.clone(),
         title: rec.title.clone(),
@@ -1263,6 +1307,7 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
         artist_credit_name: rec.artist_credit_name.clone(),
         genre: rec.genre.clone(),
         rating: rec.avg_rating(),
+        predicted_rating,
         play_count: rec.total_play_count(),
         last_played: rec.last_played().map(String::from),
         primary_source_id: primary_source.map(|s| s.id.clone()),
@@ -1828,7 +1873,55 @@ fn pseudo_shuffle<T>(v: &mut [T], seed: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_artist_names;
+    use super::{compute_predicted_rating, extract_artist_names};
+
+    #[test]
+    fn single_artist_with_rating_no_album() {
+        let result = compute_predicted_rating(&[Some(4.0)], &[None]);
+        assert_eq!(result, Some(4.0));
+    }
+
+    #[test]
+    fn two_artists_no_album() {
+        let result = compute_predicted_rating(&[Some(4.0), Some(3.5)], &[None]);
+        assert_eq!(result, Some(3.75));
+    }
+
+    #[test]
+    fn no_artists_album_with_rating() {
+        let result = compute_predicted_rating(&[], &[Some(4.5)]);
+        assert_eq!(result, Some(4.5));
+    }
+
+    #[test]
+    fn mixed_some_nulls() {
+        let result = compute_predicted_rating(&[Some(4.0), None], &[Some(3.0)]);
+        assert_eq!(result, Some(3.5));
+    }
+
+    #[test]
+    fn all_nulls_or_empty() {
+        let result = compute_predicted_rating(&[None], &[None]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn single_artist_and_album_same_value() {
+        let result = compute_predicted_rating(&[Some(4.0)], &[Some(4.0)]);
+        assert_eq!(result, Some(4.0));
+    }
+
+    #[test]
+    fn two_albums_one_artist() {
+        let result = compute_predicted_rating(&[Some(4.0)], &[Some(3.0), Some(5.0)]);
+        assert_eq!(result, Some(4.0));
+    }
+
+    #[test]
+    fn empty_slices() {
+        let result = compute_predicted_rating(&[], &[]);
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn txxx_artists_null_separated_preferred_over_tpe1() {

@@ -20,6 +20,7 @@ function makeRecording(overrides: Partial<RecordingRow> & { id: string }): Recor
     artist_credit_name: null,
     genre: null,
     rating: null,
+    predicted_rating: null,
     play_count: 0,
     last_played: null,
     primary_source_id: "src-" + overrides.id,

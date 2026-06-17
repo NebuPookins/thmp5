@@ -85,6 +85,7 @@ type RecordingRow = {
   artist_credit_name: string | null;
   genre: string | null;
   rating: number | null;
+  predicted_rating: number | null;
   play_count: number;
   last_played: string | null;
   primary_source_id: string | null;
@@ -434,9 +435,11 @@ type RatingStarsProps = {
   recordingId: string;
   onRate: (recordingId: string, value: number | null) => void;
   disabled?: boolean;
+  isPredicted?: boolean;
 };
 
-const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disabled = false }: RatingStarsProps) {
+const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disabled = false, isPredicted = false }: RatingStarsProps) {
+  const fillClass = isPredicted ? "rating-star-predicted" : "rating-star-filled";
   return (
     <div className="rating-stars" role="group">
       {[1, 2, 3, 4, 5].map((star) => {
@@ -444,7 +447,7 @@ const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disa
         return (
           <button
             aria-label={`Set rating to ${star}`}
-            className={`rating-star ${filled ? "rating-star-filled" : ""}`}
+            className={`rating-star ${filled ? fillClass : ""}`}
             disabled={disabled}
             key={star}
             onClick={(event) => {
@@ -1957,7 +1960,8 @@ function App() {
                 disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
                 onRate={handleRate}
                 recordingId={currentTrack.id}
-                value={currentTrack.rating}
+                value={currentTrack.rating !== null ? currentTrack.rating : currentTrack.predicted_rating}
+                isPredicted={currentTrack.rating === null}
               />
               {lastfmStatus?.logged_in ? (
                 <button
@@ -2279,6 +2283,7 @@ function App() {
                       primary_source_path: null,
                       genre: null,
                       rating: null,
+                      predicted_rating: null,
                       play_count: 0,
                       last_played: null,
                       tags: [],
@@ -2348,7 +2353,8 @@ function App() {
                                     disabled={ratingKeyInFlight === `recording:${recording.id}`}
                                     onRate={handleRate}
                                     recordingId={recording.id}
-                                    value={recording.rating}
+                                    value={recording.rating !== null ? recording.rating : recording.predicted_rating}
+                                    isPredicted={recording.rating === null}
                                   />
                                 </td>
                                 <td>{formatDuration(recording.duration_ms)}</td>
@@ -2495,7 +2501,8 @@ function App() {
                                       disabled={ratingKeyInFlight === `recording:${recording.id}`}
                                       onRate={handleRate}
                                       recordingId={recording.id}
-                                      value={recording.rating}
+                                      value={recording.rating !== null ? recording.rating : recording.predicted_rating}
+                                      isPredicted={recording.rating === null}
                                     />
                                   </td>
                                   <td>{formatDuration(recording.duration_ms)}</td>
@@ -2604,7 +2611,8 @@ function App() {
                           disabled={ratingKeyInFlight === `recording:${item.id}`}
                           onRate={handleRate}
                           recordingId={item.id}
-                          value={item.rating}
+                          value={item.rating !== null ? item.rating : item.predicted_rating}
+                          isPredicted={item.rating === null}
                         />
                       </div>
                     </li>
@@ -2621,7 +2629,8 @@ function App() {
                           disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
                           onRate={handleRate}
                           recordingId={currentTrack.id}
-                          value={currentTrack.rating}
+                          value={currentTrack.rating !== null ? currentTrack.rating : currentTrack.predicted_rating}
+                          isPredicted={currentTrack.rating === null}
                         />
                       </div>
                     </li>
@@ -2651,7 +2660,8 @@ function App() {
                           disabled={ratingKeyInFlight === `recording:${item.id}`}
                           onRate={handleRate}
                           recordingId={item.id}
-                          value={item.rating}
+                          value={item.rating !== null ? item.rating : item.predicted_rating}
+                          isPredicted={item.rating === null}
                         />
                       </div>
                     </li>

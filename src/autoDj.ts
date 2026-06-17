@@ -10,6 +10,7 @@ export interface RecordingRow {
   artist_credit_name: string | null;
   genre: string | null;
   rating: number | null;
+  predicted_rating: number | null;
   play_count: number;
   last_played: string | null;
   primary_source_id: string | null;
