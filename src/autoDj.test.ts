@@ -251,6 +251,25 @@ describe("pickNextTrack", () => {
     expect(result!.id).not.toBe("g");
   });
 
+  it("does not re-pick a just-completed track that is now first in history (regression)", () => {
+    // Scenario: HANABI finishes playing, completeCurrentTrack() runs,
+    // setting currentTrack=null and adding HANABI to history[0].
+    // AutoDJ then fires with queue=[], currentTrack=null.
+    // It must NOT re-pick the same song just because it's no longer currentTrack.
+    const justFinished = makeRecording({ id: "hanabi", last_played: null });
+    const other = makeRecording({ id: "other-song", last_played: null });
+    const result = pickNextTrack({
+      playable: [justFinished, other],
+      queue: [],
+      history: [justFinished], // just-completed track is first in history
+      currentTrack: null,
+      now: FAKE_NOW,
+    });
+    expect(result).toBeDefined();
+    expect(result!.id).not.toBe("hanabi");
+    expect(result!.id).toBe("other-song");
+  });
+
   it("returns undefined when all songs are excluded and no fallback possible", () => {
     const result = pickNextTrack({
       playable: [],

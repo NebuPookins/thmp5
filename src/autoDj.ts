@@ -154,6 +154,12 @@ export function pickNextTrack(options: PickOptions): RecordingRow | undefined {
   const excludeIdSet = new Set<string>();
   if (currentTrack) excludeIdSet.add(currentTrack.id);
   for (const item of queue) excludeIdSet.add(item.id);
+  // Exclude recently-completed tracks from history to prevent re-picking
+  // when the queue empties before backend playback history refreshes.
+  // We exclude the most recent entries (up to 5) since history is most-recent-first.
+  for (let i = 0; i < Math.min(history.length, 5); i++) {
+    excludeIdSet.add(history[i].id);
+  }
 
   // First pass: strict — exclude recently-played AND in-queue/current.
   let candidates = excludeRecentlyPlayed(playable, wallClock);
@@ -162,7 +168,7 @@ export function pickNextTrack(options: PickOptions): RecordingRow | undefined {
   const pick = pickByRatingStrategy(history, candidates);
   if (pick) return pick;
 
-  // Second pass: relaxed — only exclude in-queue/current, allow recently-played.
+  // Second pass: relaxed — only exclude in-queue/current/recent-history, allow recently-played.
   candidates = excludeIds(playable, excludeIdSet);
   return pickByRatingStrategy(history, candidates);
 }
