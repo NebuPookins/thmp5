@@ -453,7 +453,7 @@ const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disa
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              onRate(recordingId, value === star ? null : star);
+              onRate(recordingId, isPredicted ? star : (value === star ? null : star));
             }}
             type="button"
           >
