@@ -416,7 +416,7 @@ function compareRecordings(a: RecordingRow, b: RecordingRow, col: SortColumn, as
       delta = (a.genre ?? "").localeCompare(b.genre ?? "");
       break;
     case "rating":
-      delta = (a.rating ?? 0) - (b.rating ?? 0);
+      delta = (a.rating ?? a.predicted_rating ?? 0) - (b.rating ?? b.predicted_rating ?? 0);
       break;
     case "duration":
       delta = (a.duration_ms ?? 0) - (b.duration_ms ?? 0);
