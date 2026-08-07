@@ -69,38 +69,18 @@ fn serialize_frame(
     frame
 }
 
-/// Serialize a COMM (comment) frame payload.
+/// Serialize the payload of a described frame — TXXX or COMM.
 ///
-/// Format: `[encoding_byte][language: 3 bytes ISO-639-2]["\0"][text]`
-/// We use language "eng" and an empty description.
-fn serialize_comment_payload(value: &str) -> Vec<u8> {
-    let mut payload = vec![0x03u8]; // UTF-8
-    payload.extend_from_slice(b"eng"); // language
-    payload.push(0x00); // empty description / content descriptor
-    payload.extend_from_slice(value.as_bytes());
-    payload
-}
-
-/// Check whether a frame ID is a text frame we can serialize.
-fn is_serializable_text_frame(frame_id: &str) -> bool {
-    // Standard text frames: 4-byte ID starting with 'T', not TXXX
-    if frame_id.len() == 4 && frame_id.starts_with('T') && frame_id != "TXXX" {
-        return true;
-    }
-    // TXXX frames: "TXXX" or "TXXX:description"
-    if frame_id == "TXXX" || frame_id.starts_with("TXXX:") {
-        return true;
-    }
-    matches!(frame_id, "COMM")
-}
-
-/// Serialize a TXXX (user-defined text) frame payload.
-///
-/// Format: `[encoding_byte][description\0][value]`
-fn serialize_txxx_payload(description: &str, value: &str) -> Vec<u8> {
-    let mut payload = vec![0x03u8]; // UTF-8
+/// Format: `[encoding_byte][language][description]["\0"][value]`, where
+/// `language` is the 3-byte ISO-639-2 code COMM carries and is empty for TXXX.
+/// Descriptions round-trip, but — as with the text encoding — the language is
+/// normalized rather than preserved: every comment we write is tagged "eng".
+fn serialize_described_payload(language: &[u8], description: &str, value: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 + language.len() + description.len() + value.len());
+    payload.push(0x03); // UTF-8
+    payload.extend_from_slice(language);
     payload.extend_from_slice(description.as_bytes());
-    payload.push(0x00);
+    payload.push(0x00); // content-descriptor terminator
     payload.extend_from_slice(value.as_bytes());
     payload
 }
@@ -130,24 +110,18 @@ pub fn serialize_tag(
     let mut tag_body = Vec::new();
 
     for (frame_id, value) in frames {
-        if !is_serializable_text_frame(frame_id) {
+        if !super::is_text_frame(frame_id) {
             continue;
         }
 
-        let (actual_frame_id, payload) = if frame_id == "COMM" {
-            ("COMM".to_string(), serialize_comment_payload(value))
-        } else if frame_id.starts_with("TXXX") {
-            let description = frame_id.strip_prefix("TXXX:").unwrap_or("");
-            (
-                "TXXX".to_string(),
-                serialize_txxx_payload(description, value),
-            )
-        } else {
-            (frame_id.clone(), encode_text_value(value))
+        let (base_id, description) = super::split_frame_key(frame_id);
+        let payload = match base_id {
+            "COMM" => serialize_described_payload(b"eng", description, value),
+            "TXXX" => serialize_described_payload(b"", description, value),
+            _ => encode_text_value(value),
         };
 
-        let frame_bytes =
-            serialize_frame(&actual_frame_id, &payload, version, frame_sizes_synchsafe);
+        let frame_bytes = serialize_frame(base_id, &payload, version, frame_sizes_synchsafe);
         tag_body.extend_from_slice(&frame_bytes);
     }
 
@@ -293,6 +267,17 @@ mod tests {
         assert!(tag_bytes.windows(4).any(|w| w == b"COMM"));
         // The comment payload should contain "eng\0comment"
         let payload = b"\x03eng\x00A comment";
+        assert!(tag_bytes.windows(payload.len()).any(|w| w == payload));
+    }
+
+    #[test]
+    fn test_serialize_tag_with_described_comment() {
+        let frames = vec![("COMM:ID3v1 Comment".to_string(), "A comment".to_string())];
+        let tag_bytes = serialize_tag(&frames, &[], 4).unwrap();
+
+        assert!(tag_bytes.windows(4).any(|w| w == b"COMM"));
+        // Language, then the description, then the terminator, then the text.
+        let payload = b"\x03engID3v1 Comment\x00A comment";
         assert!(tag_bytes.windows(payload.len()).any(|w| w == payload));
     }
 

@@ -177,15 +177,9 @@ pub fn delete_frame(path: &Path, frame_id: &str) -> Result<TagWriteResult> {
     let pre_audio_hash = audio_hash(&original_data);
     let pre_full_hash = full_hash(&original_data);
 
-    // Remove matching frames
-    let modified_frames: Vec<_> = frames
-        .into_iter()
-        .filter(|(id, _)| id != frame_id)
-        .collect();
-
-    if modified_frames.len() == 0 {
-        // Allow: user might want to clear all frames (still write a valid tag with no frames)
-    }
+    // Remove matching frames. Removing every frame is allowed — we still write
+    // a valid (empty) tag in that case.
+    let modified_frames: Vec<_> = frames.into_iter().filter(|(id, _)| id != frame_id).collect();
 
     let backup_path = backup_file(path)?;
     write_modified_file(path, &original_data, &modified_frames, id3v2_version)?;
@@ -404,28 +398,16 @@ pub fn parse_text_frames(data: &[u8]) -> Option<(Vec<(String, String)>, u8)> {
 
         if is_text_frame(&frame_id) && frame_size > 1 {
             let encoding = data[data_start];
-            if frame_id == "TXXX" {
-                let payload = &data[data_start + 1..data_end];
-                let null_pos = payload.iter().position(|&b| b == 0);
-                match null_pos {
-                    Some(n) => {
-                        let desc = decode_id3v2_text(&payload[..n], encoding);
-                        let val = decode_id3v2_text(&payload[n + 1..], encoding);
-                        let key = if desc.is_empty() {
-                            "TXXX".to_string()
-                        } else {
-                            format!("TXXX:{desc}")
-                        };
-                        frames.push((key, val));
-                    }
-                    None => {
-                        let val = decode_id3v2_text(payload, encoding);
-                        frames.push(("TXXX".to_string(), val));
-                    }
+            let payload = &data[data_start + 1..data_end];
+            match language_prefix_len(&frame_id) {
+                Some(lang_len) if payload.len() >= lang_len => {
+                    let (desc_bytes, value_bytes) =
+                        split_description(&payload[lang_len..], encoding);
+                    frames.push(described_frame(&frame_id, desc_bytes, value_bytes, encoding));
                 }
-            } else {
-                let text = decode_id3v2_text(&data[data_start + 1..data_end], encoding);
-                frames.push((frame_id, text));
+                // Malformed described frame — too short to hold its language code.
+                Some(_) => {}
+                None => frames.push((frame_id, decode_id3v2_text(payload, encoding))),
             }
         }
 
@@ -433,6 +415,65 @@ pub fn parse_text_frames(data: &[u8]) -> Option<(Vec<(String, String)>, u8)> {
     }
 
     Some((frames, version))
+}
+
+/// The number of language-code bytes that precede the description in a
+/// described frame's payload, or `None` for frames that carry no description.
+///
+/// TXXX is `[encoding][description][terminator][value]`; COMM is the same with
+/// a 3-byte ISO-639-2 language code in front of the description.
+fn language_prefix_len(frame_id: &str) -> Option<usize> {
+    match frame_id {
+        "TXXX" => Some(0),
+        "COMM" => Some(3),
+        _ => None,
+    }
+}
+
+/// Split a `description ~ terminator ~ value` payload (used by TXXX and COMM)
+/// into its two halves.
+///
+/// The terminator is two NUL bytes for the UTF-16 encodings (0x01/0x02) and a
+/// single NUL byte otherwise. A payload with no terminator is treated as being
+/// entirely the value, with an empty description.
+fn split_description(payload: &[u8], encoding: u8) -> (&[u8], &[u8]) {
+    if encoding == 0x01 || encoding == 0x02 {
+        let mut i = 0;
+        while i + 1 < payload.len() {
+            if payload[i] == 0 && payload[i + 1] == 0 {
+                return (&payload[..i], &payload[i + 2..]);
+            }
+            i += 2;
+        }
+    } else if let Some(n) = payload.iter().position(|&b| b == 0) {
+        return (&payload[..n], &payload[n + 1..]);
+    }
+    (&[], payload)
+}
+
+/// Build the `(key, value)` pair for a frame that carries a description,
+/// keying it as `"<base>:<description>"` (or just `"<base>"` when the
+/// description is empty) so the description survives a rewrite.
+fn described_frame(
+    base_id: &str,
+    desc_bytes: &[u8],
+    value_bytes: &[u8],
+    encoding: u8,
+) -> (String, String) {
+    let desc = decode_id3v2_text(desc_bytes, encoding);
+    let value = decode_id3v2_text(value_bytes, encoding);
+    let key = if desc.is_empty() {
+        base_id.to_string()
+    } else {
+        format!("{base_id}:{desc}")
+    };
+    (key, value)
+}
+
+/// Split a frame key back into its base ID and description — the inverse of
+/// the key built by [`described_frame`].
+fn split_frame_key(key: &str) -> (&str, &str) {
+    key.split_once(':').unwrap_or((key, ""))
 }
 
 fn skip_extended_header(data: &[u8], version: u8, pos: usize, end: usize) -> usize {
@@ -452,14 +493,13 @@ fn synchsafe_to_u32(b: &[u8]) -> u32 {
     ((b[0] as u32) << 21) | ((b[1] as u32) << 14) | ((b[2] as u32) << 7) | (b[3] as u32)
 }
 
+/// Whether a wire frame ID — or a `base:description` key produced by
+/// [`described_frame`] — names a text frame this module can parse and
+/// re-serialize.
 fn is_text_frame(frame_id: &str) -> bool {
-    if frame_id.len() == 4 && frame_id.starts_with('T') && frame_id != "TXXX" {
-        return true;
-    }
-    if frame_id == "TXXX" || frame_id.starts_with("TXXX:") {
-        return true;
-    }
-    frame_id == "COMM"
+    let base = split_frame_key(frame_id).0;
+    // Standard text frames plus the two described frames we understand.
+    (base.len() == 4 && base.starts_with('T') && base != "TXXX") || matches!(base, "TXXX" | "COMM")
 }
 
 fn decode_id3v2_text(data: &[u8], encoding: u8) -> String {
@@ -819,6 +859,156 @@ mod tests {
             .any(|(id, val)| id == "TXXX:MusicBrainz Artist Id" && val == "new-uuid"));
         // Original TIT2 should still be there
         assert!(reparsed.iter().any(|(id, _)| id == "TIT2"));
+    }
+
+    // ── COMM tests ─────────────────────────────────────────────────────────────
+
+    fn comm_frame(description: &str, text: &str) -> Vec<u8> {
+        let mut payload = vec![0x03u8]; // UTF-8
+        payload.extend_from_slice(b"eng"); // language
+        payload.extend_from_slice(description.as_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(text.as_bytes());
+        id3_frame(b"COMM", &payload)
+    }
+
+    #[test]
+    fn test_parse_comm_frame() {
+        let data = synth_mp3(&[comm_frame("", "A comment")]);
+        let (parsed, _) = parse_text_frames(&data).unwrap();
+        assert_eq!(parsed, vec![("COMM".into(), "A comment".into())]);
+    }
+
+    #[test]
+    fn test_parse_comm_frame_with_description() {
+        let data = synth_mp3(&[comm_frame("ID3v1 Comment", "Ripped by X")]);
+        let (parsed, _) = parse_text_frames(&data).unwrap();
+        assert_eq!(
+            parsed,
+            vec![("COMM:ID3v1 Comment".into(), "Ripped by X".into())]
+        );
+    }
+
+    #[test]
+    fn test_parse_comm_frame_utf16() {
+        // UTF-16LE with BOM: encoding 0x01, empty description, 2-byte terminator.
+        let mut payload = vec![0x01u8];
+        payload.extend_from_slice(b"eng");
+        payload.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x00]); // BOM + terminator
+        payload.extend_from_slice(&[0xFF, 0xFE]); // BOM for the text
+        for c in "Hi".encode_utf16() {
+            payload.extend_from_slice(&c.to_le_bytes());
+        }
+        let data = synth_mp3(&[id3_frame(b"COMM", &payload)]);
+        let (parsed, _) = parse_text_frames(&data).unwrap();
+        assert_eq!(parsed, vec![("COMM".into(), "Hi".into())]);
+    }
+
+    #[test]
+    fn test_comm_roundtrip() {
+        let original = synth_mp3(&[
+            id3_frame(b"TIT2", b"\x03Song"),
+            comm_frame("", "A comment"),
+            comm_frame("ID3v1 Comment", "Ripped by X"),
+        ]);
+        let (parsed, version) = parse_text_frames(&original).unwrap();
+        let rebuilt = rebuild_file(&original, &parsed, version).unwrap();
+        let (reparsed, _) = parse_text_frames(&rebuilt).unwrap();
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn test_comm_preserved_across_edit_of_other_frame() {
+        let original = synth_mp3(&[
+            id3_frame(b"TIT2", b"\x03Song"),
+            comm_frame("", "A comment"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &original).unwrap();
+
+        write_single_frame(&path, "TIT2", "New Song").unwrap();
+
+        let written = std::fs::read(&path).unwrap();
+        let (reparsed, _) = parse_text_frames(&written).unwrap();
+        assert!(reparsed
+            .iter()
+            .any(|(id, val)| id == "TIT2" && val == "New Song"));
+        assert!(reparsed
+            .iter()
+            .any(|(id, val)| id == "COMM" && val == "A comment"));
+    }
+
+    #[test]
+    fn test_write_comm_frame_to_disk() {
+        let original = synth_mp3(&[
+            id3_frame(b"TIT2", b"\x03Song"),
+            comm_frame("", "Old comment"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &original).unwrap();
+
+        let result = write_single_frame(&path, "COMM", "New comment").unwrap();
+        assert_eq!(result.pre_audio_hash, result.post_audio_hash);
+
+        let written = std::fs::read(&path).unwrap();
+        let (reparsed, _) = parse_text_frames(&written).unwrap();
+        let comments: Vec<_> = reparsed
+            .into_iter()
+            .filter(|(id, _)| id.starts_with("COMM"))
+            .collect();
+        assert_eq!(comments, vec![("COMM".into(), "New comment".into())]);
+    }
+
+    #[test]
+    fn test_write_comm_leaves_described_comments_alone() {
+        // iTunes stores gapless/normalization data in described COMM frames.
+        // Editing "the comment" must not overwrite them.
+        let original = synth_mp3(&[
+            comm_frame("iTunNORM", "0000 0001"),
+            comm_frame("", "Old comment"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &original).unwrap();
+
+        write_single_frame(&path, "COMM", "New comment").unwrap();
+
+        let written = std::fs::read(&path).unwrap();
+        let (reparsed, _) = parse_text_frames(&written).unwrap();
+        assert_eq!(
+            reparsed,
+            vec![
+                ("COMM:iTunNORM".into(), "0000 0001".into()),
+                ("COMM".into(), "New comment".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_delete_comm_frame() {
+        let original = synth_mp3(&[
+            id3_frame(b"TIT2", b"\x03Song"),
+            comm_frame("iTunNORM", "0000 0001"),
+            comm_frame("", "A comment"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &original).unwrap();
+
+        delete_frame(&path, "COMM").unwrap();
+
+        let written = std::fs::read(&path).unwrap();
+        let (reparsed, _) = parse_text_frames(&written).unwrap();
+        // Only the plain comment goes; described comments are left intact.
+        assert_eq!(
+            reparsed,
+            vec![
+                ("TIT2".into(), "Song".into()),
+                ("COMM:iTunNORM".into(), "0000 0001".into()),
+            ]
+        );
     }
 
     #[test]
