@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import { pickNextTrack } from "./autoDj";
+import { calculatePomodoroBatch, formatPomodoroDuration, parsePomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
 import "./App.css";
 
 type LibrarySummary = {
@@ -573,6 +574,7 @@ function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<QueueItem[]>([]);
   const [autoDj, setAutoDj] = useState(false);
+  const [pomodoroDurationInput, setPomodoroDurationInput] = useState("25m");
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const currentTrackRef = useRef<QueueItem | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
@@ -895,6 +897,33 @@ function App() {
     } else {
       setQueue((q) => [...q, ...playable]);
     }
+  }
+
+  function handlePomodoroFill() {
+    setError(null);
+    const targetDurationMs =
+      parsePomodoroDuration(pomodoroDurationInput) ?? DEFAULT_TARGET_MS;
+
+    const playable = recordings.filter((r) => r.primary_source_id !== null);
+    if (playable.length === 0) {
+      setError("No playable tracks available for Pomodoro.");
+      return;
+    }
+
+    const batch = calculatePomodoroBatch({
+      playable,
+      queue,
+      history,
+      currentTrack,
+      targetDurationMs,
+    });
+
+    if (batch.length === 0) {
+      setError("Not enough tracks to fill the Pomodoro duration.");
+      return;
+    }
+
+    enqueueAll(batch);
   }
 
   async function loadArtists() {
@@ -2618,14 +2647,35 @@ function App() {
                     : "Nothing playing"}
                 </p>
               </div>
-              <button
-                className={`auto-dj-btn ${autoDj ? "auto-dj-btn-on" : ""}`}
-                onClick={() => setAutoDj((v) => !v)}
-                title={autoDj ? "Auto DJ on — click to disable" : "Auto DJ off — click to enable"}
-                type="button"
-              >
-                Auto DJ
-              </button>
+              <div className="queue-header-actions">
+                <input
+                  className="pomodoro-duration-input"
+                  type="text"
+                  value={pomodoroDurationInput}
+                  onChange={(e) => setPomodoroDurationInput(e.target.value)}
+                  onFocus={(e) => e.target.select()}
+                  placeholder="25m"
+                  size={5}
+                  aria-label="Pomodoro duration"
+                  title={`Pomodoro duration (e.g., 25m, 1h, 1h30m)`}
+                />
+                <button
+                  className="pomodoro-btn"
+                  onClick={handlePomodoroFill}
+                  title={`Fill queue with ~${formatPomodoroDuration(parsePomodoroDuration(pomodoroDurationInput) ?? DEFAULT_TARGET_MS)} of music`}
+                  type="button"
+                >
+                  Pomodoro
+                </button>
+                <button
+                  className={`auto-dj-btn ${autoDj ? "auto-dj-btn-on" : ""}`}
+                  onClick={() => setAutoDj((v) => !v)}
+                  title={autoDj ? "Auto DJ on — click to disable" : "Auto DJ off — click to enable"}
+                  type="button"
+                >
+                  Auto DJ
+                </button>
+              </div>
             </div>
             <ol className="queue-list">
               {history.length === 0 && !currentTrack && queue.length === 0 ? (

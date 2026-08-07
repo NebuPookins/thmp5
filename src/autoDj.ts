@@ -48,6 +48,26 @@ export interface PickOptions {
 }
 
 /**
+ * Build the set of track IDs that must be excluded from selection:
+ * the currently-playing track, every queued item, and up to `count`
+ * of the most recent history entries.
+ */
+export function buildExclusionSet(
+  currentTrack: QueueItem | null,
+  queue: QueueItem[],
+  history: QueueItem[],
+  historyCount = 5,
+): Set<string> {
+  const exclude = new Set<string>();
+  if (currentTrack) exclude.add(currentTrack.id);
+  for (const item of queue) exclude.add(item.id);
+  for (let i = 0; i < Math.min(history.length, historyCount); i++) {
+    exclude.add(history[i].id);
+  }
+  return exclude;
+}
+
+/**
  * Return the subset of `items` that were last played more than 24h ago
  * (or have never been played / have no timestamp).
  */
@@ -151,16 +171,8 @@ export function pickNextTrack(options: PickOptions): RecordingRow | undefined {
   const { playable, queue, history, currentTrack, now } = options;
   const wallClock = now ?? Date.now();
 
-  // IDs that must be excluded (currently playing + queued).
-  const excludeIdSet = new Set<string>();
-  if (currentTrack) excludeIdSet.add(currentTrack.id);
-  for (const item of queue) excludeIdSet.add(item.id);
-  // Exclude recently-completed tracks from history to prevent re-picking
-  // when the queue empties before backend playback history refreshes.
-  // We exclude the most recent entries (up to 5) since history is most-recent-first.
-  for (let i = 0; i < Math.min(history.length, 5); i++) {
-    excludeIdSet.add(history[i].id);
-  }
+  // IDs that must be excluded (currently playing + queued + recent history).
+  const excludeIdSet = buildExclusionSet(currentTrack, queue, history);
 
   // First pass: strict — exclude recently-played AND in-queue/current.
   let candidates = excludeRecentlyPlayed(playable, wallClock);
