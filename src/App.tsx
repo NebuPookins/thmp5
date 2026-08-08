@@ -323,15 +323,20 @@ function abbreviatePaths(sources: SplitSourceDetail[]): Map<string, string> {
   return map;
 }
 
+function decomposeDuration(durationMs: number) {
+  const totalSeconds = Math.floor(durationMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return { hours, minutes, seconds };
+}
+
 function formatDuration(durationMs: number | null): string {
   if (!durationMs || durationMs <= 0) {
     return "Unknown";
   }
 
-  const totalSeconds = Math.floor(durationMs / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
+  const { hours, minutes, seconds } = decomposeDuration(durationMs);
 
   if (hours > 0) {
     return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds
@@ -340,6 +345,25 @@ function formatDuration(durationMs: number | null): string {
   }
 
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function formatDurationCompact(durationMs: number): string {
+  if (durationMs <= 0) return "0m00s";
+
+  const { hours, minutes, seconds } = decomposeDuration(durationMs);
+
+  if (hours > 0) {
+    return `${hours}h${minutes.toString().padStart(2, "0")}m${seconds
+      .toString()
+      .padStart(2, "0")}s`;
+  }
+  return `${minutes}m${seconds.toString().padStart(2, "0")}s`;
+}
+
+function formatEtaTime(date: Date): string {
+  return date
+    .toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    .replace(/[\s  ]+/g, "");
 }
 
 function formatLastPlayed(value: string | null): string {
@@ -664,6 +688,17 @@ function App() {
   const queueHistoryLimit = bootstrap?.config.queue_history_limit ?? 5;
   const isPlaying = playerState.status === "playing";
   const activeDurationMs = playerState.duration_ms ?? currentTrack?.duration_ms ?? 0;
+
+  const queuedDurationMs = useMemo(
+    () => queue.reduce((sum, item) => sum + (item.duration_ms ?? 0), 0),
+    [queue],
+  );
+
+  const currentRemaining = currentTrack
+    ? Math.max(0, activeDurationMs - playerState.position_ms)
+    : 0;
+  const totalRemainingMs = currentRemaining + queuedDurationMs;
+  const totalCount = queue.length + (currentTrack ? 1 : 0);
 
   const selectedArtist = useMemo(
     () => artists.find((artist) => artist.id === selectedArtistId) ?? null,
@@ -2642,8 +2677,11 @@ function App() {
               <div>
                 <p className="panel-label">
                   Timeline |
-                  {history.length > 0 || currentTrack || queue.length > 0
-                    ? `${history.length} played · ${queue.length} queued`
+                  {history.length > 0 || totalCount > 0
+                    ? `${history.length} Played - ${totalCount} Queued` +
+                      (totalRemainingMs > 0
+                        ? ` (${formatDurationCompact(totalRemainingMs)} ETA ${formatEtaTime(new Date(Date.now() + totalRemainingMs))})`
+                        : "")
                     : "Nothing playing"}
                 </p>
               </div>
