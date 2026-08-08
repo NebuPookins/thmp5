@@ -515,6 +515,11 @@ thead th {
   justify-content: space-between;
   gap: 12px;
   align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #09111a;
+  padding-block: 4px;
 }
 
 .queue-list {
