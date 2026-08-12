@@ -1697,6 +1697,21 @@ function App() {
     setQueue((current) => current.filter((_, i) => i !== index));
   }
 
+  function moveQueueItem(fromIndex: number, toIndex: number) {
+    setQueue((current) => {
+      const moved = current[fromIndex];
+      const withoutFrom = [...current.slice(0, fromIndex), ...current.slice(fromIndex + 1)];
+      return [...withoutFrom.slice(0, toIndex), moved, ...withoutFrom.slice(toIndex)];
+    });
+  }
+
+  // A single tagged union so that invalid states (hover without a drag source,
+  // or a source with no hover target) are unrepresentable.
+  type DragState = { from: number; over: number | null };
+  const dragRef = useRef<DragState | null>(null);
+  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+  const queueListRef = useRef<HTMLOListElement>(null);
+
   async function handlePauseResume() {
     if (!currentTrack) {
       if (queue.length > 0) {
@@ -2715,7 +2730,27 @@ function App() {
                 </button>
               </div>
             </div>
-            <ol className="queue-list">
+            <ol
+              className="queue-list"
+              ref={queueListRef}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+              }}
+              onDrop={() => {
+                const state = dragRef.current;
+                if (state === null) return;
+                // Drop landed on a grid gap — insert after the last-hovered item,
+                // or at the end if nothing was hovered yet.
+                const targetIndex =
+                  dragOverIndex !== null && dragOverIndex + 1 < queue.length
+                    ? dragOverIndex + 1
+                    : queue.length - 1;
+                if (state.from !== targetIndex) {
+                  moveQueueItem(state.from, targetIndex);
+                }
+              }}
+            >
               {history.length === 0 && !currentTrack && queue.length === 0 ? (
                 <li className="empty-item">Double-click a track to start playing.</li>
               ) : (
@@ -2762,8 +2797,35 @@ function App() {
                   ) : null}
                   {queue.map((item, index) => (
                     <li
-                      className="queue-upcoming-item"
+                      className={`queue-upcoming-item${dragOverIndex === index ? " drag-over" : ""}`}
                       key={`${index}-${item.id}-${item.primary_source_id}`}
+                      draggable
+                      onDragStart={(e) => {
+                        dragRef.current = { from: index, over: null };
+                        queueListRef.current?.classList.add("is-dragging");
+                        // WebKitGTK requires setData for the drag to be a valid drop source.
+                        e.dataTransfer.effectAllowed = "move";
+                        e.dataTransfer.setData("text/plain", String(index));
+                      }}
+                      onDragEnter={(e) => e.preventDefault()}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                        if (dragOverIndex !== index) setDragOverIndex(index);
+                      }}
+                      onDragEnd={() => {
+                        dragRef.current = null;
+                        setDragOverIndex(null);
+                        queueListRef.current?.classList.remove("is-dragging");
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const state = dragRef.current;
+                        if (state !== null && state.from !== index) {
+                          moveQueueItem(state.from, index);
+                        }
+                      }}
                       onContextMenu={(e) => openRecordingContextMenu(e, item)}
                     >
                       <div className="queue-row">

@@ -669,6 +669,17 @@ thead th {
 
 .queue-upcoming-item {
   position: relative;
+  cursor: grab;
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.is-dragging .queue-upcoming-item:active {
+  cursor: grabbing;
+}
+
+.queue-upcoming-item.drag-over {
+  outline: 1px dashed rgba(239, 177, 90, 0.6);
+  opacity: 0.85;
 }
 
 .queue-remove-btn {
