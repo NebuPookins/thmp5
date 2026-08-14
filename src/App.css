@@ -656,6 +656,19 @@ thead th {
   color: #fff;
 }
 
+.pomodoro-prompt {
+  padding: 6px;
+}
+
+.pomodoro-prompt .pomodoro-duration-input {
+  border: none;
+  background: transparent;
+  width: 88px;
+  max-width: none;
+  text-align: left;
+  font-size: 0.8rem;
+}
+
 .queue-now-playing {
   background: linear-gradient(180deg, rgba(41, 54, 76, 0.94), rgba(18, 28, 42, 0.94)) !important;
   border: 1px solid rgba(239, 177, 90, 0.55);
@@ -1751,16 +1764,20 @@ thead th {
   z-index: 200;
 }
 
-.ctx-menu {
+.ctx-menu,
+.pomodoro-prompt {
   position: fixed;
   z-index: 201;
-  list-style: none;
-  margin: 0;
-  padding: 4px 0;
   background: #0e1624;
   border: 1px solid rgba(149, 173, 198, 0.18);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.ctx-menu {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
   min-width: 160px;
 }
 

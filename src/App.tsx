@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import { pickNextTrack } from "./autoDj";
-import { calculatePomodoroBatch, formatPomodoroDuration, parsePomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
+import { calculatePomodoroBatch, parsePomodoroDuration, formatPomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
 import "./App.css";
 
 type LibrarySummary = {
@@ -590,6 +590,12 @@ function navReducer(state: NavState | null, action: NavAction): NavState | null 
   }
 }
 
+// Quick-fill presets for the Pomodoro buttons in the timeline header.
+const POMODORO_PRESETS = [
+  { durationMs: DEFAULT_TARGET_MS }, // 25m focus session
+  { durationMs: 5 * 60 * 1000 }, // 5m quick break
+];
+
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
@@ -598,7 +604,7 @@ function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [history, setHistory] = useState<QueueItem[]>([]);
   const [autoDj, setAutoDj] = useState(false);
-  const [pomodoroDurationInput, setPomodoroDurationInput] = useState("25m");
+  const [pomodoroPrompt, setPomodoroPrompt] = useState<{ x: number; y: number; value: string } | null>(null);
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const currentTrackRef = useRef<QueueItem | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
@@ -934,10 +940,8 @@ function App() {
     }
   }
 
-  function handlePomodoroFill() {
+  function handlePomodoroFill(targetDurationMs: number) {
     setError(null);
-    const targetDurationMs =
-      parsePomodoroDuration(pomodoroDurationInput) ?? DEFAULT_TARGET_MS;
 
     const playable = recordings.filter((r) => r.primary_source_id !== null);
     if (playable.length === 0) {
@@ -959,6 +963,22 @@ function App() {
     }
 
     enqueueAll(batch);
+  }
+
+  function openPomodoroPrompt(e: React.MouseEvent) {
+    e.preventDefault();
+    setPomodoroPrompt({ x: e.clientX, y: e.clientY, value: "" });
+  }
+
+  function submitPomodoroPrompt() {
+    if (!pomodoroPrompt) return;
+    const targetDurationMs = parsePomodoroDuration(pomodoroPrompt.value);
+    if (targetDurationMs === null) {
+      setError("Invalid Pomodoro duration. Try e.g. 25m, 1h, or 1h30m.");
+      return;
+    }
+    setPomodoroPrompt(null);
+    handlePomodoroFill(targetDurationMs);
   }
 
   async function loadArtists() {
@@ -2701,25 +2721,21 @@ function App() {
                 </p>
               </div>
               <div className="queue-header-actions">
-                <input
-                  className="pomodoro-duration-input"
-                  type="text"
-                  value={pomodoroDurationInput}
-                  onChange={(e) => setPomodoroDurationInput(e.target.value)}
-                  onFocus={(e) => e.target.select()}
-                  placeholder="25m"
-                  size={5}
-                  aria-label="Pomodoro duration"
-                  title={`Pomodoro duration (e.g., 25m, 1h, 1h30m)`}
-                />
-                <button
-                  className="pomodoro-btn"
-                  onClick={handlePomodoroFill}
-                  title={`Fill queue with ~${formatPomodoroDuration(parsePomodoroDuration(pomodoroDurationInput) ?? DEFAULT_TARGET_MS)} of music`}
-                  type="button"
-                >
-                  Pomodoro
-                </button>
+                {POMODORO_PRESETS.map((preset) => {
+                  const label = formatPomodoroDuration(preset.durationMs);
+                  return (
+                    <button
+                      key={preset.durationMs}
+                      className="pomodoro-btn"
+                      onClick={() => handlePomodoroFill(preset.durationMs)}
+                      onContextMenu={openPomodoroPrompt}
+                      title={`Queue ~${label} of music. Right-click for a custom duration.`}
+                      type="button"
+                    >
+                      {label} 🍅
+                    </button>
+                  );
+                })}
                 <button
                   className={`auto-dj-btn ${autoDj ? "auto-dj-btn-on" : ""}`}
                   onClick={() => setAutoDj((v) => !v)}
@@ -3572,6 +3588,39 @@ function App() {
               ) : null
             ))}
           </ul>
+        </>
+      )}
+
+      {pomodoroPrompt && (
+        <>
+          <div
+            className="ctx-menu-backdrop"
+            onClick={() => setPomodoroPrompt(null)}
+            onContextMenu={(e) => { e.preventDefault(); setPomodoroPrompt(null); }}
+          />
+          <div
+            className="pomodoro-prompt"
+            style={{ left: pomodoroPrompt.x, top: pomodoroPrompt.y }}
+          >
+            <input
+              autoFocus
+              className="pomodoro-duration-input"
+              type="text"
+              value={pomodoroPrompt.value}
+              onChange={(e) => setPomodoroPrompt({ ...pomodoroPrompt, value: e.target.value })}
+              onFocus={(e) => e.target.select()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  submitPomodoroPrompt();
+                } else if (e.key === "Escape") {
+                  setPomodoroPrompt(null);
+                }
+              }}
+              placeholder="e.g. 55m"
+              aria-label="Custom Pomodoro duration"
+              title="Pomodoro duration (e.g., 25m, 1h, 1h30m)"
+            />
+          </div>
         </>
       )}
 
