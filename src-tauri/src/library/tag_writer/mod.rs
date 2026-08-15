@@ -179,7 +179,10 @@ pub fn delete_frame(path: &Path, frame_id: &str) -> Result<TagWriteResult> {
 
     // Remove matching frames. Removing every frame is allowed — we still write
     // a valid (empty) tag in that case.
-    let modified_frames: Vec<_> = frames.into_iter().filter(|(id, _)| id != frame_id).collect();
+    let modified_frames: Vec<_> = frames
+        .into_iter()
+        .filter(|(id, _)| id != frame_id)
+        .collect();
 
     let backup_path = backup_file(path)?;
     write_modified_file(path, &original_data, &modified_frames, id3v2_version)?;
@@ -403,7 +406,12 @@ pub fn parse_text_frames(data: &[u8]) -> Option<(Vec<(String, String)>, u8)> {
                 Some(lang_len) if payload.len() >= lang_len => {
                     let (desc_bytes, value_bytes) =
                         split_description(&payload[lang_len..], encoding);
-                    frames.push(described_frame(&frame_id, desc_bytes, value_bytes, encoding));
+                    frames.push(described_frame(
+                        &frame_id,
+                        desc_bytes,
+                        value_bytes,
+                        encoding,
+                    ));
                 }
                 // Malformed described frame — too short to hold its language code.
                 Some(_) => {}
@@ -919,10 +927,7 @@ mod tests {
 
     #[test]
     fn test_comm_preserved_across_edit_of_other_frame() {
-        let original = synth_mp3(&[
-            id3_frame(b"TIT2", b"\x03Song"),
-            comm_frame("", "A comment"),
-        ]);
+        let original = synth_mp3(&[id3_frame(b"TIT2", b"\x03Song"), comm_frame("", "A comment")]);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.mp3");
         std::fs::write(&path, &original).unwrap();
