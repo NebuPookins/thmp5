@@ -1725,10 +1725,8 @@ function App() {
     });
   }
 
-  // A single tagged union so that invalid states (hover without a drag source,
-  // or a source with no hover target) are unrepresentable.
-  type DragState = { from: number; over: number | null };
-  const dragRef = useRef<DragState | null>(null);
+  // Queue index of the item being dragged, or null when no drag is active.
+  const dragRef = useRef<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
   const queueListRef = useRef<HTMLOListElement>(null);
 
@@ -2754,16 +2752,20 @@ function App() {
                 e.dataTransfer.dropEffect = "move";
               }}
               onDrop={() => {
-                const state = dragRef.current;
-                if (state === null) return;
+                const from = dragRef.current;
+                if (from === null) return;
                 // Drop landed on a grid gap — insert after the last-hovered item,
-                // or at the end if nothing was hovered yet.
+                // or at the end if nothing was hovered yet. moveQueueItem inserts
+                // into the queue with `from` already removed, so "after the hovered
+                // item" is dragOverIndex (not +1) when dragging down from above it.
                 const targetIndex =
-                  dragOverIndex !== null && dragOverIndex + 1 < queue.length
-                    ? dragOverIndex + 1
+                  dragOverIndex !== null
+                    ? from < dragOverIndex
+                      ? dragOverIndex
+                      : dragOverIndex + 1
                     : queue.length - 1;
-                if (state.from !== targetIndex) {
-                  moveQueueItem(state.from, targetIndex);
+                if (from !== targetIndex) {
+                  moveQueueItem(from, targetIndex);
                 }
               }}
             >
@@ -2817,7 +2819,7 @@ function App() {
                       key={`${index}-${item.id}-${item.primary_source_id}`}
                       draggable
                       onDragStart={(e) => {
-                        dragRef.current = { from: index, over: null };
+                        dragRef.current = index;
                         queueListRef.current?.classList.add("is-dragging");
                         // WebKitGTK requires setData for the drag to be a valid drop source.
                         e.dataTransfer.effectAllowed = "move";
@@ -2837,9 +2839,9 @@ function App() {
                       onDrop={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        const state = dragRef.current;
-                        if (state !== null && state.from !== index) {
-                          moveQueueItem(state.from, index);
+                        const from = dragRef.current;
+                        if (from !== null && from !== index) {
+                          moveQueueItem(from, index);
                         }
                       }}
                       onContextMenu={(e) => openRecordingContextMenu(e, item)}
