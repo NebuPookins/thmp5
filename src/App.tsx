@@ -1719,16 +1719,33 @@ function App() {
 
   function moveQueueItem(fromIndex: number, toIndex: number) {
     setQueue((current) => {
+      if (fromIndex < 0 || fromIndex >= current.length) {
+        return current;
+      }
       const moved = current[fromIndex];
       const withoutFrom = [...current.slice(0, fromIndex), ...current.slice(fromIndex + 1)];
-      return [...withoutFrom.slice(0, toIndex), moved, ...withoutFrom.slice(toIndex)];
+      const insertAt = Math.min(Math.max(toIndex, 0), withoutFrom.length);
+      return [...withoutFrom.slice(0, insertAt), moved, ...withoutFrom.slice(insertAt)];
     });
   }
 
-  // Queue index of the item being dragged, or null when no drag is active.
-  const dragRef = useRef<number | null>(null);
-  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+  // Recording id of the item being dragged, or null when no drag is active. An id
+  // (not an index or object reference) survives the queue shifting and its items
+  // being reconciled mid-drag.
+  const dragRef = useRef<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
   const queueListRef = useRef<HTMLOListElement>(null);
+
+  // Current index of the dragged recording, or null if no drag is active or the
+  // recording is no longer in the queue. Resolved at drop time (not drag start)
+  // because the queue can shift (auto-advance) and be reconciled (fresh objects)
+  // mid-drag — neither index nor object reference stays valid across both.
+  function resolveDraggedIndex(): number | null {
+    const draggedId = dragRef.current;
+    if (draggedId === null) return null;
+    const from = queue.findIndex((item) => item.id === draggedId);
+    return from === -1 ? null : from;
+  }
 
   async function handlePauseResume() {
     if (!currentTrack) {
@@ -2752,17 +2769,21 @@ function App() {
                 e.dataTransfer.dropEffect = "move";
               }}
               onDrop={() => {
-                const from = dragRef.current;
+                const from = resolveDraggedIndex();
                 if (from === null) return;
                 // Drop landed on a grid gap — insert after the last-hovered item,
-                // or at the end if nothing was hovered yet. moveQueueItem inserts
-                // into the queue with `from` already removed, so "after the hovered
-                // item" is dragOverIndex (not +1) when dragging down from above it.
+                // or at the end if nothing was hovered yet. Resolve the hovered
+                // item's current index at drop time too, since the queue can shift
+                // mid-drag. moveQueueItem inserts into the queue with `from` already
+                // removed, so "after the hovered item" is `over` (not +1) when
+                // dragging down from above it.
+                const over =
+                  dragOverId !== null ? queue.findIndex((item) => item.id === dragOverId) : -1;
                 const targetIndex =
-                  dragOverIndex !== null
-                    ? from < dragOverIndex
-                      ? dragOverIndex
-                      : dragOverIndex + 1
+                  over !== -1
+                    ? from < over
+                      ? over
+                      : over + 1
                     : queue.length - 1;
                 if (from !== targetIndex) {
                   moveQueueItem(from, targetIndex);
@@ -2815,31 +2836,31 @@ function App() {
                   ) : null}
                   {queue.map((item, index) => (
                     <li
-                      className={`queue-upcoming-item${dragOverIndex === index ? " drag-over" : ""}`}
+                      className={`queue-upcoming-item${dragOverId === item.id ? " drag-over" : ""}`}
                       key={`${index}-${item.id}-${item.primary_source_id}`}
                       draggable
                       onDragStart={(e) => {
-                        dragRef.current = index;
+                        dragRef.current = item.id;
                         queueListRef.current?.classList.add("is-dragging");
                         // WebKitGTK requires setData for the drag to be a valid drop source.
                         e.dataTransfer.effectAllowed = "move";
-                        e.dataTransfer.setData("text/plain", String(index));
+                        e.dataTransfer.setData("text/plain", item.id);
                       }}
                       onDragEnter={(e) => e.preventDefault()}
                       onDragOver={(e) => {
                         e.preventDefault();
                         e.dataTransfer.dropEffect = "move";
-                        if (dragOverIndex !== index) setDragOverIndex(index);
+                        if (dragOverId !== item.id) setDragOverId(item.id);
                       }}
                       onDragEnd={() => {
                         dragRef.current = null;
-                        setDragOverIndex(null);
+                        setDragOverId(null);
                         queueListRef.current?.classList.remove("is-dragging");
                       }}
                       onDrop={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        const from = dragRef.current;
+                        const from = resolveDraggedIndex();
                         if (from !== null && from !== index) {
                           moveQueueItem(from, index);
                         }
