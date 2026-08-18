@@ -6,6 +6,13 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import { pickNextTrack } from "./autoDj";
 import { calculatePomodoroBatch, parsePomodoroDuration, formatPomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
+import {
+  type QueueEntry,
+  type DropKind,
+  makeQueueEntry,
+  moveEntryByKey,
+  mapQueueEntryRecording,
+} from "./queue";
 import "./App.css";
 
 type LibrarySummary = {
@@ -554,11 +561,23 @@ function applyPredictedRatings<T extends { id: string; predicted_rating: number 
   }
 
   const predictedById = new Map(updates.map((update) => [update.id, update.rating] as const));
-  return rows.map((row) =>
-    predictedById.has(row.id)
-      ? { ...row, predicted_rating: predictedById.get(row.id) ?? null }
-      : row,
-  );
+  return rows.map((row) => applyPredictedRating(row, predictedById));
+}
+
+function applyAggregateRating<T extends { id: string; rating: number | null }>(
+  row: T,
+  update: EntityRatingUpdate,
+): T {
+  return row.id === update.id ? { ...row, rating: update.rating } : row;
+}
+
+function applyPredictedRating<T extends { id: string; predicted_rating: number | null }>(
+  row: T,
+  predictedById: Map<string, number | null>,
+): T {
+  return predictedById.has(row.id)
+    ? { ...row, predicted_rating: predictedById.get(row.id) ?? null }
+    : row;
 }
 
 // ── Detail view navigation stack ──────────────────────────────────────────────
@@ -601,7 +620,7 @@ function App() {
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
   const [artists, setArtists] = useState<ArtistRow[]>([]);
   const [releaseGroups, setReleaseGroups] = useState<ReleaseGroupRow[]>([]);
-  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [queue, setQueue] = useState<QueueEntry[]>([]);
   const [history, setHistory] = useState<QueueItem[]>([]);
   const [autoDj, setAutoDj] = useState(false);
   const [pomodoroPrompt, setPomodoroPrompt] = useState<{ x: number; y: number; value: string } | null>(null);
@@ -696,7 +715,7 @@ function App() {
   const activeDurationMs = playerState.duration_ms ?? currentTrack?.duration_ms ?? 0;
 
   const queuedDurationMs = useMemo(
-    () => queue.reduce((sum, item) => sum + (item.duration_ms ?? 0), 0),
+    () => queue.reduce((sum, item) => sum + (item.recording.duration_ms ?? 0), 0),
     [queue],
   );
 
@@ -933,10 +952,12 @@ function App() {
     setError(null);
     if (!currentTrack && playerState.status === "stopped" && playable.length > 0) {
       const [first, ...rest] = playable;
+      const restEntries = rest.map((recording) => makeQueueEntry(recording));
       setCurrentTrack(first);
-      setQueue((q) => [...q, ...rest]);
+      setQueue((q) => [...q, ...restEntries]);
     } else {
-      setQueue((q) => [...q, ...playable]);
+      const entries = playable.map((recording) => makeQueueEntry(recording));
+      setQueue((q) => [...q, ...entries]);
     }
   }
 
@@ -951,7 +972,7 @@ function App() {
 
     const batch = calculatePomodoroBatch({
       playable,
-      queue,
+      queue: queue.map((entry) => entry.recording),
       history,
       currentTrack,
       targetDurationMs,
@@ -1233,7 +1254,7 @@ function App() {
 
     const recordingsById = new Map(recordings.map((recording) => [recording.id, recording] as const));
     setHistory((current) => reconcileRecordingList(current, recordingsById));
-    setQueue((current) => reconcileRecordingList(current, recordingsById));
+    setQueue((current) => mapQueueEntryRecording(current, (recording) => reconcileRecording(recording, recordingsById)));
     setCurrentTrack((current) => (current ? reconcileRecording(current, recordingsById) : current));
     setSmartResult((current) => (
       current
@@ -1324,7 +1345,7 @@ function App() {
     }
 
     const [nextTrack, ...rest] = queue;
-    setCurrentTrack(nextTrack);
+    setCurrentTrack(nextTrack.recording);
     setQueue(rest);
   }, [currentTrack, playerState.status, queue]);
 
@@ -1339,13 +1360,14 @@ function App() {
 
     const pick = pickNextTrack({
       playable,
-      queue,
+      queue: queue.map((entry) => entry.recording),
       history,
       currentTrack,
     });
 
     if (pick) {
-      setQueue((current) => [...current, pick]);
+      const entry = makeQueueEntry(pick);
+      setQueue((current) => [...current, entry]);
     }
   }, [autoDj, queue, recordings, history, currentTrack]);
 
@@ -1709,48 +1731,38 @@ function App() {
       return;
     }
 
-    setQueue((current) => [...current, recording]);
+    const entry = makeQueueEntry(recording);
+    setQueue((current) => [...current, entry]);
   }
 
   function removeFromQueue(index: number) {
     setQueue((current) => current.filter((_, i) => i !== index));
   }
 
-  function moveQueueItem(fromIndex: number, toIndex: number) {
-    setQueue((current) => {
-      if (fromIndex < 0 || fromIndex >= current.length) {
-        return current;
-      }
-      const moved = current[fromIndex];
-      const withoutFrom = [...current.slice(0, fromIndex), ...current.slice(fromIndex + 1)];
-      const insertAt = Math.min(Math.max(toIndex, 0), withoutFrom.length);
-      return [...withoutFrom.slice(0, insertAt), moved, ...withoutFrom.slice(insertAt)];
-    });
-  }
-
-  // Recording id of the item being dragged, or null when no drag is active. An id
-  // (not an index or object reference) survives the queue shifting and its items
-  // being reconciled mid-drag.
+  // Stable key of the entry being dragged, or null when no drag is active. A key
+  // (not a recording id, index, or object reference) identifies the exact entry
+  // across duplicates and survives the queue shifting (auto-advance) and being
+  // reconciled (fresh objects) mid-drag.
   const dragRef = useRef<string | null>(null);
-  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  // Key of the entry currently hovered during a drag. `dragOverRef` is read
+  // synchronously at drop time; `dragOverKey` state just drives the hover styling.
+  const dragOverRef = useRef<string | null>(null);
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null);
   const queueListRef = useRef<HTMLOListElement>(null);
 
-  // Current index of the dragged recording, or null if no drag is active or the
-  // recording is no longer in the queue. Resolved at drop time (not drag start)
-  // because the queue can shift (auto-advance) and be reconciled (fresh objects)
-  // mid-drag — neither index nor object reference stays valid across both.
-  function resolveDraggedIndex(): number | null {
-    const draggedId = dragRef.current;
-    if (draggedId === null) return null;
-    const from = queue.findIndex((item) => item.id === draggedId);
-    return from === -1 ? null : from;
+  // Reorder the queue by moving the entry with `fromKey` to `overKey`. Resolved
+  // inside the functional updater against the latest committed queue (not a
+  // render-closure snapshot), so a mid-drag shift can't leave `from` pointing at
+  // the wrong element.
+  function moveQueueItemByKey(fromKey: string, overKey: string | null, dropKind: DropKind) {
+    setQueue((current) => moveEntryByKey(current, fromKey, overKey, dropKind));
   }
 
   async function handlePauseResume() {
     if (!currentTrack) {
       if (queue.length > 0) {
         const [nextTrack, ...rest] = queue;
-        setCurrentTrack(nextTrack);
+        setCurrentTrack(nextTrack.recording);
         setQueue(rest);
       }
       return;
@@ -1778,7 +1790,8 @@ function App() {
     const [prev, ...restHistory] = history;
     setHistory(restHistory);
     if (currentTrack) {
-      setQueue((current) => [currentTrack, ...current]);
+      const entry = makeQueueEntry(currentTrack);
+      setQueue((current) => [entry, ...current]);
     }
     try {
       await invoke<PlayerState>("stop");
@@ -1946,7 +1959,7 @@ function App() {
       current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
     );
     setQueue((current) =>
-      current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
+      mapQueueEntryRecording(current, (recording) => applyRatingToRecording(recording, recordingId, stars)),
     );
     setCurrentTrack((current) =>
       current ? applyRatingToRecording(current, recordingId, stars) : current,
@@ -1972,22 +1985,27 @@ function App() {
       // Reconcile the recording's displayed rating with the server's computed average
       setRecordings((current) => applyAggregateRatings(current, [updateResult.recording]));
       setHistory((current) => applyAggregateRatings(current, [updateResult.recording]));
-      setQueue((current) => applyAggregateRatings(current, [updateResult.recording]));
+      setQueue((current) =>
+        mapQueueEntryRecording(current, (recording) => applyAggregateRating(recording, updateResult.recording)),
+      );
       setCurrentTrack((current) =>
-        current ? (applyAggregateRatings([current], [updateResult.recording])[0] ?? current) : current,
+        current ? applyAggregateRating(current, updateResult.recording) : current,
       );
       setArtists((current) => applyAggregateRatings(current, updateResult.artists));
       setReleaseGroups((current) => applyAggregateRatings(current, updateResult.release_groups));
       // Refresh predicted ratings for recordings sharing an artist or album
       // with the rated track (e.g. other tracks on the same album).
       if (updateResult.affected_recordings.length > 0) {
+        const predictedById = new Map(
+          updateResult.affected_recordings.map((update) => [update.id, update.rating] as const),
+        );
         setRecordings((current) => applyPredictedRatings(current, updateResult.affected_recordings));
         setHistory((current) => applyPredictedRatings(current, updateResult.affected_recordings));
-        setQueue((current) => applyPredictedRatings(current, updateResult.affected_recordings));
+        setQueue((current) =>
+          mapQueueEntryRecording(current, (recording) => applyPredictedRating(recording, predictedById)),
+        );
         setCurrentTrack((current) =>
-          current
-            ? (applyPredictedRatings([current], updateResult.affected_recordings)[0] ?? current)
-            : current,
+          current ? applyPredictedRating(current, predictedById) : current,
         );
         setSmartResult((current) =>
           current
@@ -2444,7 +2462,8 @@ function App() {
                     if (!currentTrack && playerState.status === "stopped") {
                       setCurrentTrack(item);
                     } else {
-                      setQueue((q) => [...q, item]);
+                      const entry = makeQueueEntry(item);
+                      setQueue((q) => [...q, entry]);
                     }
                   }}
                   onRescanRecording={(recordingId) => { void handleRescanRecording(recordingId); }}
@@ -2768,25 +2787,14 @@ function App() {
                 e.dataTransfer.dropEffect = "move";
               }}
               onDrop={() => {
-                const from = resolveDraggedIndex();
-                if (from === null) return;
-                // Drop landed on a grid gap — insert after the last-hovered item,
-                // or at the end if nothing was hovered yet. Resolve the hovered
-                // item's current index at drop time too, since the queue can shift
-                // mid-drag. moveQueueItem inserts into the queue with `from` already
-                // removed, so "after the hovered item" is `over` (not +1) when
-                // dragging down from above it.
-                const over =
-                  dragOverId !== null ? queue.findIndex((item) => item.id === dragOverId) : -1;
-                const targetIndex =
-                  over !== -1
-                    ? from < over
-                      ? over
-                      : over + 1
-                    : queue.length - 1;
-                if (from !== targetIndex) {
-                  moveQueueItem(from, targetIndex);
-                }
+                // Drop landed on a grid gap — insert after the last-hovered entry,
+                // or at the end if nothing was hovered yet. Resolved against the
+                // latest committed queue by entry key (not a stale render-closure
+                // index), which also treats a drop in the gap after the dragged
+                // entry's own row as a no-op.
+                const fromKey = dragRef.current;
+                if (fromKey === null) return;
+                moveQueueItemByKey(fromKey, dragOverRef.current, "gap");
               }}
             >
               {history.length === 0 && !currentTrack && queue.length === 0 ? (
@@ -2833,35 +2841,44 @@ function App() {
                       </div>
                     </li>
                   ) : null}
-                  {queue.map((item, index) => (
+                  {queue.map(({ key, recording: item }, index) => (
                     <li
-                      className={`queue-upcoming-item${dragOverId === item.id ? " drag-over" : ""}`}
-                      key={`${index}-${item.id}-${item.primary_source_id}`}
+                      className={`queue-upcoming-item${dragOverKey === key ? " drag-over" : ""}`}
+                      key={key}
                       draggable
                       onDragStart={(e) => {
-                        dragRef.current = item.id;
+                        dragRef.current = key;
+                        // Start each drag with a clean hover state: if a previous drag
+                        // was aborted by the dragged node unmounting (auto-advance), its
+                        // onDragEnd never ran, so reset the hover here too.
+                        dragOverRef.current = null;
+                        setDragOverKey(null);
                         queueListRef.current?.classList.add("is-dragging");
                         // WebKitGTK requires setData for the drag to be a valid drop source.
                         e.dataTransfer.effectAllowed = "move";
-                        e.dataTransfer.setData("text/plain", item.id);
+                        e.dataTransfer.setData("text/plain", key);
                       }}
                       onDragEnter={(e) => e.preventDefault()}
                       onDragOver={(e) => {
                         e.preventDefault();
                         e.dataTransfer.dropEffect = "move";
-                        if (dragOverId !== item.id) setDragOverId(item.id);
+                        if (dragOverRef.current !== key) {
+                          dragOverRef.current = key;
+                          setDragOverKey(key);
+                        }
                       }}
                       onDragEnd={() => {
                         dragRef.current = null;
-                        setDragOverId(null);
+                        dragOverRef.current = null;
+                        setDragOverKey(null);
                         queueListRef.current?.classList.remove("is-dragging");
                       }}
                       onDrop={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
-                        const from = resolveDraggedIndex();
-                        if (from !== null && from !== index) {
-                          moveQueueItem(from, index);
+                        const fromKey = dragRef.current;
+                        if (fromKey !== null) {
+                          moveQueueItemByKey(fromKey, key, "item");
                         }
                       }}
                       onContextMenu={(e) => openRecordingContextMenu(e, item)}
