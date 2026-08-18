@@ -221,7 +221,7 @@ type SplitRecordingDetail = {
 
 type ContextMenuState =
   | { kind: "recording"; x: number; y: number; path: string; recording: RecordingRow }
-  | { kind: "source"; x: number; y: number; path: string; recording: RecordingRow }
+  | { kind: "source"; x: number; y: number; path: string }
   | { kind: "artist"; x: number; y: number; artist_id: string; artist_name: string }
   | { kind: "release_group"; x: number; y: number; release_group_id: string; title: string };
 
@@ -1244,7 +1244,7 @@ function App() {
         : current
     ));
     setContextMenu((current) => (
-      current && (current.kind === "recording" || current.kind === "source")
+      current && current.kind === "recording"
         ? {
             ...current,
             recording: reconcileRecording(current.recording, recordingsById),
@@ -1694,8 +1694,7 @@ function App() {
 
   function openEntitySourceContextMenu(e: React.MouseEvent, filePath: string) {
     e.preventDefault();
-    // recording field is unused for "source" kind context menus
-    setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: filePath, recording: {} as RecordingRow });
+    setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: filePath });
   }
 
   function enqueueRecording(recording: RecordingRow) {
@@ -2688,7 +2687,7 @@ function App() {
                                         onContextMenu={(e) => {
                                           e.preventDefault();
                                           e.stopPropagation();
-                                          setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: p, recording });
+                                          setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: p });
                                         }}
                                       >
                                         {p}
@@ -3123,7 +3122,11 @@ function App() {
                 ) : (
                   <ol className="issue-list">
                     {fileIssues.map((issue, i) => (
-                      <li key={i} className="issue-item">
+                      <li
+                        key={i}
+                        className="issue-item"
+                        onContextMenu={(e) => openEntitySourceContextMenu(e, issue.file_path)}
+                      >
                         <div className="issue-item-header">
                           <span className={`issue-kind issue-kind-${issue.kind}`}>
                             {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : issue.kind === "duplicate_frame" ? "Duplicate Tag" : issue.kind === "backup_file_exists" ? "Backup" : "Playback"}
