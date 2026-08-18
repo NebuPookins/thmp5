@@ -1946,11 +1946,11 @@ function App() {
 
   async function updateRecordingRating(recordingId: string, stars: number | null) {
     const ratingKey = `recording:${recordingId}`;
-    const previousRecordings = recordings;
-    const previousHistory = history;
-    const previousQueue = queue;
-    const previousCurrentTrack = currentTrack;
-    const previousSmartResult = smartResult;
+    // The pre-optimistic rating for this recording, used to roll back on error.
+    // Read from `recordings` (which is a dependency of handleRate's useCallback, so
+    // it is fresh) rather than from stale-closure snapshots of queue/history, which
+    // would silently discard unrelated concurrent changes (enqueues, auto-advance).
+    const previousRating = recordings.find((r) => r.id === recordingId)?.rating ?? null;
     setRatingKeyInFlight(ratingKey);
     setRecordings((current) =>
       current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
@@ -2017,11 +2017,16 @@ function App() {
         );
       }
     } catch (ratingError) {
-      setRecordings(previousRecordings);
-      setHistory(previousHistory);
-      setQueue(previousQueue);
-      setCurrentTrack(previousCurrentTrack);
-      setSmartResult(previousSmartResult);
+      // Roll back only the optimistic rating for this recording, via functional
+      // updaters so unrelated concurrent changes (enqueues, auto-advance) survive.
+      const revertRating = (recording: RecordingRow) => applyRatingToRecording(recording, recordingId, previousRating);
+      setRecordings((current) => current.map(revertRating));
+      setHistory((current) => current.map(revertRating));
+      setQueue((current) => mapQueueEntryRecording(current, revertRating));
+      setCurrentTrack((current) => (current ? revertRating(current) : current));
+      setSmartResult((current) =>
+        current ? { ...current, recordings: current.recordings.map(revertRating) } : current,
+      );
       setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
     } finally {
       setRatingKeyInFlight((current) => (current === ratingKey ? null : current));
