@@ -1,8 +1,9 @@
 pub mod serialize;
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Result of a tag write operation.
@@ -125,7 +126,8 @@ pub fn write_single_frame(path: &Path, frame_id: &str, new_value: &str) -> Resul
     let backup_path = backup_file(path)?;
 
     // Write
-    write_modified_file(path, &original_data, &frames, id3v2_version)?;
+    let preserved = collect_preserved_frames(&original_data);
+    write_modified_file(path, &original_data, &frames, id3v2_version, &preserved)?;
 
     // Verify
     let written_data = std::fs::read(path)
@@ -185,7 +187,14 @@ pub fn delete_frame(path: &Path, frame_id: &str) -> Result<TagWriteResult> {
         .collect();
 
     let backup_path = backup_file(path)?;
-    write_modified_file(path, &original_data, &modified_frames, id3v2_version)?;
+    let preserved = collect_preserved_frames(&original_data);
+    write_modified_file(
+        path,
+        &original_data,
+        &modified_frames,
+        id3v2_version,
+        &preserved,
+    )?;
 
     // Verify
     let written_data = std::fs::read(path)
@@ -221,6 +230,119 @@ pub fn delete_frame(path: &Path, frame_id: &str) -> Result<TagWriteResult> {
     })
 }
 
+/// A single conflicting frame discovered across consecutive ID3v2 tags.
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeConflict {
+    /// Wire frame ID (e.g. "TIT2", or "TXXX:description").
+    pub frame_id: String,
+    /// Human-readable field name for the frame.
+    pub field_name: String,
+    /// Ordered distinct values found across the tags.
+    pub values: Vec<String>,
+}
+
+/// The user's chosen value for one conflicting frame during a merge.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MergeDecision {
+    pub frame_id: String,
+    pub value: String,
+}
+
+/// Enumerate conflicting text frames across *all* consecutive ID3v2 tags.
+///
+/// Only frames whose value differs between tags are returned; a frame that
+/// appears once (or identically in both tags) needs no user decision.
+pub fn preview_merge(path: &Path) -> Result<Vec<MergeConflict>> {
+    let data =
+        std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let (frames, _version) = parse_all_text_frames(&data)
+        .ok_or_else(|| anyhow::anyhow!("No ID3v2 tag found in {}", path.display()))?;
+
+    Ok(frames
+        .into_iter()
+        .filter(|(_, values)| values.len() >= 2)
+        .map(|(frame_id, values)| MergeConflict {
+            // Described frames are keyed "TXXX:description"; look up the bare ID.
+            field_name: crate::library::scanner::frame_id_to_field_name(
+                split_frame_key(&frame_id).0,
+            )
+            .to_string(),
+            frame_id,
+            values,
+        })
+        .collect())
+}
+
+/// Merge all consecutive ID3v2 tags into a single tag, applying the user's
+/// decisions for conflicting frames. Non-text frames from every tag are
+/// preserved (deduplicated), and audio content is left byte-identical.
+pub fn apply_merge(path: &Path, decisions: &[MergeDecision]) -> Result<TagWriteResult> {
+    let original_data =
+        std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+
+    let (frame_groups, id3v2_version) = parse_all_text_frames(&original_data)
+        .ok_or_else(|| anyhow::anyhow!("No ID3v2 tag found in {}", path.display()))?;
+
+    let decision_map: HashMap<&str, &str> = decisions
+        .iter()
+        .map(|d| (d.frame_id.as_str(), d.value.as_str()))
+        .collect();
+
+    let mut frames: Vec<(String, String)> = Vec::with_capacity(frame_groups.len());
+    for (frame_id, values) in &frame_groups {
+        let chosen = decision_map
+            .get(frame_id.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| values.first().cloned().unwrap_or_default());
+        frames.push((frame_id.clone(), chosen));
+    }
+
+    let pre_audio_hash = audio_hash(&original_data);
+    let pre_full_hash = full_hash(&original_data);
+
+    let backup_path = backup_file(path)?;
+    let preserved = collect_preserved_frames_all(&original_data, id3v2_version);
+    write_modified_file(path, &original_data, &frames, id3v2_version, &preserved)?;
+
+    // Verify audio is unchanged.
+    let written_data = std::fs::read(path)
+        .with_context(|| format!("Failed to re-read written file: {}", path.display()))?;
+    let post_audio_hash = audio_hash(&written_data);
+    if post_audio_hash != pre_audio_hash {
+        restore_from_backup_internal(path, &backup_path)?;
+        bail!(
+            "Audio content hash changed after merge — file restored from backup. \
+             Backup at: {backup_path}"
+        );
+    }
+
+    // Verify each decided frame now reads back as the chosen value (the merge
+    // always produces a single tag, so parse the first tag only).
+    let (reparsed, _) = parse_text_frames(&written_data)
+        .ok_or_else(|| anyhow::anyhow!("Failed to re-parse ID3v2 tags after merge"))?;
+    for decision in decisions {
+        let ok = reparsed
+            .iter()
+            .any(|(id, val)| id == &decision.frame_id && val == &decision.value);
+        if !ok {
+            restore_from_backup_internal(path, &backup_path)?;
+            bail!(
+                "Merge verification failed — '{}' not found with the chosen value. \
+                 File restored from backup at: {backup_path}",
+                decision.frame_id
+            );
+        }
+    }
+
+    Ok(TagWriteResult {
+        backup_path,
+        pre_audio_hash,
+        post_audio_hash,
+        pre_full_hash,
+        frame_count: frames.len(),
+    })
+}
+
 /// Restore from backup internally (no Result wrapper needed — always tries its best).
 fn restore_from_backup_internal(path: &Path, backup_path: &str) -> Result<()> {
     std::fs::copy(backup_path, path)
@@ -238,65 +360,112 @@ fn write_modified_file(
     original_data: &[u8],
     frames: &[(String, String)],
     id3v2_version: u8,
+    preserved: &[Vec<u8>],
 ) -> Result<()> {
-    let new_data = rebuild_file(original_data, frames, id3v2_version)?;
+    let new_data = rebuild_file(original_data, frames, id3v2_version, preserved)?;
     let temp_path = path.with_extension("tmp_thmp5_write");
     std::fs::write(&temp_path, &new_data).context("Failed to write temp file")?;
     std::fs::rename(&temp_path, path).context("Failed to rename temp file to target")?;
     Ok(())
 }
 
-/// Collect raw frame bytes for non-text frames from the original file.
-///
-/// These frames (APIC, UFID, etc.) cannot be re-serialized by our encoder,
-/// so we pass them through verbatim to avoid data loss.
-fn collect_preserved_frames(data: &[u8]) -> Vec<Vec<u8>> {
-    if data.len() < 10 || &data[0..3] != b"ID3" {
-        return Vec::new();
-    }
-
-    let version = data[3];
-    if version < 2 || version > 4 {
-        return Vec::new();
-    }
-
-    let frame_sizes_synchsafe = version >= 4;
-    let tag_size = synchsafe_to_u32(&data[6..10]) as usize;
-    let end = (10 + tag_size).min(data.len());
-    let mut pos = skip_extended_header(data, version, 10, end);
-    let mut preserved: Vec<Vec<u8>> = Vec::new();
-
-    while pos + 10 <= end {
+/// Visit each frame in a tag body, calling
+/// `visit(frame_id, frame_start, data_start, data_end)` with the frame's 4-byte
+/// ID, the offset of its 10-byte header, and the byte range of its payload
+/// (encoding byte included). Stops early on padding or a malformed frame.
+fn for_each_frame(data: &[u8], tag: &TagSpan, mut visit: impl FnMut(&str, usize, usize, usize)) {
+    let mut pos = skip_extended_header(data, tag.version, tag.flags, tag.body_start, tag.body_end);
+    while pos + 10 <= tag.body_end {
         if data[pos] == 0 {
             break;
         }
 
         let frame_id = match std::str::from_utf8(&data[pos..pos + 4]) {
-            Ok(id) if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => id.to_string(),
+            Ok(id) if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => id,
             _ => break,
         };
 
-        let frame_size = if frame_sizes_synchsafe {
+        let frame_size = if tag.synchsafe {
             synchsafe_to_u32(&data[pos + 4..pos + 8]) as usize
         } else {
             u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
                 as usize
         };
 
-        let frame_end = pos + 10 + frame_size;
-        if frame_end > end {
+        let frame_start = pos;
+        let data_start = pos + 10;
+        let data_end = data_start + frame_size;
+        if data_end > tag.body_end {
             break;
         }
 
-        // Collect all frames our serializer can't handle.
-        if !is_text_frame(&frame_id) {
-            preserved.push(data[pos..frame_end].to_vec());
-        }
-
-        pos = frame_end;
+        visit(frame_id, frame_start, data_start, data_end);
+        pos = data_end;
     }
+}
 
+/// Collect raw frame bytes for non-text frames from a single tag body.
+fn collect_preserved_frames_in(data: &[u8], tag: &TagSpan) -> Vec<Vec<u8>> {
+    let mut preserved: Vec<Vec<u8>> = Vec::new();
+    for_each_frame(data, tag, |frame_id, frame_start, _data_start, data_end| {
+        // Collect all frames our serializer can't handle, header included.
+        if !is_text_frame(frame_id) {
+            preserved.push(data[frame_start..data_end].to_vec());
+        }
+    });
     preserved
+}
+
+/// Collect raw frame bytes for non-text frames from the original file (first
+/// tag only).
+///
+/// These frames (APIC, UFID, etc.) cannot be re-serialized by our encoder,
+/// so we pass them through verbatim to avoid data loss.
+fn collect_preserved_frames(data: &[u8]) -> Vec<Vec<u8>> {
+    match iter_tags(data).into_iter().next() {
+        Some(tag) => collect_preserved_frames_in(data, &tag),
+        None => Vec::new(),
+    }
+}
+
+/// Collect non-text frames from *all* consecutive ID3v2 tags, deduplicated by
+/// exact bytes (identical artwork present in two tags must not be duplicated).
+/// Each frame's size header is re-encoded to `target_version`'s encoding so a
+/// v2.3 frame copied into a v2.4 tag (or vice versa) parses correctly.
+fn collect_preserved_frames_all(data: &[u8], target_version: u8) -> Vec<Vec<u8>> {
+    let target_synchsafe = target_version >= 4;
+    let mut preserved: Vec<Vec<u8>> = Vec::new();
+    for tag in iter_tags(data) {
+        for frame in collect_preserved_frames_in(data, &tag) {
+            let frame = if tag.synchsafe == target_synchsafe {
+                frame
+            } else {
+                reencode_frame_size(&frame, tag.synchsafe, target_synchsafe)
+            };
+            if !preserved.contains(&frame) {
+                preserved.push(frame);
+            }
+        }
+    }
+    preserved
+}
+
+/// Re-encode a frame's 4-byte size header between synchsafe and big-endian,
+/// leaving the frame ID, flags, and payload bytes untouched.
+fn reencode_frame_size(frame: &[u8], from_synchsafe: bool, to_synchsafe: bool) -> Vec<u8> {
+    let size = if from_synchsafe {
+        synchsafe_to_u32(&frame[4..8])
+    } else {
+        u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])
+    };
+    let mut out = frame.to_vec();
+    let encoded = if to_synchsafe {
+        serialize::u32_to_synchsafe(size)
+    } else {
+        size.to_be_bytes()
+    };
+    out[4..8].copy_from_slice(&encoded);
+    out
 }
 
 // ── Rebuild file ─────────────────────────────────────────────────────────────
@@ -306,11 +475,11 @@ fn rebuild_file(
     original_data: &[u8],
     frames: &[(String, String)],
     id3v2_version: u8,
+    preserved: &[Vec<u8>],
 ) -> Result<Vec<u8>> {
     let audio_start = find_audio_offset(original_data);
     let audio_bytes = &original_data[audio_start..];
-    let preserved = collect_preserved_frames(original_data);
-    let new_tag = serialize::serialize_tag(frames, &preserved, id3v2_version)?;
+    let new_tag = serialize::serialize_tag(frames, preserved, id3v2_version)?;
 
     let mut result = Vec::with_capacity(new_tag.len() + audio_bytes.len());
     result.extend_from_slice(&new_tag);
@@ -333,96 +502,139 @@ pub fn full_hash(data: &[u8]) -> Vec<u8> {
 
 // ── Low-level parsing ────────────────────────────────────────────────────────
 
-/// Find the offset where audio data begins (past all consecutive ID3v2 tags).
-pub fn find_audio_offset(data: &[u8]) -> usize {
-    let mut offset = 0;
-    loop {
-        if offset + 10 > data.len() || &data[offset..offset + 3] != b"ID3" {
-            return offset;
-        }
-        let tag_size = synchsafe_to_u32(&data[offset + 6..offset + 10]) as usize;
-        offset += 10 + tag_size;
-
-        if offset > 10 {
-            let flags_pos = if offset >= tag_size + 10 {
-                offset - tag_size - 10 + 5
-            } else {
-                5
-            };
-            if flags_pos < data.len() && data[flags_pos] & 0x10 != 0 {
-                offset += 10;
-            }
-        }
-    }
+/// A single consecutive ID3v2 tag located within the file data.
+struct TagSpan {
+    /// ID3v2 major version (2, 3, or 4).
+    version: u8,
+    /// Whether this tag's frame sizes are synchsafe-encoded (v2.4) or big-endian.
+    synchsafe: bool,
+    /// The tag's flags byte (used for footer / extended-header detection).
+    flags: u8,
+    /// Absolute offset of the first frame byte (header + 10, before any
+    /// extended-header skip).
+    body_start: usize,
+    /// Absolute offset one past the last frame byte (exclusive).
+    body_end: usize,
+    /// Absolute offset immediately after this tag (body_end + optional footer).
+    next_offset: usize,
 }
 
-/// Parse all serializable text frames from raw file data.
+/// Enumerate every consecutive ID3v2 tag at the start of `data`.
+fn iter_tags(data: &[u8]) -> Vec<TagSpan> {
+    let mut tags = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        if offset + 10 > data.len() || &data[offset..offset + 3] != b"ID3" {
+            break;
+        }
+        let version = data[offset + 3];
+        if version < 2 || version > 4 {
+            break;
+        }
+
+        let synchsafe_size = synchsafe_to_u32(&data[offset + 6..offset + 10]) as usize;
+        let big_endian_size = u32::from_be_bytes([
+            data[offset + 6],
+            data[offset + 7],
+            data[offset + 8],
+            data[offset + 9],
+        ]) as usize;
+        // v2.4 uses synchsafe sizes; earlier versions use plain big-endian.
+        // Fall back to big-endian if the synchsafe value would overshoot the file.
+        let (size, synchsafe) = if version < 4 || synchsafe_size + 10 > data.len() {
+            (big_endian_size, false)
+        } else {
+            (synchsafe_size, true)
+        };
+
+        let flags = data[offset + 5];
+        let body_start = offset + 10;
+        let body_end = (body_start + size).min(data.len());
+        let next_offset = (body_end + if flags & 0x10 != 0 { 10 } else { 0 }).min(data.len());
+
+        tags.push(TagSpan {
+            version,
+            synchsafe,
+            flags,
+            body_start,
+            body_end,
+            next_offset,
+        });
+        offset = next_offset;
+    }
+    tags
+}
+
+/// Find the offset where audio data begins (past all consecutive ID3v2 tags).
+pub fn find_audio_offset(data: &[u8]) -> usize {
+    iter_tags(data).last().map(|t| t.next_offset).unwrap_or(0)
+}
+
+/// Parse all serializable text frames from a single tag body.
+fn parse_text_frames_in(data: &[u8], tag: &TagSpan) -> Vec<(String, String)> {
+    let mut frames: Vec<(String, String)> = Vec::new();
+    for_each_frame(data, tag, |frame_id, _frame_start, data_start, data_end| {
+        // Skip only truly empty frames (no payload); a 1-byte payload is a valid
+        // empty text frame (encoding byte with no text).
+        if !is_text_frame(frame_id) || data_end == data_start {
+            return;
+        }
+        let encoding = data[data_start];
+        let payload = &data[data_start + 1..data_end];
+        match language_prefix_len(frame_id) {
+            Some(lang_len) if payload.len() >= lang_len => {
+                let (desc_bytes, value_bytes) = split_description(&payload[lang_len..], encoding);
+                frames.push(described_frame(frame_id, desc_bytes, value_bytes, encoding));
+            }
+            // Malformed described frame — too short to hold its language code.
+            Some(_) => {}
+            None => frames.push((frame_id.to_string(), decode_id3v2_text(payload, encoding))),
+        }
+    });
+    frames
+}
+
+/// Parse all serializable text frames from raw file data (first tag only).
 ///
 /// Returns (frames, id3v2_version) where frames is a list of (frame_id, value).
 pub fn parse_text_frames(data: &[u8]) -> Option<(Vec<(String, String)>, u8)> {
-    if data.len() < 10 || &data[0..3] != b"ID3" {
-        return None;
-    }
+    let tag = iter_tags(data).into_iter().next()?;
+    Some((parse_text_frames_in(data, &tag), tag.version))
+}
 
-    let version = data[3];
-    if version < 2 || version > 4 {
-        return None;
-    }
+/// Parse text frames from *all* consecutive ID3v2 tags, collapsing duplicate
+/// frame IDs into an ordered list of distinct values.
+///
+/// Returns (frames, id3v2_version) where `frames` preserves first-appearance
+/// order and each entry is `(frame_id, distinct_values_in_file_order)`.
+fn parse_all_text_frames(data: &[u8]) -> Option<(Vec<(String, Vec<String>)>, u8)> {
+    let tags = iter_tags(data);
+    let version = tags.first()?.version;
 
-    let frame_sizes_synchsafe = version >= 4;
-    let tag_size = synchsafe_to_u32(&data[6..10]) as usize;
-    let end = (10 + tag_size).min(data.len());
-
-    let mut pos = skip_extended_header(data, version, 10, end);
-    let mut frames: Vec<(String, String)> = Vec::new();
-
-    while pos + 10 <= end {
-        if data[pos] == 0 {
-            break;
-        }
-
-        let frame_id = match std::str::from_utf8(&data[pos..pos + 4]) {
-            Ok(id) if id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => id.to_string(),
-            _ => break,
-        };
-
-        let frame_size = if frame_sizes_synchsafe {
-            synchsafe_to_u32(&data[pos + 4..pos + 8]) as usize
-        } else {
-            u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                as usize
-        };
-
-        let data_start = pos + 10;
-        let data_end = data_start + frame_size;
-        if data_end > end {
-            break;
-        }
-
-        if is_text_frame(&frame_id) && frame_size > 1 {
-            let encoding = data[data_start];
-            let payload = &data[data_start + 1..data_end];
-            match language_prefix_len(&frame_id) {
-                Some(lang_len) if payload.len() >= lang_len => {
-                    let (desc_bytes, value_bytes) =
-                        split_description(&payload[lang_len..], encoding);
-                    frames.push(described_frame(
-                        &frame_id,
-                        desc_bytes,
-                        value_bytes,
-                        encoding,
-                    ));
-                }
-                // Malformed described frame — too short to hold its language code.
-                Some(_) => {}
-                None => frames.push((frame_id, decode_id3v2_text(payload, encoding))),
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for tag in &tags {
+        for (id, val) in parse_text_frames_in(data, tag) {
+            let values = groups.entry(id.clone()).or_insert_with(|| {
+                order.push(id.clone());
+                Vec::new()
+            });
+            if !values.contains(&val) {
+                values.push(val);
             }
         }
-
-        pos = data_end;
     }
 
-    Some((frames, version))
+    Some((
+        order
+            .into_iter()
+            .map(|id| {
+                let values = groups.remove(&id).unwrap_or_default();
+                (id, values)
+            })
+            .collect(),
+        version,
+    ))
 }
 
 /// The number of language-code bytes that precede the description in a
@@ -484,8 +696,8 @@ fn split_frame_key(key: &str) -> (&str, &str) {
     key.split_once(':').unwrap_or((key, ""))
 }
 
-fn skip_extended_header(data: &[u8], version: u8, pos: usize, end: usize) -> usize {
-    if version >= 3 && (data[5] & 0x40) != 0 && pos + 4 <= end {
+fn skip_extended_header(data: &[u8], version: u8, flags: u8, pos: usize, end: usize) -> usize {
+    if version >= 3 && (flags & 0x40) != 0 && pos + 4 <= end {
         let ext_size = if version == 4 {
             synchsafe_to_u32(&data[pos..pos + 4]) as usize
         } else {
@@ -512,7 +724,14 @@ fn is_text_frame(frame_id: &str) -> bool {
 
 fn decode_id3v2_text(data: &[u8], encoding: u8) -> String {
     match encoding {
-        0x00 => data.iter().map(|&b| b as char).collect(),
+        // ISO-8859-1: a trailing NUL is a terminator artifact, mirroring the
+        // trim already applied to the UTF-8 branch below.
+        0x00 => data
+            .iter()
+            .map(|&b| b as char)
+            .collect::<String>()
+            .trim_end_matches('\0')
+            .to_string(),
         0x01 => {
             let (bom, rest) = if data.len() >= 2 {
                 data.split_at(2)
@@ -627,7 +846,7 @@ mod tests {
         ];
         let original = synth_mp3(&frames);
         let (parsed, version) = parse_text_frames(&original).unwrap();
-        let rebuilt = rebuild_file(&original, &parsed, version).unwrap();
+        let rebuilt = rebuild_file(&original, &parsed, version, &[]).unwrap();
         let (reparsed, _) = parse_text_frames(&rebuilt).unwrap();
         assert_eq!(parsed, reparsed);
     }
@@ -638,7 +857,7 @@ mod tests {
         let original = synth_mp3(&frames);
         let orig_hash = audio_hash(&original);
         let (parsed, version) = parse_text_frames(&original).unwrap();
-        let rebuilt = rebuild_file(&original, &parsed, version).unwrap();
+        let rebuilt = rebuild_file(&original, &parsed, version, &[]).unwrap();
         assert_eq!(orig_hash, audio_hash(&rebuilt));
     }
 
@@ -651,7 +870,7 @@ mod tests {
         let original = synth_mp3(&frames);
         let (parsed, version) = parse_text_frames(&original).unwrap();
         let filtered: Vec<_> = parsed.into_iter().filter(|(id, _)| id != "TPE1").collect();
-        let new_data = rebuild_file(&original, &filtered, version).unwrap();
+        let new_data = rebuild_file(&original, &filtered, version, &[]).unwrap();
         let (reparsed, _) = parse_text_frames(&new_data).unwrap();
         assert_eq!(reparsed.len(), 1);
         assert_eq!(reparsed[0].0, "TIT2");
@@ -663,7 +882,7 @@ mod tests {
         let original = synth_mp3(&frames);
         let (mut parsed, version) = parse_text_frames(&original).unwrap();
         parsed.push(("TCON".into(), "Rock".into()));
-        let new_data = rebuild_file(&original, &parsed, version).unwrap();
+        let new_data = rebuild_file(&original, &parsed, version, &[]).unwrap();
         let (reparsed, _) = parse_text_frames(&new_data).unwrap();
         assert!(reparsed
             .iter()
@@ -813,7 +1032,7 @@ mod tests {
         ];
         let original = synth_mp3(&frames);
         let (parsed, version) = parse_text_frames(&original).unwrap();
-        let rebuilt = rebuild_file(&original, &parsed, version).unwrap();
+        let rebuilt = rebuild_file(&original, &parsed, version, &[]).unwrap();
         let (reparsed, _) = parse_text_frames(&rebuilt).unwrap();
         assert_eq!(parsed, reparsed);
     }
@@ -920,7 +1139,7 @@ mod tests {
             comm_frame("ID3v1 Comment", "Ripped by X"),
         ]);
         let (parsed, version) = parse_text_frames(&original).unwrap();
-        let rebuilt = rebuild_file(&original, &parsed, version).unwrap();
+        let rebuilt = rebuild_file(&original, &parsed, version, &[]).unwrap();
         let (reparsed, _) = parse_text_frames(&rebuilt).unwrap();
         assert_eq!(parsed, reparsed);
     }
@@ -1037,5 +1256,160 @@ mod tests {
             .any(|(id, _)| id == "TXXX:MusicBrainz Artist Id"));
         // TIT2 should still be there
         assert!(reparsed.iter().any(|(id, _)| id == "TIT2"));
+    }
+
+    /// Build a synthetic MP3 with two consecutive ID3v2 tags, then audio.
+    fn synth_mp3_two_tags(tag1: &[Vec<u8>], tag2: &[Vec<u8>]) -> Vec<u8> {
+        let mut file = Vec::new();
+        for (frames) in [tag1, tag2] {
+            let mut tag_data = Vec::new();
+            for f in frames {
+                tag_data.extend_from_slice(f);
+            }
+            file.extend_from_slice(b"ID3");
+            file.extend_from_slice(&[0x04, 0x00]);
+            file.push(0x00);
+            file.extend_from_slice(&synchsafe(tag_data.len() as u32));
+            file.extend_from_slice(&tag_data);
+        }
+        file.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        file.resize(file.len() + 413, 0u8);
+        file
+    }
+
+    fn merge_decision(frame_id: &str, value: &str) -> MergeDecision {
+        MergeDecision {
+            frame_id: frame_id.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_preview_merge_reports_conflicts() {
+        let tag1 = vec![
+            id3_frame(b"TIT2", b"\x03First Title"),
+            id3_frame(b"TPE1", b"\x03Shared Artist"),
+        ];
+        let tag2 = vec![
+            id3_frame(b"TIT2", b"\x03Second Title"),
+            id3_frame(b"TPE1", b"\x03Shared Artist"),
+            id3_frame(b"TALB", b"\x03Album"),
+        ];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        let conflicts = preview_merge(&path).unwrap();
+        // Only TIT2 differs between the tags. TPE1 matches, TALB is unique.
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].frame_id, "TIT2");
+        assert_eq!(conflicts[0].values, vec!["First Title", "Second Title"]);
+    }
+
+    #[test]
+    fn test_preview_merge_ignores_trailing_null_only_difference() {
+        // decode_id3v2_text strips trailing NULs for ISO-8859-1, so "Foo" and
+        // "Foo\0" read as the same value and shouldn't be shown as a conflict.
+        let tag1 = vec![id3_frame(b"TIT2", b"\x00Foo")];
+        let tag2 = vec![id3_frame(b"TIT2", b"\x00Foo\x00")];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        let conflicts = preview_merge(&path).unwrap();
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_apply_merge_collapses_and_preserves() {
+        let tag1 = vec![
+            id3_frame(b"TIT2", b"\x03First Title"),
+            id3_frame(b"TPE1", b"\x03Shared Artist"),
+        ];
+        let tag2 = vec![
+            id3_frame(b"TIT2", b"\x03Second Title"),
+            id3_frame(b"TPE1", b"\x03Shared Artist"),
+            id3_frame(b"TALB", b"\x03Album"),
+        ];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+        let pre_audio = audio_hash(&data);
+
+        let result = apply_merge(&path, &[merge_decision("TIT2", "Second Title")]).unwrap();
+        assert_eq!(result.pre_audio_hash, result.post_audio_hash);
+        assert_eq!(result.pre_audio_hash, pre_audio);
+
+        let written = std::fs::read(&path).unwrap();
+        let (reparsed, _) = parse_text_frames(&written).unwrap();
+        // Chosen value for TIT2 wins.
+        assert!(reparsed
+            .iter()
+            .any(|(id, v)| id == "TIT2" && v == "Second Title"));
+        // Matching frame survives.
+        assert!(reparsed
+            .iter()
+            .any(|(id, v)| id == "TPE1" && v == "Shared Artist"));
+        // Frame unique to the second tag is preserved (not dropped).
+        assert!(reparsed.iter().any(|(id, v)| id == "TALB" && v == "Album"));
+        // Only one tag remains (the two consecutive tags collapsed into one).
+        assert_eq!(iter_tags(&written).len(), 1);
+    }
+
+    #[test]
+    fn test_apply_merge_keeps_first_when_not_decided() {
+        let tag1 = vec![id3_frame(b"TIT2", b"\x03First Title")];
+        let tag2 = vec![id3_frame(b"TIT2", b"\x03Second Title")];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        apply_merge(&path, &[]).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let (reparsed, _) = parse_text_frames(&written).unwrap();
+        assert_eq!(
+            reparsed,
+            vec![("TIT2".to_string(), "First Title".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_apply_merge_verifies_empty_value() {
+        // One tag has "Foo", the other an empty TIT2 (encoding byte only).
+        // Choosing the empty value must succeed rather than rolling back.
+        let tag1 = vec![id3_frame(b"TIT2", b"\x03Foo")];
+        let tag2 = vec![id3_frame(b"TIT2", b"\x03")];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        let result = apply_merge(&path, &[merge_decision("TIT2", "")]).unwrap();
+        assert_eq!(result.pre_audio_hash, result.post_audio_hash);
+
+        let written = std::fs::read(&path).unwrap();
+        let (reparsed, _) = parse_text_frames(&written).unwrap();
+        assert!(reparsed.iter().any(|(id, v)| id == "TIT2" && v.is_empty()));
+    }
+
+    #[test]
+    fn test_apply_merge_dedups_identical_preserved_frames() {
+        let apic = id3_frame(b"APIC", b"\x00image/jpeg\x00\x03\xff\xd8\xff\xe0");
+        let tag1 = vec![apic.clone(), id3_frame(b"TIT2", b"\x03First Title")];
+        let tag2 = vec![apic, id3_frame(b"TIT2", b"\x03Second Title")];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        apply_merge(&path, &[merge_decision("TIT2", "Second Title")]).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        // The identical APIC from both tags is deduplicated to a single frame.
+        let preserved = collect_preserved_frames_all(&written, 4);
+        assert_eq!(preserved.len(), 1);
     }
 }

@@ -1432,46 +1432,6 @@ thead th {
   background: rgba(76, 175, 125, 0.35);
 }
 
-.duplicate-frame-choices {
-  display: flex;
-  gap: 6px;
-  margin-left: auto;
-}
-
-.use-value-btn {
-  font-size: 0.7rem;
-  padding: 2px 8px;
-  border: 1px solid rgba(156, 106, 222, 0.4);
-  border-radius: 6px;
-  background: rgba(156, 106, 222, 0.12);
-  color: #b388ff;
-  cursor: pointer;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  transition: background 0.15s, border-color 0.15s;
-}
-
-.use-value-btn:hover {
-  background: rgba(156, 106, 222, 0.25);
-  border-color: rgba(156, 106, 222, 0.7);
-}
-
-.use-value-btn.use-alt-value {
-  border-color: rgba(240, 196, 50, 0.4);
-  color: #f0c050;
-  background: rgba(240, 196, 50, 0.12);
-}
-
-.use-value-btn.use-alt-value:hover {
-  background: rgba(240, 196, 50, 0.25);
-  border-color: rgba(240, 196, 50, 0.7);
-}
-
-.use-value-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
 .tag-chips {
   display: flex;
   flex-wrap: nowrap;

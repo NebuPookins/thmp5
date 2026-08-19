@@ -789,56 +789,54 @@ pub async fn fix_orphan_source(
     Ok(())
 }
 
-/// Resolve a duplicate frame issue by applying the user's chosen value to the
-/// database and removing the issue from the in-memory log.
-///
-/// The auto-correction during scanning already applied the first-tag value
-/// (corrected_value). If the user chose that value, this is a no-op DB-wise.
-/// If they chose the lofty (last-tag) value, we do a targeted database update.
+/// Enumerate conflicting frames across all consecutive ID3v2 tags in a file,
+/// so the frontend can ask the user to pick a value for each before writing.
 #[tauri::command]
-pub async fn resolve_duplicate_frame(
+pub async fn preview_duplicate_merge(
+    file_path: String,
+) -> Result<Vec<crate::library::tag_writer::MergeConflict>, String> {
+    let path_buf = std::path::Path::new(&file_path).to_path_buf();
+    tokio::task::spawn_blocking(move || crate::library::tag_writer::preview_merge(&path_buf))
+        .await
+        .map_err(|e| format!("Merge preview task panicked: {e}"))?
+        .map_err(|e| format!("Failed to preview merge: {e}"))
+}
+
+/// Merge all consecutive ID3v2 tags into one, applying the user's choices for
+/// each conflicting frame, then re-scan the source and reload the catalog.
+#[tauri::command]
+pub async fn apply_duplicate_merge(
     state: tauri::State<'_, AppState>,
     file_path: String,
-    frame_id: String,
-    chosen_value: String,
-) -> Result<(), String> {
-    // Find the issue so we can compare chosen vs corrected vs lofty values.
-    let issue = {
-        let issues = state.file_issues.all();
-        issues
-            .iter()
-            .find(|i| {
-                i.kind == crate::file_issues::FileIssueKind::DuplicateFrame
-                    && i.file_path == file_path
-                    && i.frame_id.as_deref() == Some(&frame_id)
-            })
-            .cloned()
-            .ok_or_else(|| format!("No duplicate frame issue for {frame_id} in {file_path}"))?
-    };
-
-    let corrected = issue.corrected_value.as_deref().unwrap_or("");
-    let lofty = issue.lofty_value.as_deref().unwrap_or("");
-
-    // Only do DB work if the user picked the lofty value over the auto-corrected one.
-    if chosen_value == lofty && chosen_value != corrected {
-        // The recording table has been removed; all metadata is derived from
-        // raw_tags_json at catalog-load time.  The user's chosen value will
-        // take effect on the next source rescan (which rebuilds raw_tags_json).
-        // No recording-table UPDATE is needed for any frame type.
-        _ = &file_path;
-        _ = &frame_id;
-        _ = &chosen_value;
+    decisions: Vec<crate::library::tag_writer::MergeDecision>,
+) -> Result<crate::library::tag_writer::TagWriteResult, String> {
+    let path_buf = std::path::Path::new(&file_path).to_path_buf();
+    if !path_buf.is_file() {
+        return Err(format!("Source file is missing: {}", file_path));
     }
 
-    // Remove the resolved issue from the in-memory log.
-    state.file_issues.retain(|issue| {
-        !(issue.kind == crate::file_issues::FileIssueKind::DuplicateFrame
-            && issue.file_path == file_path
-            && issue.frame_id.as_deref() == Some(&frame_id))
-    });
+    let write_path = path_buf.clone();
+    let _write = tokio::task::spawn_blocking(move || {
+        crate::library::tag_writer::apply_merge(&write_path, &decisions)
+    })
+    .await
+    .map_err(|e| format!("Tag merge task panicked: {e}"))?
+    .map_err(|e| format!("Failed to merge tags: {e}"))?;
+
+    // Re-scan the source so `raw_tags_json` (which feeds both the catalog's
+    // derived issues and metadata display) reflects a single, coherent value.
+    do_rescan_source(
+        &state.db,
+        &path_buf,
+        state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
+        &state.file_issues,
+    )
+    .await
+    .map_err(|e| format!("Failed to re-scan after tag merge: {e}"))?;
 
     reload_catalog(&state).await;
-    Ok(())
+    Ok(_write)
 }
 
 #[tauri::command]

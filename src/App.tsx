@@ -193,6 +193,77 @@ type FileIssue = {
   backup_path?: string;
 };
 
+type MergeConflict = {
+  frame_id: string;
+  field_name: string;
+  values: string[];
+};
+
+// The merge modal is a small state machine. Keeping every field (which file,
+// its conflicts, the user's choices, whether a request is in flight) in a
+// single discriminated union makes cross-field inconsistencies — e.g. the
+// conflicts for file A being shown against file B's path — unrepresentable.
+// Async results carry a `requestId` so a stale preview/apply for a previous
+// open can never overwrite the current one.
+type MergeModalState =
+  | { phase: "closed" }
+  | { phase: "loading"; filePath: string; requestId: number }
+  | { phase: "ready"; filePath: string; requestId: number; conflicts: MergeConflict[]; choices: Record<string, string>; error: string | null }
+  | { phase: "submitting"; filePath: string; requestId: number; conflicts: MergeConflict[]; choices: Record<string, string> };
+
+type MergeModalAction =
+  | { type: "open"; filePath: string; requestId: number }
+  | { type: "previewOk"; requestId: number; conflicts: MergeConflict[] }
+  | { type: "previewErr"; requestId: number; error: string }
+  | { type: "choose"; frameId: string; value: string }
+  | { type: "submit" }
+  | { type: "submitOk"; requestId: number }
+  | { type: "submitErr"; requestId: number; error: string }
+  | { type: "close" };
+
+function mergeModalReducer(state: MergeModalState, action: MergeModalAction): MergeModalState {
+  switch (action.type) {
+    case "open":
+      return { phase: "loading", filePath: action.filePath, requestId: action.requestId };
+    case "previewOk":
+      if (state.phase === "loading" && state.requestId === action.requestId) {
+        const choices: Record<string, string> = {};
+        for (const c of action.conflicts) choices[c.frame_id] = c.values[0];
+        return { phase: "ready", filePath: state.filePath, requestId: state.requestId, conflicts: action.conflicts, choices, error: null };
+      }
+      return state;
+    case "previewErr":
+      if (state.phase === "loading" && state.requestId === action.requestId) {
+        return { phase: "ready", filePath: state.filePath, requestId: state.requestId, conflicts: [], choices: {}, error: action.error };
+      }
+      return state;
+    case "choose":
+      if (state.phase === "ready") {
+        return { ...state, choices: { ...state.choices, [action.frameId]: action.value } };
+      }
+      return state;
+    case "submit":
+      if (state.phase === "ready") {
+        return { phase: "submitting", filePath: state.filePath, requestId: state.requestId, conflicts: state.conflicts, choices: state.choices };
+      }
+      return state;
+    case "submitOk":
+      // Only close if we're still submitting the same file; a stale completion
+      // must not close a modal that has since moved to another file.
+      if (state.phase === "submitting" && state.requestId === action.requestId) {
+        return { phase: "closed" };
+      }
+      return state;
+    case "submitErr":
+      if (state.phase === "submitting" && state.requestId === action.requestId) {
+        return { phase: "ready", filePath: state.filePath, requestId: state.requestId, conflicts: state.conflicts, choices: state.choices, error: action.error };
+      }
+      return state;
+    case "close":
+      return { phase: "closed" };
+  }
+}
+
 type LastFmStatus = {
   configured: boolean;
   logged_in: boolean;
@@ -647,7 +718,75 @@ function App() {
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
   const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
   const [deletingBackups, setDeletingBackups] = useState<Set<string>>(new Set());
-  const [resolvingDuplicates, setResolvingDuplicates] = useState<Set<string>>(new Set());
+  const [mergeModal, mergeDispatch] = useReducer(mergeModalReducer, { phase: "closed" });
+  const mergeRequestIdRef = useRef(0);
+  const nextMergeRequestId = () => {
+    mergeRequestIdRef.current += 1;
+    return mergeRequestIdRef.current;
+  };
+
+  // Derived view of the modal state, using `null`/empty values when closed so
+  // the JSX below reads the same as before.
+  const mergeFilePath = mergeModal.phase === "closed" ? null : mergeModal.filePath;
+  const mergeConflicts =
+    mergeModal.phase === "ready" || mergeModal.phase === "submitting" ? mergeModal.conflicts : [];
+  const mergeChoices =
+    mergeModal.phase === "ready" || mergeModal.phase === "submitting" ? mergeModal.choices : {};
+  const mergeError = mergeModal.phase === "ready" ? mergeModal.error : null;
+  const mergeIsSubmitting = mergeModal.phase === "submitting";
+  const mergeIsLoading = mergeModal.phase === "loading";
+
+  const closeMerge = () => {
+    if (mergeModal.phase === "submitting") return; // an in-flight write can't be cancelled
+    mergeDispatch({ type: "close" });
+  };
+  const openMerge = (filePath: string) => {
+    const requestId = nextMergeRequestId();
+    mergeDispatch({ type: "open", filePath, requestId });
+    void (async () => {
+      try {
+        const conflicts = await invoke<MergeConflict[]>("preview_duplicate_merge", { filePath });
+        mergeDispatch({ type: "previewOk", requestId, conflicts });
+      } catch (e) {
+        mergeDispatch({ type: "previewErr", requestId, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+  };
+  const chooseMergeValue = (frameId: string, value: string) => mergeDispatch({ type: "choose", frameId, value });
+  const applyMerge = () => {
+    if (mergeModal.phase !== "ready") return;
+    const filePath = mergeModal.filePath;
+    const requestId = mergeModal.requestId;
+    const decisions = mergeModal.conflicts.map((c) => ({
+      frame_id: c.frame_id,
+      value: mergeModal.choices[c.frame_id] ?? c.values[0],
+    }));
+    mergeDispatch({ type: "submit" });
+    void (async () => {
+      try {
+        await invoke("apply_duplicate_merge", { filePath, decisions });
+        // The file was written regardless of what the modal shows now; drop its
+        // resolved duplicate issues unconditionally.
+        setFileIssues(prev => prev.filter(
+          (fi) => !(fi.kind === "duplicate_frame" && fi.file_path === filePath)
+        ));
+        mergeDispatch({ type: "submitOk", requestId });
+      } catch (e) {
+        mergeDispatch({ type: "submitErr", requestId, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+  };
+  // Index of the first duplicate_frame issue per file, so the merge button is
+  // rendered once per file rather than once per conflicting frame.
+  const firstDupIndexByFile = useMemo(() => {
+    const map = new Map<string, number>();
+    fileIssues.forEach((fi, idx) => {
+      if (fi.kind === "duplicate_frame" && !map.has(fi.file_path)) {
+        map.set(fi.file_path, idx);
+      }
+    });
+    return map;
+  }, [fileIssues]);
   const [error, setError] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [_allTags, setAllTags] = useState<string[]>([]);
@@ -3143,7 +3282,11 @@ function App() {
                   <p className="issue-empty">No file issues recorded this session.</p>
                 ) : (
                   <ol className="issue-list">
-                    {fileIssues.map((issue, i) => (
+                    {fileIssues.map((issue, i) => {
+                      const isFirstDupForFile =
+                        issue.kind === "duplicate_frame" &&
+                        firstDupIndexByFile.get(issue.file_path) === i;
+                      return (
                       <li
                         key={i}
                         className="issue-item"
@@ -3171,52 +3314,15 @@ function App() {
                               {fixingOrphans.has(issue.source_id!) ? "Fixing…" : "Fix"}
                             </button>
                           ) : issue.kind === "duplicate_frame" ? (
-                            <div className="duplicate-frame-choices">
+                            isFirstDupForFile ? (
                               <button
-                                className="use-value-btn"
+                                className="fix-orphan-btn"
                                 type="button"
-                                disabled={resolvingDuplicates.has(issue.file_path + issue.frame_id)}
-                                onClick={() => {
-                                  const key = issue.file_path + issue.frame_id;
-                                  setResolvingDuplicates(prev => new Set(prev).add(key));
-                                  void (async () => {
-                                    await invoke("resolve_duplicate_frame", {
-                                      filePath: issue.file_path,
-                                      frameId: issue.frame_id,
-                                      chosenValue: issue.corrected_value,
-                                    });
-                                    setFileIssues(prev => prev.filter(
-                                      fi => !(fi.kind === "duplicate_frame" && fi.file_path === issue.file_path && fi.frame_id === issue.frame_id)
-                                    ));
-                                    setResolvingDuplicates(prev => { const n = new Set(prev); n.delete(key); return n; });
-                                  })();
-                                }}
+                                onClick={() => openMerge(issue.file_path)}
                               >
-                                {resolvingDuplicates.has(issue.file_path + issue.frame_id) ? "Applying…" : `Use: ${issue.corrected_value?.substring(0, 60)}`}
+                                Resolve merge…
                               </button>
-                              <button
-                                className="use-value-btn use-alt-value"
-                                type="button"
-                                disabled={resolvingDuplicates.has(issue.file_path + issue.frame_id)}
-                                onClick={() => {
-                                  const key = issue.file_path + issue.frame_id;
-                                  setResolvingDuplicates(prev => new Set(prev).add(key));
-                                  void (async () => {
-                                    await invoke("resolve_duplicate_frame", {
-                                      filePath: issue.file_path,
-                                      frameId: issue.frame_id,
-                                      chosenValue: issue.lofty_value,
-                                    });
-                                    setFileIssues(prev => prev.filter(
-                                      fi => !(fi.kind === "duplicate_frame" && fi.file_path === issue.file_path && fi.frame_id === issue.frame_id)
-                                    ));
-                                    setResolvingDuplicates(prev => { const n = new Set(prev); n.delete(key); return n; });
-                                  })();
-                                }}
-                              >
-                                {resolvingDuplicates.has(issue.file_path + issue.frame_id) ? "Applying…" : `Use: ${issue.lofty_value?.substring(0, 60)}`}
-                              </button>
-                            </div>
+                            ) : null
                           ) : issue.kind === "backup_file_exists" ? (
                             <button
                               className="fix-orphan-btn"
@@ -3241,7 +3347,8 @@ function App() {
                         </span>
                         <span className="issue-message">{issue.message}</span>
                       </li>
-                    ))}
+                      );
+                    })}
                   </ol>
                 )}
               </div>
@@ -3369,6 +3476,84 @@ function App() {
                 type="button"
               >
                 {splitIsSubmitting ? "Splitting..." : "Split Recording"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {mergeFilePath && (
+        <div
+          className="modal-overlay"
+          onClick={closeMerge}
+        >
+          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+            <div className="modal-header">
+              <h2>Resolve Duplicate Tags</h2>
+              <button
+                className="modal-close-btn"
+                onClick={closeMerge}
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-section">
+              <p className="subtle-text">
+                The tags in <strong title={mergeFilePath}>{mergeFilePath}</strong> conflict across
+                multiple ID3v2 tags. Pick the value to keep for each field below; all other frames
+                are merged automatically.
+              </p>
+
+              {mergeIsLoading ? (
+                <p className="issue-empty">Reading tags…</p>
+              ) : mergeConflicts.length === 0 ? (
+                mergeError ? null : (
+                  <p className="issue-empty">No conflicting values found — the tags can be merged without any choices.</p>
+                )
+              ) : (
+                <div className="merge-conflict-list">
+                  {mergeConflicts.map((c) => (
+                    <fieldset key={c.frame_id} className="merge-conflict">
+                      <legend>{c.field_name} <span className="subtle-text">({c.frame_id})</span></legend>
+                      {c.values.map((v) => (
+                        <label key={v} className="merge-choice">
+                          <input
+                            type="radio"
+                            name={`merge-${c.frame_id}`}
+                            value={v}
+                            checked={(mergeChoices[c.frame_id] ?? c.values[0]) === v}
+                            onChange={() => chooseMergeValue(c.frame_id, v)}
+                          />
+                          <span>{v}</span>
+                        </label>
+                      ))}
+                    </fieldset>
+                  ))}
+                </div>
+              )}
+
+              {mergeError && <div className="error-banner">{mergeError}</div>}
+            </div>
+            <div className="comparison-modal-footer">
+              <button
+                className="comparison-cancel-btn"
+                onClick={closeMerge}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="comparison-confirm-btn"
+                disabled={
+                  mergeIsSubmitting ||
+                  mergeIsLoading ||
+                  (mergeModal.phase === "ready" && mergeModal.error !== null)
+                }
+                onClick={applyMerge}
+                type="button"
+              >
+                {mergeIsSubmitting ? "Applying…" : "Apply merge"}
               </button>
             </div>
           </div>
