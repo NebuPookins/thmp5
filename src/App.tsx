@@ -13,6 +13,16 @@ import {
   moveEntryByKey,
   mapQueueEntryRecording,
 } from "./queue";
+import {
+  type CompoundArtistCheck,
+  type MergeConflict,
+  artistFixReducer,
+  mergeModalReducer,
+  type SplitSourceDetail,
+  type SplitRecordingDetail,
+  splitModalReducer,
+} from "./modalReducers";
+import { useRequestId } from "./useRequestId";
 import "./App.css";
 
 type LibrarySummary = {
@@ -172,14 +182,6 @@ type PlayerErrorEvent = {
   message: string;
 };
 
-type CompoundArtistCheck = {
-  is_compound: boolean;
-  evidence_count: number;
-  total_sources_checked: number;
-  individual_artist_names: string[];
-  source_examples: string[];
-};
-
 type FileIssue = {
   file_path: string;
   kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists";
@@ -193,77 +195,6 @@ type FileIssue = {
   backup_path?: string;
 };
 
-type MergeConflict = {
-  frame_id: string;
-  field_name: string;
-  values: string[];
-};
-
-// The merge modal is a small state machine. Keeping every field (which file,
-// its conflicts, the user's choices, whether a request is in flight) in a
-// single discriminated union makes cross-field inconsistencies — e.g. the
-// conflicts for file A being shown against file B's path — unrepresentable.
-// Async results carry a `requestId` so a stale preview/apply for a previous
-// open can never overwrite the current one.
-type MergeModalState =
-  | { phase: "closed" }
-  | { phase: "loading"; filePath: string; requestId: number }
-  | { phase: "ready"; filePath: string; requestId: number; conflicts: MergeConflict[]; choices: Record<string, string>; error: string | null }
-  | { phase: "submitting"; filePath: string; requestId: number; conflicts: MergeConflict[]; choices: Record<string, string> };
-
-type MergeModalAction =
-  | { type: "open"; filePath: string; requestId: number }
-  | { type: "previewOk"; requestId: number; conflicts: MergeConflict[] }
-  | { type: "previewErr"; requestId: number; error: string }
-  | { type: "choose"; frameId: string; value: string }
-  | { type: "submit" }
-  | { type: "submitOk"; requestId: number }
-  | { type: "submitErr"; requestId: number; error: string }
-  | { type: "close" };
-
-function mergeModalReducer(state: MergeModalState, action: MergeModalAction): MergeModalState {
-  switch (action.type) {
-    case "open":
-      return { phase: "loading", filePath: action.filePath, requestId: action.requestId };
-    case "previewOk":
-      if (state.phase === "loading" && state.requestId === action.requestId) {
-        const choices: Record<string, string> = {};
-        for (const c of action.conflicts) choices[c.frame_id] = c.values[0];
-        return { phase: "ready", filePath: state.filePath, requestId: state.requestId, conflicts: action.conflicts, choices, error: null };
-      }
-      return state;
-    case "previewErr":
-      if (state.phase === "loading" && state.requestId === action.requestId) {
-        return { phase: "ready", filePath: state.filePath, requestId: state.requestId, conflicts: [], choices: {}, error: action.error };
-      }
-      return state;
-    case "choose":
-      if (state.phase === "ready") {
-        return { ...state, choices: { ...state.choices, [action.frameId]: action.value } };
-      }
-      return state;
-    case "submit":
-      if (state.phase === "ready") {
-        return { phase: "submitting", filePath: state.filePath, requestId: state.requestId, conflicts: state.conflicts, choices: state.choices };
-      }
-      return state;
-    case "submitOk":
-      // Only close if we're still submitting the same file; a stale completion
-      // must not close a modal that has since moved to another file.
-      if (state.phase === "submitting" && state.requestId === action.requestId) {
-        return { phase: "closed" };
-      }
-      return state;
-    case "submitErr":
-      if (state.phase === "submitting" && state.requestId === action.requestId) {
-        return { phase: "ready", filePath: state.filePath, requestId: state.requestId, conflicts: state.conflicts, choices: state.choices, error: action.error };
-      }
-      return state;
-    case "close":
-      return { phase: "closed" };
-  }
-}
-
 type LastFmStatus = {
   configured: boolean;
   logged_in: boolean;
@@ -271,31 +202,6 @@ type LastFmStatus = {
 };
 
 type QueueItem = RecordingRow;
-
-// ── Types for split recording modal ──────────────────────────────────────────
-type SplitSourceTagInfo = {
-  frame_id: string;
-  field_name: string;
-  value: string;
-};
-
-type SplitSourceDetail = {
-  id: string;
-  source_type: string;
-  file_path: string | null;
-  duration_ms: number | null;
-  tags: SplitSourceTagInfo[];
-};
-
-type SplitRecordingDetail = {
-  id: string;
-  title: string;
-  artist_credit_name: string | null;
-  primary_artist_id: string | null;
-  genre: string | null;
-  bpm: number | null;
-  sources: SplitSourceDetail[];
-};
 
 type ContextMenuState =
   | { kind: "recording"; x: number; y: number; path: string; recording: RecordingRow }
@@ -719,11 +625,7 @@ function App() {
   const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
   const [deletingBackups, setDeletingBackups] = useState<Set<string>>(new Set());
   const [mergeModal, mergeDispatch] = useReducer(mergeModalReducer, { phase: "closed" });
-  const mergeRequestIdRef = useRef(0);
-  const nextMergeRequestId = () => {
-    mergeRequestIdRef.current += 1;
-    return mergeRequestIdRef.current;
-  };
+  const nextMergeRequestId = useRequestId();
 
   // Derived view of the modal state, using `null`/empty values when closed so
   // the JSX below reads the same as before.
@@ -810,15 +712,46 @@ function App() {
   const [isSavingLastfmCredentials, setIsSavingLastfmCredentials] = useState(false);
   const [currentTrackLoved, setCurrentTrackLoved] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
-  const [artistFixModal, setArtistFixModal] = useState<{ artistId: string; artistName: string } | null>(null);
-  const [artistFixCheckResult, setArtistFixCheckResult] = useState<CompoundArtistCheck | null>(null);
-  const [artistFixChecking, setArtistFixChecking] = useState(false);
-  const [artistFixError, setArtistFixError] = useState<string | null>(null);
-  const [splitRecordingId, setSplitRecordingId] = useState<string | null>(null);
-  const [splitData, setSplitData] = useState<SplitRecordingDetail | null>(null);
-  const [splitSelectedSourceIds, setSplitSelectedSourceIds] = useState<Set<string>>(new Set());
-  const [splitIsSubmitting, setSplitIsSubmitting] = useState(false);
-  const [splitError, setSplitError] = useState<string | null>(null);
+  const [artistFix, artistFixDispatch] = useReducer(artistFixReducer, { phase: "closed" });
+  const nextArtistFixRequestId = useRequestId();
+  const openArtistFix = (artistId: string, artistName: string) => {
+    artistFixDispatch({ type: "open", artistId, artistName });
+  };
+  const closeArtistFix = () => artistFixDispatch({ type: "close" });
+  const runArtistFixChecks = () => {
+    if (artistFix.phase === "closed" || artistFix.phase === "checking") return;
+    const requestId = nextArtistFixRequestId();
+    const artistId = artistFix.artistId;
+    artistFixDispatch({ type: "runChecks", requestId });
+    void (async () => {
+      try {
+        const result = await invoke<CompoundArtistCheck>("check_artist_compound", { artistId });
+        artistFixDispatch({ type: "checkOk", requestId, result });
+      } catch (e) {
+        artistFixDispatch({ type: "checkErr", requestId, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+  };
+
+  const [splitModal, splitDispatch] = useReducer(splitModalReducer, { phase: "closed" });
+  const nextSplitRequestId = useRequestId();
+  const openSplit = (recordingId: string) => {
+    const requestId = nextSplitRequestId();
+    splitDispatch({ type: "open", requestId });
+    void (async () => {
+      try {
+        const data = await invoke<SplitRecordingDetail>("get_recording_detail", { id: recordingId });
+        splitDispatch({ type: "loadOk", requestId, data });
+      } catch (e) {
+        splitDispatch({ type: "loadErr", requestId, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+  };
+  const closeSplit = () => {
+    if (splitModal.phase === "submitting") return; // an in-flight write can't be cancelled
+    splitDispatch({ type: "close" });
+  };
+  const toggleSplitSource = (sourceId: string) => splitDispatch({ type: "toggleSource", sourceId });
   const [sortColumn, setSortColumn] = useState<SortColumn>("artist");
   const [sortAsc, setSortAsc] = useState(true);
 
@@ -1296,24 +1229,6 @@ function App() {
 
     return () => window.clearTimeout(timeoutId);
   }, [bootstrap?.needs_setup, search, selectedArtistId]);
-
-  // Fetch recording detail when split modal opens
-  useEffect(() => {
-    if (!splitRecordingId) {
-      setSplitData(null);
-      setSplitSelectedSourceIds(new Set());
-      setSplitError(null);
-      return;
-    }
-    invoke<SplitRecordingDetail>("get_recording_detail", { id: splitRecordingId })
-      .then((detail) => {
-        setSplitData(detail);
-        // Pre-select all sources except the last one as a reasonable default
-        const ids = detail.sources.slice(0, -1).map((s) => s.id);
-        setSplitSelectedSourceIds(new Set(ids));
-      })
-      .catch((e) => setSplitError(e instanceof Error ? e.message : String(e)));
-  }, [splitRecordingId]);
 
   useEffect(() => {
     if (!selectedReleaseGroupId) {
@@ -1962,23 +1877,20 @@ function App() {
   }
 
   async function handleSplitConfirm() {
-    if (!splitData || splitSelectedSourceIds.size === 0) return;
-    const sourceIdsToMove = Array.from(splitSelectedSourceIds);
-    setSplitIsSubmitting(true);
-    setSplitError(null);
+    if (splitModal.phase !== "ready" || splitModal.selectedSourceIds.size === 0) return;
+    const { data, selectedSourceIds, requestId } = splitModal;
+    const sourceIdsToMove = Array.from(selectedSourceIds);
+    splitDispatch({ type: "submit" });
     try {
       const newId = await invoke<string>("split_recording", {
-        recordingId: splitData.id,
+        recordingId: data.id,
         sourceIdsToMove,
       });
-      setSplitRecordingId(null);
-      setSplitSelectedSourceIds(new Set());
+      splitDispatch({ type: "submitOk", requestId });
       await loadLibraryData(selectedArtistId, search);
       dispatchNav({ type: "navigate", nav: { type: "recording", id: newId } });
     } catch (e) {
-      setSplitError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSplitIsSubmitting(false);
+      splitDispatch({ type: "submitErr", requestId, error: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -2613,7 +2525,7 @@ function App() {
                   onRescanRecording={(recordingId) => { void handleRescanRecording(recordingId); }}
                   onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
                   onRefreshLibrary={() => { void loadLibraryData(selectedArtistId, search); }}
-                  onSplitRecording={(recordingId) => { setSplitRecordingId(recordingId); }}
+                  onSplitRecording={(recordingId) => openSplit(recordingId)}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
                 <div className="smart-pl-results-panel">
@@ -3374,129 +3286,145 @@ function App() {
       ) : null}
 
 
-      {splitRecordingId && splitData && (
-        <div className="modal-overlay" onClick={() => setSplitRecordingId(null)}>
+      {splitModal.phase === "loadError" && (
+        <div className="modal-overlay" onClick={closeSplit}>
           <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
             <div className="modal-header">
               <h2>Split Recording</h2>
-              <button className="modal-close-btn" onClick={() => setSplitRecordingId(null)} type="button">×</button>
+              <button className="modal-close-btn" onClick={closeSplit} type="button">×</button>
             </div>
             <div className="modal-section">
-              <p className="subtle-text">
-                Splitting: <strong>{splitData.title}</strong>
-              </p>
-              <p className="subtle-text">Select sources to move to a new recording.</p>
-
-              {(() => {
-                const abbrevPaths = abbreviatePaths(splitData.sources);
-                return (
-                  <div className="split-source-list">
-                    {splitData.sources.map((source) => (
-                      <label
-                        key={source.id}
-                        className={`split-source-item${splitSelectedSourceIds.has(source.id) ? " split-source-item-selected" : ""}`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={splitSelectedSourceIds.has(source.id)}
-                          onChange={() => {
-                            setSplitSelectedSourceIds((prev) => {
-                              const next = new Set(prev);
-                              next.has(source.id) ? next.delete(source.id) : next.add(source.id);
-                              return next;
-                            });
-                          }}
-                        />
-                        <span className="entity-detail-badge">{source.source_type}</span>
-                        <span className="split-source-path" title={source.file_path ?? undefined}>{abbrevPaths.get(source.id) ?? source.file_path ?? "(no file path)"}</span>
-                        {source.duration_ms != null && (
-                          <span className="subtle-text">{formatDuration(source.duration_ms)}</span>
-                        )}
-                      </label>
-                    ))}
-                  </div>
-                );
-              })()}
-
-              {/* Metadata preview */}
-              <div className="split-preview-section">
-                <h3 className="entity-detail-section-title">Metadata preview</h3>
-                {(() => {
-                  const selectedSources = splitData.sources.filter((s) => splitSelectedSourceIds.has(s.id));
-                  const derivedTitle = firstTag(selectedSources, "TIT2");
-                  const derivedArtists = allUniqueTags(selectedSources, "TPE1");
-                  const derivedTags = allUniqueTags(selectedSources, "TCON");
-
-                  const releaseStrs: string[] = [];
-                  const releaseKeys = new Set<string>();
-                  for (const src of selectedSources) {
-                    const album = firstTag([src], "TALB");
-                    if (!album) continue;
-                    const discNum = src.tags.find((t) => t.frame_id === "TPOS" && t.field_name === "disc_number")?.value;
-                    const discTot = src.tags.find((t) => t.frame_id === "TPOS" && t.field_name === "disc_total")?.value;
-                    const trackNum = src.tags.find((t) => t.frame_id === "TRCK" && t.field_name === "track_number")?.value;
-                    const trackTot = src.tags.find((t) => t.frame_id === "TRCK" && t.field_name === "track_total")?.value;
-                    let r = album;
-                    const parts: string[] = [];
-                    if (discNum) parts.push(discTot ? `Disc ${discNum}/${discTot}` : `Disc ${discNum}`);
-                    if (trackNum) parts.push(trackTot ? `Track ${trackNum}/${trackTot}` : `Track ${trackNum}`);
-                    if (parts.length) r += ` (${parts.join(", ")})`;
-                    if (!releaseKeys.has(r)) {
-                      releaseKeys.add(r);
-                      releaseStrs.push(r);
-                    }
-                  }
-
-                  return (
-                    <table className="entity-detail-meta-table">
-                      <tbody>
-                        <tr>
-                          <td className="split-preview-label">Title</td>
-                          <td className="split-preview-value">{derivedTitle || "—"}</td>
-                        </tr>
-                        <tr>
-                          <td className="split-preview-label">Artist(s)</td>
-                          <td className="split-preview-value">{derivedArtists.length ? derivedArtists.join(", ") : "—"}</td>
-                        </tr>
-                        <tr>
-                          <td className="split-preview-label">Release(s)</td>
-                          <td className="split-preview-value">{releaseStrs.length ? releaseStrs.join("; ") : "—"}</td>
-                        </tr>
-                        <tr>
-                          <td className="split-preview-label">Tag(s)</td>
-                          <td className="split-preview-value">{derivedTags.length ? derivedTags.join(", ") : "—"}</td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  );
-                })()}
-              </div>
-
-              <p className="split-summary">
-                {splitData.sources.length - splitSelectedSourceIds.size} source(s) remain on original,
-                {" "}{splitSelectedSourceIds.size} moved to new recording.
-              </p>
-
-              {splitError && <div className="error-banner">{splitError}</div>}
+              <div className="error-banner">{splitModal.error}</div>
             </div>
             <div className="comparison-modal-footer">
-              <button className="comparison-cancel-btn" onClick={() => setSplitRecordingId(null)} type="button">Cancel</button>
-              <button
-                className="comparison-confirm-btn"
-                disabled={
-                  splitIsSubmitting ||
-                  splitSelectedSourceIds.size === 0 ||
-                  splitSelectedSourceIds.size === splitData.sources.length
-                }
-                onClick={() => { void handleSplitConfirm(); }}
-                type="button"
-              >
-                {splitIsSubmitting ? "Splitting..." : "Split Recording"}
-              </button>
+              <button className="comparison-cancel-btn" onClick={closeSplit} type="button">Close</button>
             </div>
           </div>
         </div>
       )}
+
+      {(splitModal.phase === "ready" || splitModal.phase === "submitting") && (() => {
+        const { data, selectedSourceIds } = splitModal;
+        const isSubmitting = splitModal.phase === "submitting";
+        const error = splitModal.phase === "ready" ? splitModal.error : null;
+        return (
+          <div className="modal-overlay" onClick={closeSplit}>
+            <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+              <div className="modal-header">
+                <h2>Split Recording</h2>
+                <button className="modal-close-btn" onClick={closeSplit} type="button">×</button>
+              </div>
+              <div className="modal-section">
+                <p className="subtle-text">
+                  Splitting: <strong>{data.title}</strong>
+                </p>
+                <p className="subtle-text">Select sources to move to a new recording.</p>
+
+                {(() => {
+                  const abbrevPaths = abbreviatePaths(data.sources);
+                  return (
+                    <div className="split-source-list">
+                      {data.sources.map((source) => (
+                        <label
+                          key={source.id}
+                          className={`split-source-item${selectedSourceIds.has(source.id) ? " split-source-item-selected" : ""}`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedSourceIds.has(source.id)}
+                            onChange={() => toggleSplitSource(source.id)}
+                          />
+                          <span className="entity-detail-badge">{source.source_type}</span>
+                          <span className="split-source-path" title={source.file_path ?? undefined}>{abbrevPaths.get(source.id) ?? source.file_path ?? "(no file path)"}</span>
+                          {source.duration_ms != null && (
+                            <span className="subtle-text">{formatDuration(source.duration_ms)}</span>
+                          )}
+                        </label>
+                      ))}
+                    </div>
+                  );
+                })()}
+
+                {/* Metadata preview */}
+                <div className="split-preview-section">
+                  <h3 className="entity-detail-section-title">Metadata preview</h3>
+                  {(() => {
+                    const selectedSources = data.sources.filter((s) => selectedSourceIds.has(s.id));
+                    const derivedTitle = firstTag(selectedSources, "TIT2");
+                    const derivedArtists = allUniqueTags(selectedSources, "TPE1");
+                    const derivedTags = allUniqueTags(selectedSources, "TCON");
+
+                    const releaseStrs: string[] = [];
+                    const releaseKeys = new Set<string>();
+                    for (const src of selectedSources) {
+                      const album = firstTag([src], "TALB");
+                      if (!album) continue;
+                      const discNum = src.tags.find((t) => t.frame_id === "TPOS" && t.field_name === "disc_number")?.value;
+                      const discTot = src.tags.find((t) => t.frame_id === "TPOS" && t.field_name === "disc_total")?.value;
+                      const trackNum = src.tags.find((t) => t.frame_id === "TRCK" && t.field_name === "track_number")?.value;
+                      const trackTot = src.tags.find((t) => t.frame_id === "TRCK" && t.field_name === "track_total")?.value;
+                      let r = album;
+                      const parts: string[] = [];
+                      if (discNum) parts.push(discTot ? `Disc ${discNum}/${discTot}` : `Disc ${discNum}`);
+                      if (trackNum) parts.push(trackTot ? `Track ${trackNum}/${trackTot}` : `Track ${trackNum}`);
+                      if (parts.length) r += ` (${parts.join(", ")})`;
+                      if (!releaseKeys.has(r)) {
+                        releaseKeys.add(r);
+                        releaseStrs.push(r);
+                      }
+                    }
+
+                    return (
+                      <table className="entity-detail-meta-table">
+                        <tbody>
+                          <tr>
+                            <td className="split-preview-label">Title</td>
+                            <td className="split-preview-value">{derivedTitle || "—"}</td>
+                          </tr>
+                          <tr>
+                            <td className="split-preview-label">Artist(s)</td>
+                            <td className="split-preview-value">{derivedArtists.length ? derivedArtists.join(", ") : "—"}</td>
+                          </tr>
+                          <tr>
+                            <td className="split-preview-label">Release(s)</td>
+                            <td className="split-preview-value">{releaseStrs.length ? releaseStrs.join("; ") : "—"}</td>
+                          </tr>
+                          <tr>
+                            <td className="split-preview-label">Tag(s)</td>
+                            <td className="split-preview-value">{derivedTags.length ? derivedTags.join(", ") : "—"}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    );
+                  })()}
+                </div>
+
+                <p className="split-summary">
+                  {data.sources.length - selectedSourceIds.size} source(s) remain on original,
+                  {" "}{selectedSourceIds.size} moved to new recording.
+                </p>
+
+                {error && <div className="error-banner">{error}</div>}
+              </div>
+              <div className="comparison-modal-footer">
+                <button className="comparison-cancel-btn" onClick={closeSplit} type="button">Cancel</button>
+                <button
+                  className="comparison-confirm-btn"
+                  disabled={
+                    isSubmitting ||
+                    selectedSourceIds.size === 0 ||
+                    selectedSourceIds.size === data.sources.length
+                  }
+                  onClick={() => { void handleSplitConfirm(); }}
+                  type="button"
+                >
+                  {isSubmitting ? "Splitting..." : "Split Recording"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {mergeFilePath && (
         <div
@@ -3576,52 +3504,37 @@ function App() {
         </div>
       )}
 
-      {artistFixModal && (() => {
-        const { artistId, artistName } = artistFixModal;
-        function closeModal() {
-          setArtistFixModal(null);
-          setArtistFixCheckResult(null);
-          setArtistFixError(null);
-        }
-        async function runChecks() {
-          setArtistFixChecking(true);
-          setArtistFixCheckResult(null);
-          setArtistFixError(null);
-          try {
-            const result = await invoke<CompoundArtistCheck>("check_artist_compound", { artistId });
-            setArtistFixCheckResult(result);
-          } catch (e) {
-            setArtistFixError(String(e));
-          } finally {
-            setArtistFixChecking(false);
-          }
-        }
+      {artistFix.phase !== "closed" && (() => {
+        const { artistName } = artistFix;
+        const checking = artistFix.phase === "checking";
+        const result = artistFix.phase === "done" && artistFix.outcome.kind === "ok" ? artistFix.outcome.result : null;
+        const error = artistFix.phase === "done" && artistFix.outcome.kind === "err" ? artistFix.outcome.error : null;
         return (
           <div
             className="modal-overlay"
-            onClick={() => closeModal()}
+            onClick={closeArtistFix}
             role="dialog"
             aria-modal="true"
           >
             <div className="modal-card" onClick={(e) => e.stopPropagation()}>
               <div className="modal-header">
                 <h2>Fix Issues: {artistName}</h2>
-                <button className="modal-close-btn" onClick={() => closeModal()} type="button">×</button>
+                <button className="modal-close-btn" onClick={closeArtistFix} type="button">×</button>
               </div>
               <div className="modal-section">
                 {/* Error */}
-                {artistFixError && (
-                  <p className="check-error">Error: {artistFixError}</p>
+                {error && (
+                  <p className="check-error">Error: {error}</p>
                 )}
 
                 {/* Initial state — no checks run yet */}
-                {!artistFixChecking && !artistFixCheckResult && !artistFixError && (
+                {!checking && !result && !error && (
                   <>
                     <p className="check-empty">
                       Run checks to identify potential issues with this artist.
                     </p>
                     <div className="check-actions">
-                      <button className="check-run-btn" type="button" onClick={() => void runChecks()}>
+                      <button className="check-run-btn" type="button" onClick={runArtistFixChecks}>
                         Run Checks
                       </button>
                     </div>
@@ -3629,31 +3542,31 @@ function App() {
                 )}
 
                 {/* Checking in progress */}
-                {artistFixChecking && (
+                {checking && (
                   <p className="check-running">Running checks…</p>
                 )}
 
                 {/* Check complete: not compound */}
-                {artistFixCheckResult && !artistFixCheckResult.is_compound && (
+                {result && !result.is_compound && (
                   <div className="check-status check-pass-banner">
                     ✓ All checks passed — no issues found
                   </div>
                 )}
 
                 {/* Check complete: compound artist detected */}
-                {artistFixCheckResult && artistFixCheckResult.is_compound && (
+                {result && result.is_compound && (
                   <>
                     <div className="check-status check-fail-banner">
                       ✗ Artist appears to be a collaboration
                     </div>
                     <p className="check-meta">
-                      Checked {artistFixCheckResult.total_sources_checked} source file{artistFixCheckResult.total_sources_checked !== 1 ? "s" : ""}.
-                      Found evidence in {artistFixCheckResult.evidence_count} file{artistFixCheckResult.evidence_count !== 1 ? "s" : ""}.
+                      Checked {result.total_sources_checked} source file{result.total_sources_checked !== 1 ? "s" : ""}.
+                      Found evidence in {result.evidence_count} file{result.evidence_count !== 1 ? "s" : ""}.
                     </p>
                     <div className="check-section">
                       <span className="modal-section-label">Individual artists detected</span>
                       <ul className="check-detail-list">
-                        {artistFixCheckResult.individual_artist_names.map((name) => (
+                        {result.individual_artist_names.map((name) => (
                           <li key={name} className="check-detail-item">{name}</li>
                         ))}
                       </ul>
@@ -3725,7 +3638,7 @@ function App() {
                       className="ctx-menu-item"
                       type="button"
                       onClick={() => {
-                        setSplitRecordingId(contextMenu.recording.id);
+                        openSplit(contextMenu.recording.id);
                         setContextMenu(null);
                       }}
                     >
@@ -3768,7 +3681,7 @@ function App() {
                     className="ctx-menu-item"
                     type="button"
                     onClick={() => {
-                      setArtistFixModal({ artistId: contextMenu.artist_id, artistName: contextMenu.artist_name });
+                      openArtistFix(contextMenu.artist_id, contextMenu.artist_name);
                       setContextMenu(null);
                     }}
                   >

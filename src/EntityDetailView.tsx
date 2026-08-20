@@ -1,178 +1,21 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  type DetailNav,
+  type SourceTagInfo,
+  type SourceDetail,
+  type ArtistDetail,
+  type TrackDetail,
+  type ReleaseCompleteness,
+  type ReleaseGroupDetail,
+  type RecordingDetail,
+} from "./entityTypes";
+import { detailReducer } from "./entityDetailReducer";
+import { useRequestId } from "./useRequestId";
 import "./EntityDetailView.css";
 
-// ── Types matching Rust models ─────────────────────────────────────────────
-
-export type EntityType = "artist" | "release_group" | "recording";
-
-type SourceTagInfo = {
-  frame_id: string;
-  field_name: string;
-  value: string;
-};
-
-type SourceDetail = {
-  id: string;
-  source_type: string;
-  file_path: string | null;
-  format: string | null;
-  duration_ms: number | null;
-  replay_gain_track_db: number | null;
-  replay_gain_track_peak: number | null;
-  tags: SourceTagInfo[];
-};
-
-type ReleaseInfo = {
-  release_group_id: string;
-  release_group_title: string;
-  track_position: number | null;
-  disc_position: number | null;
-  disc_total: number | null;
-};
-
-// ── Artist detail types ─────────────────────────────────────────────────────
-
-type ArtistReleaseGroup = {
-  id: string;
-  title: string;
-  rg_type: string | null;
-  release_date: string | null;
-  recording_count: number;
-  rating: number | null;
-  primary_artist_id: string | null;
-  artist_credit_name: string | null;
-};
-
-type GuestAppearanceTrack = {
-  recording_id: string;
-  recording_title: string;
-  track_position: number | null;
-  disc_position: number | null;
-};
-
-type GuestAppearanceReleaseGroup = {
-  id: string;
-  title: string;
-  rg_type: string | null;
-  release_date: string | null;
-  primary_artist_id: string | null;
-  artist_credit_name: string | null;
-  tracks: GuestAppearanceTrack[];
-};
-
-type ArtistDetail = {
-  id: string;
-  name: string;
-  sort_name: string;
-  mbid: string | null;
-  rating: number | null;
-  last_played: string | null;
-  recording_count: number;
-  release_group_count: number;
-  release_groups: ArtistReleaseGroup[];
-  guest_appearances: GuestAppearanceReleaseGroup[];
-};
-
-// ── Release group detail types ──────────────────────────────────────────────
-
-type TrackDetail = {
-  id: string;
-  position: number;
-  title: string | null;
-  duration_ms: number | null;
-  recording_id: string;
-  recording_title: string;
-  artist_credit_name: string | null;
-  primary_artist_id: string | null;
-  has_source: boolean;
-  primary_source_id: string | null;
-};
-
-type MediumDetail = {
-  id: string;
-  position: number;
-  format: string | null;
-  tracks: TrackDetail[];
-};
-
-type ReleaseCompleteness =
-  | { type: "complete" }
-  | { type: "incomplete"; missing_tracks: MissingTrackDetail[] }
-  | { type: "unknown"; reason: string; disagreement_groups: SourceDisagreementGroup[] };
-
-type SourceDisagreementGroup = {
-  description: string;
-  source_paths: string[];
-};
-
-type ReleaseDetail = {
-  id: string;
-  title: string;
-  release_date: string | null;
-  country: string | null;
-  label: string | null;
-  catalog_number: string | null;
-  mediums: MediumDetail[];
-  completeness: ReleaseCompleteness;
-};
-
-type MissingTrackDetail = {
-  disc_position: number;
-  track_position: number;
-  title: string;
-  recording_id: string | null;
-};
-
-type ReleaseGroupDetail = {
-  id: string;
-  title: string;
-  rg_type: string | null;
-  artist_credit_name: string | null;
-  primary_artist_id: string | null;
-  rating: number | null;
-  last_played: string | null;
-  release_date: string | null;
-  releases: ReleaseDetail[];
-};
-
-// ── Recording detail types ──────────────────────────────────────────────────
-
-type RecordingArtistInfo = {
-  artist_id: string;
-  name: string;
-  position: number;
-  role: string;
-  credited_as: string | null;
-};
-
-type RecordingDetail = {
-  id: string;
-  title: string;
-  duration_ms: number | null;
-  genre: string | null;
-  bpm: number | null;
-  comment: string | null;
-  artist_credit_name: string | null;
-  primary_artist_id: string | null;
-  artist_credit_text: string | null;
-  mbid: string | null;
-  acoustid: string | null;
-  rating: number | null;
-  play_count: number;
-  last_played: string | null;
-  artists: RecordingArtistInfo[];
-  releases: ReleaseInfo[];
-  sources: SourceDetail[];
-};
-
-// ── Navigation type ─────────────────────────────────────────────────────────
-
-export type DetailNav = {
-  type: EntityType;
-  id: string;
-};
+export type { DetailNav };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -321,11 +164,13 @@ function renderTagValue(tag: SourceTagInfo): React.ReactNode {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanRecording, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [artist, setArtist] = useState<ArtistDetail | null>(null);
-  const [releaseGroup, setReleaseGroup] = useState<ReleaseGroupDetail | null>(null);
-  const [recording, setRecording] = useState<RecordingDetail | null>(null);
+  const [detailState, detailDispatch] = useReducer(detailReducer, { phase: "loading", requestId: 0 });
+  const nextDetailRequestId = useRequestId();
+  const loading = detailState.phase === "loading";
+  const error = detailState.phase === "error" ? detailState.error : null;
+  const artist = detailState.phase === "ready" && detailState.entity.type === "artist" ? detailState.entity.data : null;
+  const releaseGroup = detailState.phase === "ready" && detailState.entity.type === "release_group" ? detailState.entity.data : null;
+  const recording = detailState.phase === "ready" && detailState.entity.type === "recording" ? detailState.entity.data : null;
   const [showMergePanel, setShowMergePanel] = useState(false);
 
   // Tag editing state
@@ -348,7 +193,7 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
         newValue,
       });
       showToast(`Updated ${frameId} → backup: ${result.backup_path}`, "success");
-      void load();
+      load();
     } catch (e) {
       showToast(e instanceof Error ? e.message : String(e), "error");
     } finally {
@@ -365,7 +210,7 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
         frameId,
       });
       showToast(`Deleted ${frameId} → backup: ${result.backup_path}`, "success");
-      void load();
+      load();
     } catch (e) {
       showToast(e instanceof Error ? e.message : String(e), "error");
     }
@@ -380,7 +225,7 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
       });
       showToast(`Added ${frameId} → backup: ${result.backup_path}`, "success");
       setAddingTag(null);
-      void load();
+      load();
     } catch (e) {
       showToast(e instanceof Error ? e.message : String(e), "error");
     }
@@ -404,42 +249,42 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
     }
   }
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      switch (nav.type) {
-        case "artist":
-          setArtist(await invoke<ArtistDetail>("get_artist_detail", { id: nav.id }));
-          setReleaseGroup(null);
-          setRecording(null);
-          break;
-        case "release_group":
-          setReleaseGroup(await invoke<ReleaseGroupDetail>("get_release_group_detail", { id: nav.id }));
-          setArtist(null);
-          setRecording(null);
-          break;
-        case "recording":
-          setRecording(await invoke<RecordingDetail>("get_recording_detail", { id: nav.id }));
-          setArtist(null);
-          setReleaseGroup(null);
-          break;
+  const load = useCallback(() => {
+    const requestId = nextDetailRequestId();
+    detailDispatch({ type: "load", requestId });
+    void (async () => {
+      try {
+        switch (nav.type) {
+          case "artist": {
+            const data = await invoke<ArtistDetail>("get_artist_detail", { id: nav.id });
+            detailDispatch({ type: "loadOk", requestId, entity: { type: "artist", data } });
+            break;
+          }
+          case "release_group": {
+            const data = await invoke<ReleaseGroupDetail>("get_release_group_detail", { id: nav.id });
+            detailDispatch({ type: "loadOk", requestId, entity: { type: "release_group", data } });
+            break;
+          }
+          case "recording": {
+            const data = await invoke<RecordingDetail>("get_recording_detail", { id: nav.id });
+            detailDispatch({ type: "loadOk", requestId, entity: { type: "recording", data } });
+            break;
+          }
+        }
+      } catch (e) {
+        detailDispatch({ type: "loadErr", requestId, error: e instanceof Error ? e.message : String(e) });
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
+    })();
   }, [nav]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { load(); }, [load]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     (async () => {
       unlisten = await listen<{ recording_ids: string[] }>("recording-releases-updated", (event) => {
         if (nav.type === "recording" && event.payload.recording_ids.includes(nav.id)) {
-          void load();
+          load();
         }
       });
     })();
@@ -1094,25 +939,34 @@ function MergePanel({ currentGroupId, currentGroupTitle, onMergeComplete, onCanc
   const [merging, setMerging] = useState(false);
   const [mergeError, setMergeError] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Clearing the debounce timer only stops a search that hasn't fired yet; a
+  // search already in flight when a newer keystroke lands can still resolve
+  // late. Bump the request id on every keystroke so any in-flight search is
+  // invalidated the moment the input changes, not just when its timer fires.
+  const searchRequestIdRef = useRef(0);
 
   const handleSearch = useCallback((value: string) => {
     setSearchText(value);
+    searchRequestIdRef.current += 1;
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (!value.trim()) {
       setResults([]);
+      setSearching(false);
       return;
     }
     debounceRef.current = setTimeout(async () => {
+      const requestId = searchRequestIdRef.current;
       setSearching(true);
       try {
         const rows = await invoke<SearchResultRow[]>("list_release_groups", {
           search: value.trim(),
         });
+        if (requestId !== searchRequestIdRef.current) return;
         setResults(rows.filter((r) => r.id !== currentGroupId));
       } catch {
         // ignore search errors
       } finally {
-        setSearching(false);
+        if (requestId === searchRequestIdRef.current) setSearching(false);
       }
     }, 300);
   }, [currentGroupId]);
