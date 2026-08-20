@@ -816,16 +816,23 @@ pub async fn apply_duplicate_merge(
     }
 
     let write_path = path_buf.clone();
-    let _write = tokio::task::spawn_blocking(move || {
+    let write_result = tokio::task::spawn_blocking(move || {
         crate::library::tag_writer::apply_merge(&write_path, &decisions)
     })
     .await
     .map_err(|e| format!("Tag merge task panicked: {e}"))?
     .map_err(|e| format!("Failed to merge tags: {e}"))?;
 
+    // The merge has already succeeded on disk: the file now carries a single
+    // tag, so any duplicate-frame conflicts it once had are gone. Clear them
+    // regardless of whether the follow-up re-scan (below) succeeds.
+    state.file_issues.clear_duplicate_frames(&file_path);
+
     // Re-scan the source so `raw_tags_json` (which feeds both the catalog's
     // derived issues and metadata display) reflects a single, coherent value.
-    do_rescan_source(
+    // A failure here must not fail the command — the merge already applied —
+    // so log it and let a later rescan recover.
+    if let Err(e) = do_rescan_source(
         &state.db,
         &path_buf,
         state.acoustid_api_key.as_deref(),
@@ -833,10 +840,16 @@ pub async fn apply_duplicate_merge(
         &state.file_issues,
     )
     .await
-    .map_err(|e| format!("Failed to re-scan after tag merge: {e}"))?;
+    {
+        tracing::warn!(
+            error = %e,
+            path = %file_path,
+            "Re-scan after tag merge failed; merge already applied"
+        );
+    }
 
     reload_catalog(&state).await;
-    Ok(_write)
+    Ok(write_result)
 }
 
 #[tauri::command]

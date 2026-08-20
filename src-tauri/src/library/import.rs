@@ -283,6 +283,7 @@ pub async fn rescan_source(
                         file_issues.push_backup_exists(
                             path.display().to_string(),
                             entry.path().display().to_string(),
+                            source_id.clone(),
                         );
                     }
                 }

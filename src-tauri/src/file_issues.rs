@@ -210,18 +210,34 @@ impl FileIssueLog {
     }
 
     /// Report that a `.thmp5bak` backup file exists from a previous tag edit.
-    pub fn push_backup_exists(&self, file_path: impl Into<String>, backup_path: impl Into<String>) {
+    pub fn push_backup_exists(
+        &self,
+        file_path: impl Into<String>,
+        backup_path: impl Into<String>,
+        source_id: impl Into<String>,
+    ) {
         self.push(FileIssue {
             file_path: file_path.into(),
             kind: FileIssueKind::BackupFileExists,
             message: "Backup file from tag edit exists — delete it to clean up.".into(),
-            source_id: None,
+            source_id: Some(source_id.into()),
             recording_id: None,
             frame_id: None,
             field_name: None,
             lofty_value: None,
             corrected_value: None,
             backup_path: Some(backup_path.into()),
+        });
+    }
+
+    /// Remove all `DuplicateFrame` issues for `file_path`.
+    ///
+    /// Used after a successful tag merge: the file now carries a single tag,
+    /// so any duplicate-frame conflicts it once had are gone regardless of
+    /// whether a follow-up re-scan succeeds.
+    pub fn clear_duplicate_frames(&self, file_path: &str) {
+        self.retain(|issue| {
+            !(issue.kind == FileIssueKind::DuplicateFrame && issue.file_path == file_path)
         });
     }
 
@@ -310,11 +326,16 @@ mod tests {
     #[test]
     fn test_push_backup_exists() {
         let log = FileIssueLog::new();
-        log.push_backup_exists("/path/song.mp3", "/path/song.mp3.20260522-140431.thmp5bak");
+        log.push_backup_exists(
+            "/path/song.mp3",
+            "/path/song.mp3.20260522-140431.thmp5bak",
+            "src-1",
+        );
         let issues = log.all();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].file_path, "/path/song.mp3");
         assert_eq!(issues[0].kind, FileIssueKind::BackupFileExists);
+        assert_eq!(issues[0].source_id.as_deref(), Some("src-1"));
         assert_eq!(
             issues[0].backup_path.as_deref(),
             Some("/path/song.mp3.20260522-140431.thmp5bak")
@@ -322,10 +343,40 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_duplicate_frames_removes_only_that_files_duplicates() {
+        let log = FileIssueLog::new();
+        log.push_duplicate_frame("/path/a.mp3", "TIT2", "title", "A", "B");
+        log.push_duplicate_frame("/path/a.mp3", "TPE1", "artist", "C", "D");
+        log.push_duplicate_frame("/path/b.mp3", "TIT2", "title", "E", "F");
+        log.push_backup_exists("/path/a.mp3", "/path/a.mp3.1.thmp5bak", "src-a");
+
+        log.clear_duplicate_frames("/path/a.mp3");
+
+        let issues = log.all();
+        // a.mp3's duplicate-frame issues are gone, but its backup issue remains,
+        // and b.mp3's duplicate-frame issue is untouched.
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().any(|i| {
+            i.kind == FileIssueKind::BackupFileExists && i.file_path == "/path/a.mp3"
+        }));
+        assert!(issues
+            .iter()
+            .any(|i| { i.kind == FileIssueKind::DuplicateFrame && i.file_path == "/path/b.mp3" }));
+    }
+
+    #[test]
     fn test_push_backup_exists_dedup() {
         let log = FileIssueLog::new();
-        log.push_backup_exists("/path/song.mp3", "/path/song.mp3.20260522-140431.thmp5bak");
-        log.push_backup_exists("/path/song.mp3", "/path/song.mp3.20260522-140431.thmp5bak");
+        log.push_backup_exists(
+            "/path/song.mp3",
+            "/path/song.mp3.20260522-140431.thmp5bak",
+            "src-1",
+        );
+        log.push_backup_exists(
+            "/path/song.mp3",
+            "/path/song.mp3.20260522-140431.thmp5bak",
+            "src-1",
+        );
         let issues = log.all();
         // push_backup_exists uses the base push method, no dedup — caller
         // (rescan_source) clears previous issues for the file before pushing.

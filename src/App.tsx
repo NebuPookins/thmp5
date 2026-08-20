@@ -3324,22 +3324,38 @@ function App() {
                               </button>
                             ) : null
                           ) : issue.kind === "backup_file_exists" ? (
-                            <button
-                              className="fix-orphan-btn"
-                              type="button"
-                              disabled={deletingBackups.has(issue.backup_path ?? "")}
-                              onClick={() => {
-                                const bp = issue.backup_path!;
-                                setDeletingBackups(prev => new Set(prev).add(bp));
-                                void (async () => {
-                                  await invoke("delete_backup_file", { backupPath: bp });
-                                  setFileIssues(prev => prev.filter(fi => fi.backup_path !== bp));
-                                  setDeletingBackups(prev => { const n = new Set(prev); n.delete(bp); return n; });
-                                })();
-                              }}
-                            >
-                              {deletingBackups.has(issue.backup_path ?? "") ? "Deleting…" : "Delete backup"}
-                            </button>
+                            <>
+                              <button
+                                className="fix-orphan-btn"
+                                type="button"
+                                title="Play the current file to confirm it's still valid before deleting the backup"
+                                onClick={() => {
+                                  void invoke<PlayerState>("play", {
+                                    request: { source_id: issue.source_id! },
+                                  }).catch((playError) => {
+                                    setError(playError instanceof Error ? playError.message : String(playError));
+                                  });
+                                }}
+                              >
+                                Play file
+                              </button>
+                              <button
+                                className="fix-orphan-btn"
+                                type="button"
+                                disabled={deletingBackups.has(issue.backup_path ?? "")}
+                                onClick={() => {
+                                  const bp = issue.backup_path!;
+                                  setDeletingBackups(prev => new Set(prev).add(bp));
+                                  void (async () => {
+                                    await invoke("delete_backup_file", { backupPath: bp });
+                                    setFileIssues(prev => prev.filter(fi => fi.backup_path !== bp));
+                                    setDeletingBackups(prev => { const n = new Set(prev); n.delete(bp); return n; });
+                                  })();
+                                }}
+                              >
+                                {deletingBackups.has(issue.backup_path ?? "") ? "Deleting…" : "Delete backup"}
+                              </button>
+                            </>
                           ) : null}
                         </div>
                         <span className="issue-path" title={issue.file_path}>

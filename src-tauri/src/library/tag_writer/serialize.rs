@@ -21,20 +21,15 @@ fn synchsafe_to_u32(b: &[u8]) -> u32 {
 /// Write the 10-byte ID3v2 tag header.
 ///
 /// The `tag_size` is the combined size of all frames + padding (everything after
-/// the 10-byte header). v2.4 encodes the size synchsafe; v2.2/v2.3 use plain
-/// big-endian (matching how `iter_tags` reads it back).
+/// the 10-byte header). The tag size is synchsafe for every ID3v2 version (only
+/// *frame* sizes differ — big-endian in v2.3, synchsafe in v2.4).
 fn serialize_header(version: u8, tag_size: u32) -> [u8; 10] {
     let mut header = [0u8; 10];
     header[..3].copy_from_slice(b"ID3");
     header[3] = version;
     header[4] = 0; // revision
     header[5] = 0; // flags (none)
-    let size = if version >= 4 {
-        u32_to_synchsafe(tag_size)
-    } else {
-        tag_size.to_be_bytes()
-    };
-    header[6..10].copy_from_slice(&size);
+    header[6..10].copy_from_slice(&u32_to_synchsafe(tag_size));
     header
 }
 
@@ -185,8 +180,9 @@ mod tests {
         let header = serialize_header(3, 1000);
         assert_eq!(&header[..3], b"ID3");
         assert_eq!(header[3], 3);
-        // v2.3 uses plain big-endian tag size (not synchsafe).
-        assert_eq!(header[6..10], 1000u32.to_be_bytes());
+        // The v2.3 tag size is synchsafe (only frame sizes are big-endian in
+        // v2.3), so a size >= 128 must not be written as plain big-endian.
+        assert_eq!(header[6..10], u32_to_synchsafe(1000));
     }
 
     #[test]
