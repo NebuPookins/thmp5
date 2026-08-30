@@ -18,6 +18,7 @@ use audio::AudioEngineHandle;
 use db::DbPool;
 use file_issues::FileIssueLog;
 use importer::ImportManager;
+use models::LastFmLovedStatusEvent;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -80,7 +81,11 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 while let Some(action) = lastfm_rx.recv().await {
                     match action {
-                        audio::LastFmAction::NowPlaying { artist, track } => {
+                        audio::LastFmAction::NowPlaying {
+                            source_id,
+                            artist,
+                            track,
+                        } => {
                             let config =
                                 match crate::commands::load_lastfm_config(&db_for_lastfm).await {
                                     Ok(c) => c,
@@ -102,7 +107,15 @@ pub fn run() {
                                 .await
                             {
                                 Ok(loved) => {
-                                    let _ = lastfm_app_handle.emit("lastfm-loved-status", loved);
+                                    let _ = lastfm_app_handle.emit(
+                                        "lastfm-loved-status",
+                                        LastFmLovedStatusEvent {
+                                            loved,
+                                            source_id: source_id.clone(),
+                                            artist: artist.clone(),
+                                            track: track.clone(),
+                                        },
+                                    );
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -110,7 +123,15 @@ pub fn run() {
                                         track,
                                         "Last.fm: loved status query failed: {e}"
                                     );
-                                    let _ = lastfm_app_handle.emit("lastfm-loved-status", false);
+                                    let _ = lastfm_app_handle.emit(
+                                        "lastfm-loved-status",
+                                        LastFmLovedStatusEvent {
+                                            loved: false,
+                                            source_id: source_id.clone(),
+                                            artist: artist.clone(),
+                                            track: track.clone(),
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -274,6 +295,7 @@ pub fn run() {
             commands::lastfm_complete_auth,
             commands::lastfm_disconnect,
             commands::lastfm_love_track,
+            commands::lastfm_unlove_track,
             commands::lastfm_get_track_loved,
             commands::lastfm_now_playing,
             commands::lastfm_scrobble,

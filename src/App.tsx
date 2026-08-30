@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import { pickNextTrack } from "./autoDj";
+import { loveToggleAction } from "./lastfmLove";
 import { calculatePomodoroBatch, parsePomodoroDuration, formatPomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
 import {
   type QueueEntry,
@@ -199,6 +200,13 @@ type LastFmStatus = {
   configured: boolean;
   logged_in: boolean;
   username: string | null;
+};
+
+type LastFmLovedStatusEvent = {
+  loved: boolean;
+  source_id: string;
+  artist: string;
+  track: string;
 };
 
 type QueueItem = RecordingRow;
@@ -603,6 +611,7 @@ function App() {
   const [pomodoroPrompt, setPomodoroPrompt] = useState<{ x: number; y: number; value: string } | null>(null);
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const currentTrackRef = useRef<QueueItem | null>(null);
+  const playerSourceIdRef = useRef<string | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
   const [search, setSearch] = useState("");
   const [selectedArtistId, setSelectedArtistId] = useState<string | null>(null);
@@ -711,6 +720,7 @@ function App() {
   const [lastfmSharedSecretInput, setLastfmSharedSecretInput] = useState("");
   const [isSavingLastfmCredentials, setIsSavingLastfmCredentials] = useState(false);
   const [currentTrackLoved, setCurrentTrackLoved] = useState(false);
+  const [isLoveActionPending, setIsLoveActionPending] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [artistFix, artistFixDispatch] = useReducer(artistFixReducer, { phase: "closed" });
   const nextArtistFixRequestId = useRequestId();
@@ -1369,9 +1379,9 @@ function App() {
           }
         }
       });
-      const unlistenLoved = await listen<boolean>("lastfm-loved-status", (event) => {
-        if (isMounted) {
-          setCurrentTrackLoved(event.payload);
+      const unlistenLoved = await listen<LastFmLovedStatusEvent>("lastfm-loved-status", (event) => {
+        if (isMounted && event.payload.source_id === playerSourceIdRef.current) {
+          setCurrentTrackLoved(event.payload.loved);
         }
       });
 
@@ -1545,9 +1555,10 @@ function App() {
     };
   }, [waveformData, playerState.position_ms, activeDurationMs]);
 
-  // Keep ref in sync so stale-closure callbacks (e.g. player-track-ended listener)
+  // Keep refs in sync so stale-closure callbacks (e.g. player-track-ended listener)
   // always see the latest value.
   currentTrackRef.current = currentTrack;
+  playerSourceIdRef.current = playerState.source_id;
 
   async function completeCurrentTrack(positionMs?: number) {
     const finishedTrack = currentTrackRef.current;
@@ -1928,16 +1939,27 @@ function App() {
 
   async function handleLoveTrack() {
     if (!currentTrack?.artist_credit_name || !currentTrack?.title || !lastfmStatus?.logged_in) return;
+    if (isLoveActionPending) return;
+    const requestedTrackId = currentTrack.id;
+    const { command, nextLoved } = loveToggleAction(currentTrackLoved);
+    setIsLoveActionPending(true);
     try {
-      await invoke("lastfm_love_track", {
+      await invoke(command, {
         request: {
           artist: currentTrack.artist_credit_name,
           track: currentTrack.title,
         },
       });
-      setCurrentTrackLoved(true);
+      // Only apply the result if playback hasn't since moved to a different
+      // track — an in-flight love/unlove call must not clobber the loved
+      // state of whatever track is now playing.
+      if (currentTrackRef.current?.id === requestedTrackId) {
+        setCurrentTrackLoved(nextLoved);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIsLoveActionPending(false);
     }
   }
 
@@ -2190,8 +2212,9 @@ function App() {
               {lastfmStatus?.logged_in ? (
                 <button
                   className={"love-btn" + (currentTrackLoved ? " love-btn-loved" : "")}
+                  disabled={isLoveActionPending}
                   onClick={() => { void handleLoveTrack(); }}
-                  title="Love on Last.fm"
+                  title={currentTrackLoved ? "Unlove on Last.fm" : "Love on Last.fm"}
                   type="button"
                 >{currentTrackLoved ? "♥" : "♡"}</button>
               ) : null}
