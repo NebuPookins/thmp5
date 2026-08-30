@@ -229,6 +229,59 @@ pub async fn get_track_loved(
     Ok(loved)
 }
 
+/// Which loved-state change to apply. Pairs the API method name with its log
+/// verb so the two can never be set inconsistently with each other.
+#[derive(Clone, Copy)]
+enum LovedAction {
+    Love,
+    Unlove,
+}
+
+impl LovedAction {
+    fn method(self) -> &'static str {
+        match self {
+            LovedAction::Love => "track.love",
+            LovedAction::Unlove => "track.unlove",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            LovedAction::Love => "love",
+            LovedAction::Unlove => "unlove",
+        }
+    }
+}
+
+/// Call track.love or track.unlove, sharing the request/response handling
+/// that differs between the two only by API method name and log wording.
+async fn set_track_loved(
+    config: &LastFmConfig,
+    session_key: &str,
+    action: LovedAction,
+    artist: &str,
+    track: &str,
+) -> Result<(), String> {
+    let params = vec![
+        ("method", action.method()),
+        ("sk", session_key),
+        ("artist", artist),
+        ("track", track),
+    ];
+    match api_call(params, config).await {
+        Ok(_) => {
+            let verb = action.verb();
+            info!("Last.fm: track {verb}d successfully");
+            Ok(())
+        }
+        Err(e) => {
+            let verb = action.verb();
+            warn!(artist, track, "Last.fm: {verb} track failed: {e}");
+            Err(e)
+        }
+    }
+}
+
 /// Call track.love.
 pub async fn love_track(
     config: &LastFmConfig,
@@ -237,20 +290,16 @@ pub async fn love_track(
     track: &str,
 ) -> Result<(), String> {
     info!(artist, track, "Last.fm: loving track");
-    let params = vec![
-        ("method", "track.love"),
-        ("sk", session_key),
-        ("artist", artist),
-        ("track", track),
-    ];
-    match api_call(params, config).await {
-        Ok(_) => {
-            info!("Last.fm: track loved successfully");
-            Ok(())
-        }
-        Err(e) => {
-            warn!(artist, track, "Last.fm: love track failed: {e}");
-            Err(e)
-        }
-    }
+    set_track_loved(config, session_key, LovedAction::Love, artist, track).await
+}
+
+/// Call track.unlove.
+pub async fn unlove_track(
+    config: &LastFmConfig,
+    session_key: &str,
+    artist: &str,
+    track: &str,
+) -> Result<(), String> {
+    info!(artist, track, "Last.fm: unloving track");
+    set_track_loved(config, session_key, LovedAction::Unlove, artist, track).await
 }

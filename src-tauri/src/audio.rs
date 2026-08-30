@@ -74,6 +74,7 @@ pub struct PlayerErrorEvent {
 #[derive(Debug)]
 pub enum LastFmAction {
     NowPlaying {
+        source_id: String,
         artist: String,
         track: String,
     },
@@ -617,6 +618,7 @@ fn start_playback(
             (&request.artist, &request.title, &state.lastfm_tx)
         {
             let _ = tx.try_send(LastFmAction::NowPlaying {
+                source_id: request.source_id.clone(),
                 artist: artist.clone(),
                 track: track.clone(),
             });

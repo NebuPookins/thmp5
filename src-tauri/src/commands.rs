@@ -51,8 +51,10 @@ async fn reload_catalog(state: &AppState) {
 }
 
 /// Re-scan a source's metadata into the DB, then reload the in-memory catalog.
-/// The re-scan result is returned so callers can decide whether a failure is
-/// fatal (single-frame edits) or merely logged (duplicate merge).
+/// Used by the single-frame tag-edit commands, which propagate a re-scan
+/// failure as a command error and skip the catalog reload. `apply_duplicate_merge`
+/// does not use this helper: it always reloads the catalog even if the
+/// re-scan fails, since the merge has already been applied to the file.
 async fn rescan_and_reload(state: &AppState, path: &std::path::Path) -> anyhow::Result<()> {
     do_rescan_source(
         &state.db,
@@ -832,14 +834,24 @@ pub async fn apply_duplicate_merge(
     // Re-scan the source so `raw_tags_json` (which feeds both the catalog's
     // derived issues and metadata display) reflects a single, coherent value.
     // A failure here must not fail the command — the merge already applied —
-    // so log it and let a later rescan recover.
-    if let Err(e) = rescan_and_reload(&state, &path_buf).await {
+    // so log it and reload the catalog regardless (unlike the tag-edit
+    // commands, which propagate the rescan error and skip the reload).
+    if let Err(e) = do_rescan_source(
+        &state.db,
+        &path_buf,
+        state.acoustid_api_key.as_deref(),
+        &state.write_serializer,
+        &state.file_issues,
+    )
+    .await
+    {
         tracing::warn!(
             error = %e,
             path = %file_path,
             "Re-scan after tag merge failed; merge already applied"
         );
     }
+    reload_catalog(&state).await;
 
     Ok(write_result)
 }
@@ -1614,6 +1626,24 @@ pub async fn lastfm_love_track(
         crate::lastfm::love_track(&config, &session_key, &request.artist, &request.track).await;
     if let Err(ref e) = result {
         tracing::warn!("Love track failed: {e}");
+    }
+    result
+}
+
+/// Unlove a track on Last.fm.
+#[tauri::command]
+pub async fn lastfm_unlove_track(
+    state: tauri::State<'_, AppState>,
+    request: LastFmLoveTrackRequest,
+) -> Result<(), String> {
+    tracing::info!(artist = %request.artist, track = %request.track, "lastfm_unlove_track called");
+    let config = load_lastfm_config(&state.db).await?;
+    let session_key = load_lastfm_session_key(&state.db).await?;
+
+    let result =
+        crate::lastfm::unlove_track(&config, &session_key, &request.artist, &request.track).await;
+    if let Err(ref e) = result {
+        tracing::warn!("Unlove track failed: {e}");
     }
     result
 }

@@ -552,3 +552,17 @@ pub struct LastFmGetTrackLovedRequest {
     pub artist: String,
     pub track: String,
 }
+
+/// Payload for the `lastfm-loved-status` event. Carries the source id the
+/// loved-status lookup was for, so listeners can ignore stale results that
+/// resolve after playback has already moved on to a different track. Uses
+/// `source_id` rather than artist/track text: those strings come from the
+/// playing file's raw ID3 tags, which can differ from the catalog's
+/// MusicBrainz-derived `artist_credit_name`/`title` the frontend displays.
+#[derive(Debug, Clone, Serialize)]
+pub struct LastFmLovedStatusEvent {
+    pub loved: bool,
+    pub source_id: String,
+    pub artist: String,
+    pub track: String,
+}
