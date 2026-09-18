@@ -132,8 +132,15 @@ pub fn write_single_frame(path: &Path, frame_id: &str, new_value: &str) -> Resul
     // Backup
     let backup_path = backup_file(path)?;
 
-    // Write
-    let preserved = collect_preserved_frames_all(&original_data, id3v2_version);
+    // Write. Resolve conflicting UFID frames to their first value (matching the
+    // keep-first collapse for text frames) so a same-owner duplicate isn't
+    // re-emitted into the collapsed tag.
+    let chosen_ufid = resolve_ufid_frames(&original_data, &HashMap::new(), id3v2_version >= 4);
+    let preserved: Vec<Vec<u8>> = collect_preserved_frames_all(&original_data, id3v2_version)
+        .into_iter()
+        .filter(|f| !is_resolvable_ufid(f))
+        .chain(chosen_ufid)
+        .collect();
     write_modified_file(path, &original_data, &frames, id3v2_version, &preserved)?;
 
     // Verify
@@ -196,7 +203,13 @@ pub fn delete_frame(path: &Path, frame_id: &str) -> Result<TagWriteResult> {
         .collect();
 
     let backup_path = backup_file(path)?;
-    let preserved = collect_preserved_frames_all(&original_data, id3v2_version);
+    // Resolve conflicting UFID frames to their first value (see write_single_frame).
+    let chosen_ufid = resolve_ufid_frames(&original_data, &HashMap::new(), id3v2_version >= 4);
+    let preserved: Vec<Vec<u8>> = collect_preserved_frames_all(&original_data, id3v2_version)
+        .into_iter()
+        .filter(|f| !is_resolvable_ufid(f))
+        .chain(chosen_ufid)
+        .collect();
     write_modified_file(
         path,
         &original_data,
@@ -267,19 +280,36 @@ pub fn preview_merge(path: &Path) -> Result<Vec<MergeConflict>> {
     let (frames, _version) = parse_all_text_frames(&data)
         .ok_or_else(|| anyhow::anyhow!("No ID3v2 tag found in {}", path.display()))?;
 
-    Ok(frames
+    let mut conflicts: Vec<MergeConflict> = frames
         .into_iter()
         .filter(|(_, values)| values.len() >= 2)
         .map(|(frame_id, values)| MergeConflict {
-            // Described frames are keyed "TXXX:description"; look up the bare ID.
-            field_name: crate::library::scanner::frame_id_to_field_name(
-                split_frame_key(&frame_id).0,
-            )
-            .to_string(),
+            field_name: crate::library::scanner::frame_id_to_field_name(&frame_id).to_string(),
             frame_id,
             values,
         })
-        .collect())
+        .collect();
+
+    // UFID frames are binary, so the text-frame pass above skips them. They
+    // can still conflict across consecutive tags (two different MusicBrainz
+    // recording IDs), so surface them with the same conflict model, keyed by
+    // owner ("UFID:<owner>").
+    let ufid_conflicts: Vec<MergeConflict> = group_distinct_by_key(
+        parse_all_ufid(&data)
+            .into_iter()
+            .map(|e| (e.key, e.identifier)),
+    )
+    .into_iter()
+    .filter(|(_, values)| values.len() >= 2)
+    .map(|(frame_id, values)| MergeConflict {
+        field_name: crate::library::scanner::frame_id_to_field_name(&frame_id).to_string(),
+        frame_id,
+        values,
+    })
+    .collect();
+    conflicts.extend(ufid_conflicts);
+
+    Ok(conflicts)
 }
 
 /// Merge all consecutive ID3v2 tags into a single tag, applying the user's
@@ -306,11 +336,25 @@ pub fn apply_merge(path: &Path, decisions: &[MergeDecision]) -> Result<TagWriteR
         frames.push((frame_id.clone(), chosen));
     }
 
+    // Resolve UFID frames: collapse each owner-keyed group to a single raw
+    // frame — the chosen identifier's bytes, falling back to the first when no
+    // decision was supplied (e.g. an identical UFID in both tags).
+    let chosen_ufid = resolve_ufid_frames(&original_data, &decision_map, id3v2_version >= 4);
+    let ufid_count = chosen_ufid.len();
+
     let pre_audio_hash = audio_hash(&original_data);
     let pre_full_hash = full_hash(&original_data);
 
     let backup_path = backup_file(path)?;
-    let preserved = collect_preserved_frames_all(&original_data, id3v2_version);
+    // Preserve non-text frames, dropping only resolvable UFID frames — we
+    // re-add the chosen one per owner above so a conflicting duplicate is
+    // resolved, not duplicated. A malformed UFID frame (no owner separator)
+    // stays preserved verbatim rather than being silently discarded.
+    let preserved: Vec<Vec<u8>> = collect_preserved_frames_all(&original_data, id3v2_version)
+        .into_iter()
+        .filter(|f| !is_resolvable_ufid(f))
+        .chain(chosen_ufid)
+        .collect();
     write_modified_file(path, &original_data, &frames, id3v2_version, &preserved)?;
 
     // Verify audio is unchanged.
@@ -326,13 +370,25 @@ pub fn apply_merge(path: &Path, decisions: &[MergeDecision]) -> Result<TagWriteR
     }
 
     // Verify each decided frame now reads back as the chosen value (the merge
-    // always produces a single tag, so parse the first tag only).
+    // always produces a single tag, so parse the first tag only). UFID frames
+    // are binary and don't appear in the text-frame reparse, so verify them
+    // against a UFID-specific reparse.
     let (reparsed, _) = parse_text_frames(&written_data)
         .ok_or_else(|| anyhow::anyhow!("Failed to re-parse ID3v2 tags after merge"))?;
+    let reparsed_ufid: Vec<(String, String)> = parse_all_ufid(&written_data)
+        .into_iter()
+        .map(|e| (e.key, e.identifier))
+        .collect();
     for decision in decisions {
-        let ok = reparsed
-            .iter()
-            .any(|(id, val)| id == &decision.frame_id && val == &decision.value);
+        let ok = if decision.frame_id.starts_with("UFID:") {
+            reparsed_ufid
+                .iter()
+                .any(|(id, val)| id == &decision.frame_id && val == &decision.value)
+        } else {
+            reparsed
+                .iter()
+                .any(|(id, val)| id == &decision.frame_id && val == &decision.value)
+        };
         if !ok {
             restore_from_backup_internal(path, &backup_path)?;
             bail!(
@@ -348,7 +404,7 @@ pub fn apply_merge(path: &Path, decisions: &[MergeDecision]) -> Result<TagWriteR
         pre_audio_hash,
         post_audio_hash,
         pre_full_hash,
-        frame_count: frames.len(),
+        frame_count: frames.len() + ufid_count,
     })
 }
 
@@ -593,36 +649,133 @@ pub fn parse_text_frames(data: &[u8]) -> Option<(Vec<(String, String)>, u8)> {
 /// Parse text frames from *all* consecutive ID3v2 tags, collapsing duplicate
 /// frame IDs into an ordered list of distinct values.
 ///
+/// Group `(key, value)` pairs by key, preserving first-appearance order of the
+/// keys and of each key's values.
+fn group_by_key<K: Eq + std::hash::Hash + Clone, V>(
+    pairs: impl IntoIterator<Item = (K, V)>,
+) -> Vec<(K, Vec<V>)> {
+    let mut order: Vec<K> = Vec::new();
+    let mut groups: HashMap<K, Vec<V>> = HashMap::new();
+    for (key, value) in pairs {
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(value);
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let values = groups.remove(&key).unwrap_or_default();
+            (key, values)
+        })
+        .collect()
+}
+
+/// [`group_by_key`], with duplicate values collapsed to their first occurrence.
+fn group_distinct_by_key<K: Eq + std::hash::Hash + Clone, V: Eq>(
+    pairs: impl IntoIterator<Item = (K, V)>,
+) -> Vec<(K, Vec<V>)> {
+    group_by_key(pairs)
+        .into_iter()
+        .map(|(key, values)| {
+            let mut distinct = Vec::new();
+            for value in values {
+                if !distinct.contains(&value) {
+                    distinct.push(value);
+                }
+            }
+            (key, distinct)
+        })
+        .collect()
+}
+
 /// Returns (frames, id3v2_version) where `frames` preserves first-appearance
 /// order and each entry is `(frame_id, distinct_values_in_file_order)`.
 fn parse_all_text_frames(data: &[u8]) -> Option<(Vec<(String, Vec<String>)>, u8)> {
     let tags = iter_tags(data);
     let version = tags.first()?.version;
 
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-    for tag in &tags {
-        for (id, val) in parse_text_frames_in(data, tag) {
-            let values = groups.entry(id.clone()).or_insert_with(|| {
-                order.push(id.clone());
-                Vec::new()
-            });
-            if !values.contains(&val) {
-                values.push(val);
-            }
-        }
-    }
+    let frames: Vec<(String, Vec<String>)> =
+        group_distinct_by_key(tags.iter().flat_map(|tag| parse_text_frames_in(data, tag)));
 
-    Some((
-        order
-            .into_iter()
-            .map(|id| {
-                let values = groups.remove(&id).unwrap_or_default();
-                (id, values)
+    Some((frames, version))
+}
+
+/// A single UFID frame parsed from a tag body.
+struct UfidFrame {
+    /// Owner-keyed identifier ("UFID:<owner>"), matching the raw-tags key.
+    key: String,
+    /// Decoded identifier (a lossy string, matching the scanner's representation).
+    identifier: String,
+    /// Raw frame bytes (header + payload) for verbatim re-serialization.
+    raw: Vec<u8>,
+    /// Whether the source tag used synchsafe frame sizes.
+    synchsafe: bool,
+}
+
+/// Parse every UFID frame from all consecutive ID3v2 tags.
+///
+/// UFID is a binary frame (`[owner NUL][identifier]`), so the text-frame parser
+/// skips it; the scanner nevertheless turns it into a `UFID:<owner>` raw tag
+/// for MusicBrainz recording IDs. Mirroring that here lets a merge resolve
+/// conflicting UFID frames rather than blindly preserving them.
+fn parse_all_ufid(data: &[u8]) -> Vec<UfidFrame> {
+    let mut out = Vec::new();
+    for tag in iter_tags(data) {
+        for_each_frame(data, &tag, |frame_id, frame_start, data_start, data_end| {
+            if frame_id != "UFID" {
+                return;
+            }
+            let payload = &data[data_start..data_end];
+            let Some((owner, identifier)) = crate::library::scanner::decode_ufid_payload(payload)
+            else {
+                return;
+            };
+            out.push(UfidFrame {
+                key: format!("UFID:{owner}"),
+                identifier,
+                raw: data[frame_start..data_end].to_vec(),
+                synchsafe: tag.synchsafe,
+            });
+        });
+    }
+    out
+}
+
+/// Whether `frame` (raw header + payload bytes) is a UFID frame that
+/// [`parse_all_ufid`] can resolve — i.e. its payload carries the NUL owner
+/// separator. A UFID frame without that separator is malformed and must be
+/// preserved verbatim rather than dropped when resolvable UFID frames are
+/// collapsed to their chosen value.
+fn is_resolvable_ufid(frame: &[u8]) -> bool {
+    frame.len() >= 10 && &frame[..4] == b"UFID" && frame[10..].contains(&0)
+}
+
+/// Collapse every UFID frame across consecutive tags to a single chosen frame
+/// per owner, re-encoded to `target_synchsafe`. The chosen frame is the one
+/// whose identifier matches the decision's value, or the first frame when no
+/// decision names that owner (e.g. an identical UFID in both tags).
+fn resolve_ufid_frames(
+    data: &[u8],
+    decision_map: &HashMap<&str, &str>,
+    target_synchsafe: bool,
+) -> Vec<Vec<u8>> {
+    group_by_key(parse_all_ufid(data).into_iter().map(|e| (e.key.clone(), e)))
+        .into_iter()
+        .filter_map(|(key, entries)| {
+            let chosen = decision_map
+                .get(key.as_str())
+                .and_then(|id| entries.iter().find(|e| e.identifier.as_str() == *id))
+                .or_else(|| entries.first());
+            chosen.map(|e| {
+                if e.synchsafe == target_synchsafe {
+                    e.raw.clone()
+                } else {
+                    reencode_frame_size(&e.raw, e.synchsafe, target_synchsafe)
+                }
             })
-            .collect(),
-        version,
-    ))
+        })
+        .collect()
 }
 
 /// The number of language-code bytes that precede the description in a
@@ -1402,6 +1555,370 @@ mod tests {
         // The identical APIC from both tags is deduplicated to a single frame.
         let preserved = collect_preserved_frames_all(&written, 4);
         assert_eq!(preserved.len(), 1);
+    }
+
+    // ── UFID merge tests ─────────────────────────────────────────────────────
+
+    /// Build a UFID frame: `[owner]\0[identifier]` with no encoding byte.
+    fn ufid_frame(owner: &str, identifier: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(owner.as_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(identifier.as_bytes());
+        id3_frame(b"UFID", &payload)
+    }
+
+    /// Build a UFID frame whose identifier is arbitrary binary bytes.
+    fn ufid_frame_bytes(owner: &str, identifier: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(owner.as_bytes());
+        payload.push(0x00);
+        payload.extend_from_slice(identifier);
+        id3_frame(b"UFID", &payload)
+    }
+
+    /// Independently walk raw file bytes and return every UFID frame's
+    /// `(owner, raw identifier bytes)`. Deliberately does not reuse the
+    /// production parsers, so it acts as an oracle for what is actually on disk.
+    fn ufid_identifier_bytes(data: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            if offset + 10 > data.len() || &data[offset..offset + 3] != b"ID3" {
+                break;
+            }
+            let version = data[offset + 3];
+            let tag_size = synchsafe_to_u32(&data[offset + 6..offset + 10]) as usize;
+            let body_start = offset + 10;
+            let body_end = (body_start + tag_size).min(data.len());
+            let synchsafe_sizes = version >= 4;
+            let mut pos = body_start;
+            while pos + 10 <= body_end {
+                if data[pos] == 0 {
+                    break;
+                }
+                let size = if synchsafe_sizes {
+                    synchsafe_to_u32(&data[pos + 4..pos + 8]) as usize
+                } else {
+                    u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                        as usize
+                };
+                let data_start = pos + 10;
+                let data_end = (data_start + size).min(body_end);
+                if &data[pos..pos + 4] == b"UFID" {
+                    let payload = &data[data_start..data_end];
+                    if let Some(n) = payload.iter().position(|&b| b == 0) {
+                        let owner = String::from_utf8_lossy(&payload[..n]).to_string();
+                        let ident = trim_trailing_nuls(&payload[n + 1..]).to_vec();
+                        out.push((owner, ident));
+                    }
+                }
+                pos = data_end;
+            }
+            offset = body_end;
+        }
+        out
+    }
+
+    /// [`ufid_identifier_bytes`] with the identifier shown as a lossy string.
+    fn ufid_identifiers(data: &[u8]) -> Vec<(String, String)> {
+        ufid_identifier_bytes(data)
+            .into_iter()
+            .map(|(owner, ident)| (owner, String::from_utf8_lossy(&ident).into_owned()))
+            .collect()
+    }
+
+    fn trim_trailing_nuls(bytes: &[u8]) -> &[u8] {
+        let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        &bytes[..end]
+    }
+
+    #[test]
+    fn test_preview_merge_reports_ufid_conflict() {
+        let tag1 = vec![
+            id3_frame(b"TIT2", b"\x03First Title"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+            ),
+        ];
+        let tag2 = vec![
+            id3_frame(b"TIT2", b"\x03Second Title"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "a96e6645-8e43-42da-ac97-390486ccc272",
+            ),
+        ];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        let conflicts = preview_merge(&path).unwrap();
+        // Both the TIT2 text conflict and the UFID conflict are reported.
+        assert_eq!(conflicts.len(), 2);
+        let ufid = conflicts
+            .iter()
+            .find(|c| c.frame_id == "UFID:http://musicbrainz.org")
+            .expect("UFID conflict present");
+        assert_eq!(
+            ufid.values,
+            vec![
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+                "a96e6645-8e43-42da-ac97-390486ccc272",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_preview_merge_ignores_identical_ufid() {
+        let tag1 = vec![ufid_frame(
+            "http://musicbrainz.org",
+            "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+        )];
+        let tag2 = vec![ufid_frame(
+            "http://musicbrainz.org",
+            "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+        )];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        let conflicts = preview_merge(&path).unwrap();
+        assert!(conflicts
+            .iter()
+            .all(|c| c.frame_id != "UFID:http://musicbrainz.org"));
+    }
+
+    #[test]
+    fn test_apply_merge_resolves_ufid_conflict() {
+        let tag1 = vec![ufid_frame(
+            "http://musicbrainz.org",
+            "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+        )];
+        let tag2 = vec![ufid_frame(
+            "http://musicbrainz.org",
+            "a96e6645-8e43-42da-ac97-390486ccc272",
+        )];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        let result = apply_merge(
+            &path,
+            &[merge_decision(
+                "UFID:http://musicbrainz.org",
+                "a96e6645-8e43-42da-ac97-390486ccc272",
+            )],
+        )
+        .unwrap();
+        assert_eq!(result.pre_audio_hash, result.post_audio_hash);
+
+        let written = std::fs::read(&path).unwrap();
+        // The chosen identifier is kept; the other is dropped.
+        assert_eq!(
+            ufid_identifiers(&written),
+            vec![(
+                "http://musicbrainz.org".to_string(),
+                "a96e6645-8e43-42da-ac97-390486ccc272".to_string()
+            )]
+        );
+        assert_eq!(iter_tags(&written).len(), 1);
+    }
+
+    #[test]
+    fn test_apply_merge_preserves_nonconflicting_ufid() {
+        // A UFID present in only one tag must survive a merge untouched.
+        let tag1 = vec![
+            id3_frame(b"TIT2", b"\x03First Title"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+            ),
+        ];
+        let tag2 = vec![id3_frame(b"TIT2", b"\x03Second Title")];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        apply_merge(&path, &[merge_decision("TIT2", "Second Title")]).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(
+            ufid_identifiers(&written),
+            vec![(
+                "http://musicbrainz.org".to_string(),
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_apply_merge_preserves_malformed_ufid_without_nul() {
+        // A UFID whose payload has no NUL separator is malformed and cannot be
+        // resolved by parse_all_ufid; the merge must preserve it verbatim
+        // rather than silently dropping it while collapsing resolvable UFID
+        // frames to their chosen value.
+        let malformed_ufid = id3_frame(b"UFID", b"http://musicbrainz.org");
+        let tag1 = vec![id3_frame(b"TIT2", b"\x03First Title"), malformed_ufid];
+        let tag2 = vec![id3_frame(b"TIT2", b"\x03Second Title")];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        apply_merge(&path, &[merge_decision("TIT2", "Second Title")]).unwrap();
+        let written = std::fs::read(&path).unwrap();
+
+        let preserved = collect_preserved_frames_all(&written, 4);
+        assert!(
+            preserved.iter().any(|f| f.starts_with(b"UFID")),
+            "malformed UFID frame (no NUL separator) was dropped by the merge"
+        );
+    }
+
+    #[test]
+    fn test_write_single_frame_preserves_ufid() {
+        // Regression guard: making UFID mergeable must not make single-frame
+        // edits (which also collapse consecutive tags) drop UFID frames.
+        let tag1 = vec![
+            id3_frame(b"TIT2", b"\x03Song"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+            ),
+        ];
+        let tag2 = vec![id3_frame(b"TIT2", b"\x03Song")];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        write_single_frame(&path, "TIT2", "Modified").unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(
+            ufid_identifiers(&written),
+            vec![(
+                "http://musicbrainz.org".to_string(),
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_preview_merge_distinguishes_binary_ufid_identifiers() {
+        // Two distinct binary identifiers (both invalid UTF-8) must surface as
+        // two distinct values, not collapse to one lossy "�" and vanish.
+        let tag1 = vec![ufid_frame_bytes("http://example.com", &[0xFF])];
+        let tag2 = vec![ufid_frame_bytes("http://example.com", &[0xFE])];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        let conflicts = preview_merge(&path).unwrap();
+        let ufid = conflicts
+            .iter()
+            .find(|c| c.frame_id == "UFID:http://example.com")
+            .expect("binary UFID conflict present");
+        assert_eq!(
+            ufid.values,
+            vec!["hex:ff".to_string(), "hex:fe".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_apply_merge_resolves_binary_ufid_conflict() {
+        let tag1 = vec![ufid_frame_bytes("http://example.com", &[0xFF])];
+        let tag2 = vec![ufid_frame_bytes("http://example.com", &[0xFE])];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        apply_merge(
+            &path,
+            &[merge_decision("UFID:http://example.com", "hex:fe")],
+        )
+        .unwrap();
+
+        let written = std::fs::read(&path).unwrap();
+        // The chosen identifier's raw bytes survive; the other is dropped.
+        assert_eq!(
+            ufid_identifier_bytes(&written),
+            vec![("http://example.com".to_string(), vec![0xFE])]
+        );
+        assert_eq!(iter_tags(&written).len(), 1);
+    }
+
+    #[test]
+    fn test_write_single_frame_resolves_conflicting_ufid() {
+        // A same-owner UFID differing across tags must be collapsed to the
+        // first value by a single-frame edit, not duplicated into the result.
+        let tag1 = vec![
+            id3_frame(b"TIT2", b"\x03Song"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+            ),
+        ];
+        let tag2 = vec![
+            id3_frame(b"TIT2", b"\x03Song"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "a96e6645-8e43-42da-ac97-390486ccc272",
+            ),
+        ];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        write_single_frame(&path, "TIT2", "Modified").unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(
+            ufid_identifiers(&written),
+            vec![(
+                "http://musicbrainz.org".to_string(),
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613".to_string()
+            )]
+        );
+        assert_eq!(iter_tags(&written).len(), 1);
+    }
+
+    #[test]
+    fn test_delete_frame_resolves_conflicting_ufid() {
+        let tag1 = vec![
+            id3_frame(b"TIT2", b"\x03Song"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613",
+            ),
+        ];
+        let tag2 = vec![
+            id3_frame(b"TIT2", b"\x03Song"),
+            ufid_frame(
+                "http://musicbrainz.org",
+                "a96e6645-8e43-42da-ac97-390486ccc272",
+            ),
+        ];
+        let data = synth_mp3_two_tags(&tag1, &tag2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mp3");
+        std::fs::write(&path, &data).unwrap();
+
+        delete_frame(&path, "TIT2").unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(
+            ufid_identifiers(&written),
+            vec![(
+                "http://musicbrainz.org".to_string(),
+                "60ae9fc7-e6e2-494c-b13d-7239b7c65613".to_string()
+            )]
+        );
+        assert_eq!(iter_tags(&written).len(), 1);
     }
 
     // ── v2.3 helpers ─────────────────────────────────────────────────────────

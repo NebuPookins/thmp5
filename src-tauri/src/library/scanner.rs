@@ -285,7 +285,10 @@ fn detect_duplicates_from_raw_bytes(
 }
 
 pub(crate) fn frame_id_to_field_name(id: &str) -> &'static str {
-    match id {
+    // Described frames arrive keyed "BASE:description" (e.g. "TXXX:ARTISTS",
+    // "UFID:http://musicbrainz.org"); match on the bare base ID.
+    let base = id.split_once(':').map(|(base, _)| base).unwrap_or(id);
+    match base {
         "TIT2" | "TT2" => "title",
         "TPE1" | "TP1" => "artist",
         "TPE2" | "TP2" => "album artist",
@@ -302,7 +305,32 @@ pub(crate) fn frame_id_to_field_name(id: &str) -> &'static str {
         "TIT3" | "TT3" => "subtitle",
         "TOPE" | "TOA" => "original artist",
         "COMM" | "COM" => "comment",
+        "UFID" => "unique file identifier",
         _ => "unknown field",
+    }
+}
+
+/// Decode a UFID frame payload (`[owner NUL][identifier]`) into its owner and
+/// identifier. The owner is a URL and is decoded lossy; the identifier is binary
+/// and is decoded losslessly (see [`decode_ufid_identifier`]) so two distinct
+/// identifiers never collapse to the same value. Returns `None` when the payload
+/// has no NUL separator (a malformed UFID frame).
+pub(crate) fn decode_ufid_payload(payload: &[u8]) -> Option<(String, String)> {
+    let null_pos = payload.iter().position(|&b| b == 0)?;
+    let owner = String::from_utf8_lossy(&payload[..null_pos]).to_string();
+    let identifier = decode_ufid_identifier(&payload[null_pos + 1..]);
+    Some((owner, identifier))
+}
+
+/// Decode a UFID identifier's bytes losslessly: valid UTF-8 (with trailing NUL
+/// padding stripped) is returned verbatim, and anything else is hex-encoded
+/// with a `hex:` prefix so distinct byte strings map to distinct strings.
+fn decode_ufid_identifier(bytes: &[u8]) -> String {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    let bytes = &bytes[..end];
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => format!("hex:{}", hex::encode(bytes)),
     }
 }
 
@@ -1331,11 +1359,7 @@ fn scan_all_id3_text_frames(path: &Path) -> Option<Vec<(String, String)>> {
                 // UFID frame: owner identifier (null-terminated Latin-1 string)
                 // followed by identifier bytes (typically an ASCII UUID).
                 let payload = &tag_data[data_start..data_end];
-                if let Some(null_pos) = payload.iter().position(|&b| b == 0) {
-                    let owner = String::from_utf8_lossy(&payload[..null_pos]).to_string();
-                    let value = String::from_utf8_lossy(&payload[null_pos + 1..])
-                        .trim_end_matches('\0')
-                        .to_string();
+                if let Some((owner, value)) = decode_ufid_payload(payload) {
                     frames.push((format!("UFID:{owner}"), value));
                 }
             }
