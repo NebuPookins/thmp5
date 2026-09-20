@@ -296,6 +296,7 @@ pub(crate) fn frame_id_to_field_name(id: &str) -> &'static str {
         "TRCK" | "TRK" => "track number",
         "TPOS" | "TPA" => "disc number",
         "TYER" | "TYE" | "TDRC" => "year",
+        "TDOR" => "Original release time",
         "TCON" | "TCO" => "genre",
         "TXXX" | "TXX" => "user-defined text",
         "TBPM" | "TBP" => "BPM",
