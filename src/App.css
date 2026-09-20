@@ -2050,6 +2050,23 @@ thead th {
   width: calc(100% - 24px);
 }
 
+/* ── Duplicate-tag merge choices ──────────────────────────────────────── */
+/* List-tag values carry null-byte separators; box each item so boundaries
+   between adjacent items stay visible instead of reading as one run of text. */
+.merge-choice-items {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  vertical-align: middle;
+}
+
+.merge-choice-item {
+  background: #1a1a2e;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
 /* ── Toggle switch ─────────────────────────────────────────────────── */
 .toggle-switch {
   position: relative;
