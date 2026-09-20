@@ -3483,18 +3483,29 @@ function App() {
                   {mergeConflicts.map((c) => (
                     <fieldset key={c.frame_id} className="merge-conflict">
                       <legend>{c.field_name} <span className="subtle-text">({c.frame_id})</span></legend>
-                      {c.values.map((v) => (
-                        <label key={v} className="merge-choice">
-                          <input
-                            type="radio"
-                            name={`merge-${c.frame_id}`}
-                            value={v}
-                            checked={(mergeChoices[c.frame_id] ?? c.values[0]) === v}
-                            onChange={() => chooseMergeValue(c.frame_id, v)}
-                          />
-                          <span>{v}</span>
-                        </label>
-                      ))}
+                      {c.values.map((v) => {
+                        const segments = v.split("\0").filter((s) => s.length > 0);
+                        return (
+                          <label key={v} className="merge-choice">
+                            <input
+                              type="radio"
+                              name={`merge-${c.frame_id}`}
+                              value={v}
+                              checked={(mergeChoices[c.frame_id] ?? c.values[0]) === v}
+                              onChange={() => chooseMergeValue(c.frame_id, v)}
+                            />
+                            {segments.length > 1 ? (
+                              <span className="merge-choice-items">
+                                {segments.map((seg, i) => (
+                                  <span key={i} className="merge-choice-item">{seg}</span>
+                                ))}
+                              </span>
+                            ) : (
+                              <span>{v}</span>
+                            )}
+                          </label>
+                        );
+                      })}
                     </fieldset>
                   ))}
                 </div>
