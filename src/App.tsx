@@ -630,7 +630,18 @@ function App() {
   const waveformContainerRef = useRef<HTMLDivElement>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"options" | "issues">("options");
+  const isModalOpenRef = useRef(isModalOpen);
+  isModalOpenRef.current = isModalOpen;
+  const settingsTabRef = useRef(settingsTab);
+  settingsTabRef.current = settingsTab;
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
+  const [pendingFileIssues, setPendingFileIssues] = useState<FileIssue[] | null>(null);
+  const lastMouseMoveTimeRef = useRef<number>(0);
+  const fileIssuesRef = useRef<FileIssue[]>(fileIssues);
+  fileIssuesRef.current = fileIssues;
+  const pendingFileIssuesRef = useRef<FileIssue[] | null>(pendingFileIssues);
+  pendingFileIssuesRef.current = pendingFileIssues;
+
   const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
   const [deletingBackups, setDeletingBackups] = useState<Set<string>>(new Set());
   const [mergeModal, mergeDispatch] = useReducer(mergeModalReducer, { phase: "closed" });
@@ -681,6 +692,9 @@ function App() {
         setFileIssues(prev => prev.filter(
           (fi) => !(fi.kind === "duplicate_frame" && fi.file_path === filePath)
         ));
+        setPendingFileIssues(prev => prev ? prev.filter(
+          (fi) => !(fi.kind === "duplicate_frame" && fi.file_path === filePath)
+        ) : null);
         mergeDispatch({ type: "submitOk", requestId });
       } catch (e) {
         mergeDispatch({ type: "submitErr", requestId, error: e instanceof Error ? e.message : String(e) });
@@ -1212,13 +1226,84 @@ function App() {
     })();
   }, [bootstrap]);
 
+  // Utility to check if two issue lists are structurally equal
+  const areIssuesEqual = (a: FileIssue[], b: FileIssue[]): boolean => {
+    if (a.length !== b.length) return false;
+    return JSON.stringify(a) === JSON.stringify(b);
+  };
+
+  // Update file issues helper: if modal is open and mouse moved recently (< 3s), buffer background update.
+  // Direct user updates pass forceImmediate = true.
+  const updateFileIssues = useCallback((newIssues: FileIssue[], forceImmediate = false) => {
+    if (forceImmediate) {
+      setFileIssues(newIssues);
+      setPendingFileIssues(null);
+      return;
+    }
+
+    const now = Date.now();
+    const isModalActive = isModalOpenRef.current && settingsTabRef.current === "issues";
+    const timeSinceMouseMove = now - lastMouseMoveTimeRef.current;
+
+    if (isModalActive && timeSinceMouseMove < 3000) {
+      if (!areIssuesEqual(newIssues, fileIssuesRef.current)) {
+        setPendingFileIssues(newIssues);
+      } else {
+        setPendingFileIssues(null);
+      }
+    } else {
+      setFileIssues(newIssues);
+      setPendingFileIssues(null);
+    }
+  }, []);
+
+  // Poll/check periodic background issue updates or cooldown flushes
+  useEffect(() => {
+    const isModalActive = isModalOpen && settingsTab === "issues";
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+      const timeSinceMouseMove = now - lastMouseMoveTimeRef.current;
+
+      // If there are pending issues and 3 seconds passed since mouse movement, apply them
+      if (pendingFileIssuesRef.current !== null && (!isModalActive || timeSinceMouseMove >= 3000)) {
+        setFileIssues(pendingFileIssuesRef.current);
+        setPendingFileIssues(null);
+      }
+
+      // Periodically fetch background file issues while modal is active
+      if (isModalActive) {
+        invoke<FileIssue[]>("get_file_issues")
+          .then((fetched) => {
+            const currentMouseMoveTime = lastMouseMoveTimeRef.current;
+            const currentIsModalActive = isModalOpenRef.current && settingsTabRef.current === "issues";
+            if (currentIsModalActive && (Date.now() - currentMouseMoveTime) < 3000) {
+              if (!areIssuesEqual(fetched, fileIssuesRef.current)) {
+                setPendingFileIssues(fetched);
+              } else {
+                setPendingFileIssues(null);
+              }
+            } else {
+              setFileIssues(fetched);
+              setPendingFileIssues(null);
+            }
+          })
+          .catch(() => {});
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isModalOpen, settingsTab]);
+
   // Reload the file issue list whenever the issues tab becomes visible.
   useEffect(() => {
     if (!isModalOpen || settingsTab !== "issues") return;
     invoke<FileIssue[]>("get_file_issues")
-      .then(setFileIssues)
+      .then((fetched) => {
+        updateFileIssues(fetched, true);
+      })
       .catch(() => {});
-  }, [isModalOpen, settingsTab]);
+  }, [isModalOpen, settingsTab, updateFileIssues]);
 
   useEffect(() => {
     if (!bootstrap || bootstrap.needs_setup) {
@@ -2998,6 +3083,7 @@ function App() {
         <div
           className="modal-overlay"
           onClick={() => setIsModalOpen(false)}
+          onMouseMove={() => { lastMouseMoveTimeRef.current = Date.now(); }}
           role="dialog"
           aria-modal="true"
         >
@@ -3213,6 +3299,11 @@ function App() {
               </>
             ) : (
               <div className="modal-section">
+                {pendingFileIssues !== null && (
+                  <div className="pending-updates-badge">
+                    <span>Updates pending (will apply when mouse stops moving)</span>
+                  </div>
+                )}
                 {fileIssues.length === 0 ? (
                   <p className="issue-empty">No file issues recorded this session.</p>
                 ) : (
@@ -3242,6 +3333,7 @@ function App() {
                                 void (async () => {
                                   await invoke("fix_orphan_source", { sourceId: sid });
                                   setFileIssues(prev => prev.filter(fi => fi.source_id !== sid));
+                                  setPendingFileIssues(prev => prev ? prev.filter(fi => fi.source_id !== sid) : null);
                                   setFixingOrphans(prev => { const n = new Set(prev); n.delete(sid); return n; });
                                 })();
                               }}
@@ -3284,6 +3376,7 @@ function App() {
                                   void (async () => {
                                     await invoke("delete_backup_file", { backupPath: bp });
                                     setFileIssues(prev => prev.filter(fi => fi.backup_path !== bp));
+                                    setPendingFileIssues(prev => prev ? prev.filter(fi => fi.backup_path !== bp) : null);
                                     setDeletingBackups(prev => { const n = new Set(prev); n.delete(bp); return n; });
                                   })();
                                 }}
