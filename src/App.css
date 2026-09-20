@@ -1071,6 +1071,7 @@ thead th {
 .modal-card {
   width: auto;
   max-width: calc(100% - 48px);
+  max-height: calc(100vh - 48px);
   border-radius: 24px;
   border: 1px solid rgba(149, 173, 198, 0.16);
   background: rgba(11, 18, 28, 0.96);
@@ -1086,6 +1087,7 @@ thead th {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-shrink: 0;
 }
 
 .modal-header h2 {
@@ -1115,6 +1117,9 @@ thead th {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
 }
 
 .modal-section-label {
@@ -1923,6 +1928,7 @@ thead th {
   justify-content: space-between;
   gap: 12px;
   margin-top: 4px;
+  flex-shrink: 0;
 }
 
 .comparison-confirm-btn {
@@ -2064,6 +2070,16 @@ thead th {
 }
 
 /* ── Duplicate-tag merge choices ──────────────────────────────────────── */
+.merge-conflict-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+  padding-right: 4px;
+}
+
 /* List-tag values carry null-byte separators; box each item so boundaries
    between adjacent items stay visible instead of reading as one run of text. */
 .merge-choice-items {
