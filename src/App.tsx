@@ -3357,11 +3357,41 @@ function App() {
                                 type="button"
                                 title="Play the current file to confirm it's still valid before deleting the backup"
                                 onClick={() => {
-                                  void invoke<PlayerState>("play", {
-                                    request: { source_id: issue.source_id! },
-                                  }).catch((playError) => {
-                                    setError(playError instanceof Error ? playError.message : String(playError));
-                                  });
+                                  const targetTrack: RecordingRow = recordings.find(
+                                    (r) =>
+                                      (issue.source_id && r.primary_source_id === issue.source_id) ||
+                                      r.source_paths.includes(issue.file_path)
+                                  ) ?? {
+                                    id: issue.recording_id ?? issue.source_id ?? issue.file_path,
+                                    title: issue.file_path.split("/").pop() ?? issue.file_path,
+                                    duration_ms: null,
+                                    primary_artist_id: null,
+                                    artist_credit_name: null,
+                                    genre: null,
+                                    rating: null,
+                                    predicted_rating: null,
+                                    play_count: 0,
+                                    last_played: null,
+                                    primary_source_id: issue.source_id ?? null,
+                                    primary_source_path: issue.file_path,
+                                    tags: [],
+                                    artist_ids: [],
+                                    source_paths: [issue.file_path],
+                                    releases: [],
+                                  };
+
+                                  if (currentTrack) {
+                                    setHistory((prev) => [currentTrack, ...prev].slice(0, queueHistoryLimit));
+                                  }
+                                  setCurrentTrack(targetTrack);
+                                  const sourceIdToPlay = targetTrack.primary_source_id ?? issue.source_id;
+                                  if (sourceIdToPlay) {
+                                    void invoke<PlayerState>("play", {
+                                      request: { source_id: sourceIdToPlay },
+                                    }).catch((playError) => {
+                                      setError(playError instanceof Error ? playError.message : String(playError));
+                                    });
+                                  }
                                 }}
                               >
                                 Play file
