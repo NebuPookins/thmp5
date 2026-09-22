@@ -671,11 +671,24 @@ pub async fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<Fi
 }
 
 /// Delete a `.thmp5bak` backup file created by a previous tag edit.
+///
+/// Only deletes paths that match a currently-tracked `BackupFileExists`
+/// issue — `backup_path` is caller-supplied over the Tauri IPC bridge, so
+/// without this check the command would be an arbitrary-file-delete
+/// primitive for anything the app process can write to.
 #[tauri::command]
 pub async fn delete_backup_file(
     state: tauri::State<'_, AppState>,
     backup_path: String,
 ) -> Result<(), String> {
+    let is_tracked = state.file_issues.all().iter().any(|issue| {
+        issue.kind == FileIssueKind::BackupFileExists
+            && issue.backup_path.as_deref() == Some(backup_path.as_str())
+    });
+    if !is_tracked {
+        return Err("Not a tracked backup file".to_string());
+    }
+
     let p = std::path::Path::new(&backup_path);
     if p.exists() {
         std::fs::remove_file(p).map_err(|e| format!("Failed to delete backup file: {e}"))?;

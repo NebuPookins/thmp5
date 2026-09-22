@@ -3404,16 +3404,20 @@ function App() {
                                   const bp = issue.backup_path!;
                                   setDeletingBackups(prev => new Set(prev).add(bp));
                                   void (async () => {
-                                    await invoke("delete_backup_file", { backupPath: bp });
-                                    setFileIssues(prev => prev.filter(fi => fi.backup_path !== bp));
-                                    setPendingFileIssues(prev => prev ? prev.filter(fi => fi.backup_path !== bp) : null);
-                                    setDeletingBackups(prev => { const n = new Set(prev); n.delete(bp); return n; });
+                                    try {
+                                      await invoke("delete_backup_file", { backupPath: bp });
+                                      setFileIssues(prev => prev.filter(fi => fi.backup_path !== bp));
+                                      setPendingFileIssues(prev => prev ? prev.filter(fi => fi.backup_path !== bp) : null);
+                                    } finally {
+                                      setDeletingBackups(prev => { const n = new Set(prev); n.delete(bp); return n; });
+                                    }
                                   })();
                                 }}
                               >
                                 {deletingBackups.has(issue.backup_path ?? "") ? "Deleting…" : "Delete backup"}
                               </button>
                             </>
+
                           ) : null}
                         </div>
                         <span className="issue-path" title={issue.file_path}>
