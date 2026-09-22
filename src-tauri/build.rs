@@ -82,7 +82,6 @@ fn build_taglib_helper(manifest_dir: &Path) {
     }
 
     let target = std::env::var("TARGET").expect("missing TARGET");
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("missing OUT_DIR"));
     let build_dir = out_dir.join("taglib-helper-build");
     let binaries_dir = manifest_dir.join("binaries");
@@ -129,26 +128,22 @@ fn build_taglib_helper(manifest_dir: &Path) {
         );
     }
 
-    if profile == "release" {
-        fs::create_dir_all(&binaries_dir).expect("failed to create binaries dir");
-        let staged_binary = staged_helper_binary_path(&binaries_dir, &target);
-        fs::copy(&built_binary, &staged_binary).unwrap_or_else(|error| {
-            panic!(
-                "failed to stage taglib-helper from {} to {}: {error}",
-                built_binary.display(),
-                staged_binary.display()
-            )
-        });
-        println!(
-            "cargo:rustc-env=THMP5_TAGLIB_HELPER_BUILT={}",
+    // tauri_build::build() validates that the `externalBin` sidecar exists
+    // at this target-triple-suffixed path in every profile, not just
+    // release, so it must always be staged here.
+    fs::create_dir_all(&binaries_dir).expect("failed to create binaries dir");
+    let staged_binary = staged_helper_binary_path(&binaries_dir, &target);
+    fs::copy(&built_binary, &staged_binary).unwrap_or_else(|error| {
+        panic!(
+            "failed to stage taglib-helper from {} to {}: {error}",
+            built_binary.display(),
             staged_binary.display()
-        );
-    } else {
-        println!(
-            "cargo:rustc-env=THMP5_TAGLIB_HELPER_BUILT={}",
-            built_binary.display()
-        );
-    }
+        )
+    });
+    println!(
+        "cargo:rustc-env=THMP5_TAGLIB_HELPER_BUILT={}",
+        staged_binary.display()
+    );
 }
 
 fn helper_binary_path(build_dir: &Path, target: &str) -> PathBuf {
