@@ -6,15 +6,14 @@ import {
   formatPomodoroDuration,
   type RecordingRow,
 } from "./pomodoro";
+import { parsePlayedAt } from "./autoDj";
 import { FAKE_NOW, ONE_DAY_MS, makeRecording } from "./testHelpers";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Parse a last_played ISO string to epoch ms, matching the internal helper. */
+/** Parse a last_played string to epoch ms, matching the internal helper. */
 function lpEpoch(lastPlayed: string | null): number | null {
-  if (lastPlayed === null) return null;
-  const t = new Date(lastPlayed).getTime();
-  return isNaN(t) ? null : t;
+  return lastPlayed === null ? null : parsePlayedAt(lastPlayed);
 }
 
 function mk(

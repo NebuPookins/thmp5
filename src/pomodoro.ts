@@ -8,6 +8,7 @@
 
 import {
   buildExclusionSet,
+  parsePlayedAt,
   type RecordingRow,
   type QueueItem,
 } from "./autoDj";
@@ -227,8 +228,8 @@ export function calculatePomodoroBatch(
     let lpMs: number | null = null;
     let isRecent = false;
     if (r.last_played !== null) {
-      const t = new Date(r.last_played).getTime();
-      if (isNaN(t)) {
+      const t = parsePlayedAt(r.last_played);
+      if (t === null) {
         // Malformed date: treat as recent (matches excludeRecentlyPlayed in autoDj.ts,
         // which filters out malformed dates from the "keep" set).
         isRecent = true;

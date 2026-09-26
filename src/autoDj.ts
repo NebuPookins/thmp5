@@ -67,6 +67,22 @@ export function buildExclusionSet(
   return exclude;
 }
 
+// SQLite's `datetime('now')` format: UTC, space-separated, no zone designator.
+const SQLITE_DATETIME = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+
+/**
+ * Parse a `last_played` timestamp into epoch ms, or null if malformed.
+ *
+ * The backend reports `play_history.played_at` verbatim, which SQLite stores
+ * as UTC in "YYYY-MM-DD HH:MM:SS" form. `Date` would parse that as *local*
+ * time (or reject it outright on some engines), so it is rewritten to an
+ * explicit-UTC ISO string first. Other formats are passed through to `Date`.
+ */
+export function parsePlayedAt(value: string): number | null {
+  const ms = Date.parse(SQLITE_DATETIME.test(value) ? `${value.replace(" ", "T")}Z` : value);
+  return Number.isNaN(ms) ? null : ms;
+}
+
 /**
  * Return the subset of `items` that were last played more than 24h ago
  * (or have never been played / have no timestamp).
@@ -78,8 +94,8 @@ export function excludeRecentlyPlayed(
   const cutoff = now - 86_400_000; // 24 hours in ms
   return items.filter((r) => {
     if (!r.last_played) return true; // never played → fine
-    const playedAt = new Date(r.last_played).getTime();
-    return !isNaN(playedAt) && playedAt < cutoff;
+    const playedAt = parsePlayedAt(r.last_played);
+    return playedAt !== null && playedAt < cutoff;
   });
 }
 

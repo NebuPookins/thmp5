@@ -4,8 +4,31 @@ import {
   excludeIds,
   pickByRatingStrategy,
   pickNextTrack,
+  parsePlayedAt,
 } from "./autoDj";
 import { FAKE_NOW, ONE_DAY_MS, makeRecording } from "./testHelpers";
+
+// ── parsePlayedAt ────────────────────────────────────────────────────────────
+
+/** Format epoch ms the way SQLite's datetime('now') stores play_history.played_at. */
+function toSqliteDatetime(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+}
+
+describe("parsePlayedAt", () => {
+  it("interprets SQLite datetime strings as UTC regardless of local timezone", () => {
+    expect(parsePlayedAt("2024-03-10 08:30:15")).toBe(Date.UTC(2024, 2, 10, 8, 30, 15));
+  });
+
+  it("parses ISO strings with an explicit zone", () => {
+    expect(parsePlayedAt("2024-03-10T08:30:15.000Z")).toBe(Date.UTC(2024, 2, 10, 8, 30, 15));
+  });
+
+  it("returns null for malformed input", () => {
+    expect(parsePlayedAt("not-a-date")).toBeNull();
+    expect(parsePlayedAt("")).toBeNull();
+  });
+});
 
 // ── excludeRecentlyPlayed ────────────────────────────────────────────────────
 
@@ -38,6 +61,18 @@ describe("excludeRecentlyPlayed", () => {
     // playedAt === cutoff → NOT < cutoff → excluded
     const result = excludeRecentlyPlayed([a], FAKE_NOW);
     expect(result).toEqual([]);
+  });
+
+  it("uses UTC for SQLite-format timestamps from the backend", () => {
+    const recent = makeRecording({
+      id: "recent",
+      last_played: toSqliteDatetime(FAKE_NOW - ONE_DAY_MS + 60_000),
+    });
+    const old = makeRecording({
+      id: "old",
+      last_played: toSqliteDatetime(FAKE_NOW - ONE_DAY_MS - 60_000),
+    });
+    expect(excludeRecentlyPlayed([recent, old], FAKE_NOW)).toEqual([old]);
   });
 
   it("handles malformed last_played gracefully", () => {
