@@ -1098,6 +1098,13 @@ fn apply_cmp(op: CmpOp, a: i64, b: i64) -> bool {
     }
 }
 
+/// Compare an averaged rating against a query's integer star value. The
+/// average is rounded to the nearest star first, so `Rating` and `AlbumRating`
+/// treat e.g. a 4.6 average as 5 stars consistently.
+fn cmp_avg_rating(op: CmpOp, avg: f64, stars: i64) -> bool {
+    apply_cmp(op, avg.round() as i64, stars)
+}
+
 fn match_str(op: StrOp, haystack: &str, needle: &str) -> bool {
     let h = haystack.to_lowercase();
     let n = needle.to_lowercase();
@@ -1137,15 +1144,11 @@ fn eval_pred(
 ) -> bool {
     match pred {
         Predicate::RatingNull => rec.avg_rating().is_none(),
-        Predicate::Rating(op, n) => rec
-            .avg_rating()
-            .map(|r| apply_cmp(*op, r.round() as i64, *n))
-            .unwrap_or(false),
+        Predicate::Rating(op, n) => rec.avg_rating().is_some_and(|r| cmp_avg_rating(*op, r, *n)),
         Predicate::AlbumRating(op, n) => rec.release_group_assocs.iter().any(|assoc| {
             rg_avg_ratings
                 .get(&assoc.rg_id)
-                .map(|&r| apply_cmp(*op, r as i64, *n))
-                .unwrap_or(false)
+                .is_some_and(|&r| cmp_avg_rating(*op, r, *n))
         }),
         Predicate::PlayCount(op, n) => apply_cmp(*op, rec.total_play_count(), *n),
         Predicate::LastPlayed(dir, n, unit) => {
@@ -1873,7 +1876,18 @@ fn pseudo_shuffle<T>(v: &mut [T], seed: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_predicted_rating, extract_artist_names};
+    use super::{cmp_avg_rating, compute_predicted_rating, extract_artist_names};
+    use crate::query::CmpOp;
+
+    #[test]
+    fn avg_rating_rounds_to_nearest_star() {
+        // An album averaging 4.8 stars is a 5-star album, not a 4-star one.
+        assert!(cmp_avg_rating(CmpOp::Eq, 4.8, 5));
+        assert!(cmp_avg_rating(CmpOp::Gte, 4.8, 5));
+        assert!(!cmp_avg_rating(CmpOp::Lt, 4.8, 5));
+        assert!(cmp_avg_rating(CmpOp::Eq, 4.4, 4));
+        assert!(cmp_avg_rating(CmpOp::Gt, 3.5, 3));
+    }
 
     #[test]
     fn single_artist_with_rating_no_album() {
