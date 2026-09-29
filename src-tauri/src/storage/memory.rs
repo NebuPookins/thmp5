@@ -557,7 +557,7 @@ impl MemoryCatalog {
                             .and_then(|(pos, _)| pos);
                         let disc_pos = tag_first(&source.tags, "TPOS")
                             .and_then(|s| s.split('/').next())
-                            .and_then(|s| s.trim().parse::<i64>().ok());
+                            .and_then(|s| s.trim_end_matches('\0').trim().parse::<i64>().ok());
                         let release_year = tag_first(&source.tags, "TDRC")
                             .or_else(|| tag_first(&source.tags, "TYER"))
                             .map(|s| s.chars().take(4).collect::<String>());
@@ -778,6 +778,8 @@ pub(crate) fn extract_artist_names(tags: &[(String, String)]) -> Vec<String> {
 
 /// Parse "N" or "N/M" track string; returns (position, total).
 fn parse_trck(s: &str) -> (Option<i64>, Option<i64>) {
+    // Some taggers write a trailing NUL byte (e.g. "2/50\0").
+    let s = s.trim_end_matches('\0');
     let mut parts = s.splitn(2, '/');
     let pos = parts.next().and_then(|p| p.trim().parse::<i64>().ok());
     let total = parts.next().and_then(|p| p.trim().parse::<i64>().ok());
@@ -785,7 +787,8 @@ fn parse_trck(s: &str) -> (Option<i64>, Option<i64>) {
 }
 
 fn parse_trck_total(s: &str) -> Option<i64> {
-    s.split_once('/')
+    s.trim_end_matches('\0')
+        .split_once('/')
         .and_then(|(_, p)| p.trim().parse::<i64>().ok())
 }
 
@@ -1873,6 +1876,12 @@ fn pseudo_shuffle<T>(v: &mut [T], seed: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_trck_tolerates_trailing_nul() {
+        assert_eq!(super::parse_trck("2/50\0"), (Some(2), Some(50)));
+        assert_eq!(super::parse_trck_total("2/50\0"), Some(50));
+    }
+
     use super::{compute_predicted_rating, extract_artist_names};
 
     #[test]
