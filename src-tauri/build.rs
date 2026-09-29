@@ -133,13 +133,17 @@ fn build_taglib_helper(manifest_dir: &Path) {
     // release, so it must always be staged here.
     fs::create_dir_all(&binaries_dir).expect("failed to create binaries dir");
     let staged_binary = staged_helper_binary_path(&binaries_dir, &target);
-    fs::copy(&built_binary, &staged_binary).unwrap_or_else(|error| {
-        panic!(
-            "failed to stage taglib-helper from {} to {}: {error}",
-            built_binary.display(),
-            staged_binary.display()
-        )
-    });
+    // tauri_build watches externalBin files, so rewriting an identical
+    // binary would bump its mtime and make every build dirty.
+    if !files_identical(&built_binary, &staged_binary) {
+        fs::copy(&built_binary, &staged_binary).unwrap_or_else(|error| {
+            panic!(
+                "failed to stage taglib-helper from {} to {}: {error}",
+                built_binary.display(),
+                staged_binary.display()
+            )
+        });
+    }
     println!(
         "cargo:rustc-env=THMP5_TAGLIB_HELPER_BUILT={}",
         staged_binary.display()
@@ -160,6 +164,10 @@ fn staged_helper_binary_path(binaries_dir: &Path, target: &str) -> PathBuf {
     } else {
         binaries_dir.join(format!("taglib-helper-{target}"))
     }
+}
+
+fn files_identical(a: &Path, b: &Path) -> bool {
+    matches!((fs::read(a), fs::read(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 fn run_command(command: &mut Command, description: &str) {
