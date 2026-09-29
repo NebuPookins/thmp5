@@ -32,3 +32,9 @@ npm run tauri dev    # dev mode with hot reload
 npm run tauri build  # production build
 cargo test           # run Rust unit tests
 ```
+
+## Where Things Live (don't re-search)
+- **User's library DB**: `~/.local/share/net.nebupookins.thmp5/library.db` (SQLite; inspect with `sqlite3`). Don't `find /` for it — that times out.
+  - `source` table: `file_path`, `track_total`, `raw_tags_json` (JSON array of `[frame_id, value]` pairs, e.g. `["TRCK","2/50\u0000"]`). Query e.g. `select file_path, raw_tags_json from source where raw_tags_json like '%<album title>%'`.
+  - Other tables: `play_history`, `playlist`, `playlist_track`, `source_rating`, `app_config`.
+- **Gotcha**: real-world ID3 values often carry a trailing `\0` (TRCK, TPOS, multi-value frames); always `trim_end_matches('\0')` before parsing numbers.

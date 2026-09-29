@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=thmp5
+GenericName=Music Player
+Comment=Music player with MusicBrainz-style recording, release, and artist modeling
+Exec=@ROOT@/scripts/launch.sh
+Path=@ROOT@
+Icon=net.nebupookins.thmp5
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;player;musicbrainz;playlist;
+StartupNotify=true
+StartupWMClass=Thmp5
