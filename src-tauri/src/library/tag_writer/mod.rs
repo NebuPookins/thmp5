@@ -26,22 +26,50 @@ pub struct TagWriteResult {
 /// Create a timestamped backup of the file at `path`.
 ///
 /// Returns the backup path, e.g. `/path/to/file.mp3.20260522-140431.thmp5bak`.
+/// The timestamp only has one-second resolution, so if that name is already
+/// taken (e.g. two edits within the same second) a numeric suffix is added
+/// (`...140431-1.thmp5bak`). An existing backup is never overwritten — it may
+/// be the only copy of the file's original tags.
 fn backup_file(path: &Path) -> Result<String> {
-    let timestamp = chrono_or_fallback();
-    let backup_name = format!(
-        "{}.{}.thmp5bak",
+    const MAX_ATTEMPTS: usize = 1000;
+    let stem = format!(
+        "{}.{}",
         path.file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| path.to_string_lossy()),
-        timestamp,
+        chrono_or_fallback(),
     );
-    let backup_path = path
-        .parent()
-        .map(|p| p.join(&backup_name))
-        .unwrap_or_else(|| Path::new(&backup_name).to_path_buf());
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let candidates = std::iter::once(format!("{stem}.thmp5bak"))
+        .chain((1..).map(|n| format!("{stem}-{n}.thmp5bak")))
+        .map(|name| dir.join(name))
+        .take(MAX_ATTEMPTS);
 
-    std::fs::copy(path, &backup_path).context("Failed to create backup file")?;
-    Ok(backup_path.to_string_lossy().to_string())
+    for backup_path in candidates {
+        match copy_to_new_file(path, &backup_path) {
+            Ok(()) => return Ok(backup_path.to_string_lossy().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).context("Failed to create backup file"),
+        }
+    }
+    bail!("Failed to create backup file: {MAX_ATTEMPTS} candidate names for {stem} already exist")
+}
+
+/// Copy `src` to `dest`, failing with `AlreadyExists` instead of overwriting
+/// if `dest` exists. A partially written `dest` is removed on failure.
+fn copy_to_new_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let mut dest_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    std::fs::File::open(src)
+        .and_then(|mut src_file| {
+            std::io::copy(&mut src_file, &mut dest_file)?;
+            dest_file.set_permissions(src_file.metadata()?.permissions())
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(dest);
+        })
 }
 
 /// Generate a timestamp string for the backup filename.
@@ -1138,6 +1166,27 @@ mod tests {
         // Backup should have same content as original
         let backup_data = std::fs::read(&backup_path).unwrap();
         assert_eq!(backup_data, data);
+    }
+
+    #[test]
+    fn test_backup_file_never_overwrites_existing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.mp3");
+        let original = synth_mp3(&[id3_frame(b"TIT2", b"\x03Original")]);
+        std::fs::write(&path, &original).unwrap();
+        let first = backup_file(&path).unwrap();
+
+        // Simulate an edit landing in the same second as the first backup.
+        let edited = synth_mp3(&[id3_frame(b"TIT2", b"\x03Edited")]);
+        std::fs::write(&path, &edited).unwrap();
+        let second = backup_file(&path).unwrap();
+        let third = backup_file(&path).unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_eq!(std::fs::read(&first).unwrap(), original);
+        assert_eq!(std::fs::read(&second).unwrap(), edited);
+        assert_eq!(std::fs::read(&third).unwrap(), edited);
     }
 
     // ── TXXX tests ─────────────────────────────────────────────────────────────
