@@ -47,7 +47,7 @@ hex = "0.4"
 walkdir = "2"
 
 # Metadata reading
-lofty = "0.22"
+lofty = "0.25"
 
 # Audio decoding (fingerprinting: decode to PCM for chromaprint)
 symphonia = { version = "0.5", features = ["all"] }

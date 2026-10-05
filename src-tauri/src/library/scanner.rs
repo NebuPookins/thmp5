@@ -786,43 +786,43 @@ fn read_metadata_with_lofty(path: &Path) -> Result<(TrackMetadata, Vec<Duplicate
         meta.title = tag.title().map(|s| s.into_owned());
         meta.artist = tag.artist().map(|s| s.into_owned());
         meta.album = tag.album().map(|s| s.into_owned());
-        meta.year = tag.year();
+        meta.year = tag.date().map(|d| u32::from(d.year));
         meta.track_number = tag.track();
         meta.track_total = tag.track_total();
         meta.disc_number = tag.disk();
 
         // Album artist (not in the Accessor trait; use the tag item key)
         meta.album_artist = tag
-            .get_string(&ItemKey::AlbumArtist)
+            .get_string(ItemKey::AlbumArtist)
             .map(ToString::to_string);
 
         meta.genre = tag.genre().map(|s| s.into_owned());
         meta.comment = tag.comment().map(|s| s.into_owned());
         meta.bpm = tag
-            .get_string(&ItemKey::Bpm)
+            .get_string(ItemKey::Bpm)
             .and_then(|s| s.trim().parse().ok());
         meta.replay_gain_track_db = tag
-            .get_string(&ItemKey::ReplayGainTrackGain)
+            .get_string(ItemKey::ReplayGainTrackGain)
             .and_then(|s| s.trim().trim_end_matches("dB").trim().parse().ok());
         meta.replay_gain_track_peak = tag
-            .get_string(&ItemKey::ReplayGainTrackPeak)
+            .get_string(ItemKey::ReplayGainTrackPeak)
             .and_then(|s| s.trim().parse().ok());
         meta.replay_gain_album_db = tag
-            .get_string(&ItemKey::ReplayGainAlbumGain)
+            .get_string(ItemKey::ReplayGainAlbumGain)
             .and_then(|s| s.trim().trim_end_matches("dB").trim().parse().ok());
         meta.replay_gain_album_peak = tag
-            .get_string(&ItemKey::ReplayGainAlbumPeak)
+            .get_string(ItemKey::ReplayGainAlbumPeak)
             .and_then(|s| s.trim().parse().ok());
 
         // TXXX=ARTISTS / TrackArtists — semicolon-separated additional artists
-        let artists_values: Vec<&str> = tag.get_strings(&ItemKey::TrackArtists).collect();
+        let artists_values: Vec<&str> = tag.get_strings(ItemKey::TrackArtists).collect();
         if !artists_values.is_empty() {
             meta.artists = Some(artists_values.join("; "));
         }
 
         // MusicBrainz Recording ID from UFID:http://musicbrainz.org
         meta.recording_mbid = tag
-            .get_string(&ItemKey::MusicBrainzTrackId)
+            .get_string(ItemKey::MusicBrainzTrackId)
             .map(|s| s.to_string());
     }
 
@@ -1096,7 +1096,7 @@ fn list_all_tags_with_lofty(path: &Path) -> Result<Vec<crate::models::SourceTagI
             value: v.into_owned(),
         });
     }
-    if let Some(v) = tag.year() {
+    if let Some(v) = tag.date().map(|d| d.year) {
         tags.push(crate::models::SourceTagInfo {
             frame_id: "TYER".into(),
             field_name: "year".into(),
@@ -1159,7 +1159,7 @@ fn list_all_tags_with_lofty(path: &Path) -> Result<Vec<crate::models::SourceTagI
         ("copyright_url", ItemKey::CopyrightUrl),
         ("original_release_date", ItemKey::OriginalReleaseDate),
     ] {
-        if let Some(v) = tag.get_string(&field_key) {
+        if let Some(v) = tag.get_string(field_key) {
             tags.push(crate::models::SourceTagInfo {
                 frame_id: key_name.to_string(),
                 field_name: key_name.to_string(),
