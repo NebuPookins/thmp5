@@ -9,8 +9,8 @@ use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 #[cfg(feature = "opus")]
 use opus::Decoder as OpusDecoder;
+use rtrb::{Consumer, Producer, RingBuffer};
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::fs::File;
 
 use std::path::Path;
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, O
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::{well_known::CODEC_ID_OPUS, AudioCodecId};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -33,6 +33,8 @@ pub const PLAYER_ERROR_EVENT: &str = "player-error";
 
 const PREBUFFER_FRAMES: usize = 8_192;
 const MAX_BUFFER_FRAMES: usize = 96_000;
+/// How often the engine thread drains and reports the callback's health counters.
+const DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Playback status codes used with `AtomicU8` in `AudioCallbackCtx`.
 const STATUS_STOPPED: u8 = 0;
@@ -96,8 +98,10 @@ pub enum LastFmAction {
 
 /// Lock-free state accessible from the real-time cpal audio callback.
 /// The engine thread writes hot-path fields through atomics; the callback
-/// reads them without acquiring `SharedState`'s mutex.  The `current_track`
-/// buffer is accessed via `try_lock` with a silence fallback.
+/// reads them without acquiring `SharedState`'s mutex.  Samples travel from the
+/// decoder thread to the callback through a lock-free SPSC ring buffer; the
+/// `current_track` handle itself is only touched via `try_lock` (once per
+/// callback) and is contended only while a track is being swapped.
 struct AudioCallbackCtx {
     status: AtomicU8,
     volume: AtomicU32,
@@ -114,7 +118,10 @@ struct AudioCallbackCtx {
     track_duration_ms: AtomicU64,
     /// The track buffer – engine thread writes via `lock()`, callback
     /// reads via `try_lock()`, falling back to silence on contention.
-    current_track: Mutex<Option<Arc<Mutex<TrackBuffer>>>>,
+    current_track: Mutex<Option<Arc<TrackBuffer>>>,
+    /// Real-time health counters, written by the callback and drained by the
+    /// engine thread (see `AudioDiagnostics`).
+    diagnostics: AudioDiagnostics,
     /// Set to true by the cpal stream error callback to signal the engine
     /// thread that the output device died and needs to be rebuilt.
     stream_rebuild_needed: AtomicBool,
@@ -145,6 +152,7 @@ impl AudioCallbackCtx {
             track_duration_ms: AtomicU64::new(0),
             stream_rebuild_needed: AtomicBool::new(false),
             current_track: Mutex::new(None),
+            diagnostics: AudioDiagnostics::default(),
             current_source_id: Mutex::new(None),
             position_tx,
             state_tx,
@@ -216,6 +224,7 @@ impl AudioEngineHandle {
             .spawn(move || {
                 let mut stream: Option<cpal::Stream> = None;
                 let events = Some(events);
+                let mut last_diagnostics_report = Instant::now();
                 tracing::info!("Audio engine thread started");
 
                 loop {
@@ -245,6 +254,11 @@ impl AudioEngineHandle {
                         }
                         Err(RecvTimeoutError::Timeout) => { /* drain events below */ }
                         Err(RecvTimeoutError::Disconnected) => break,
+                    }
+
+                    if last_diagnostics_report.elapsed() >= DIAGNOSTICS_INTERVAL {
+                        last_diagnostics_report = Instant::now();
+                        report_diagnostics(command_ctx.diagnostics.take());
                     }
 
                     // Drain event channels from the cpal callback.
@@ -403,9 +417,7 @@ impl SharedState {
     fn stop_decoder(&self, ctx: &AudioCallbackCtx) {
         if let Ok(track) = ctx.current_track.lock() {
             if let Some(buffer) = track.as_ref() {
-                if let Ok(buf) = buffer.lock() {
-                    buf.stop_requested.store(true, Ordering::Release);
-                }
+                buffer.stop_requested.store(true, Ordering::Release);
             }
         }
     }
@@ -431,28 +443,96 @@ impl SharedState {
     }
 }
 
+/// Counters the audio callback bumps and the engine thread periodically drains and logs.
+/// Logging from the callback itself would allocate and take locks, which a real-time thread
+/// must not do.
+#[derive(Default)]
+struct AudioDiagnostics {
+    callbacks: AtomicU64,
+    /// Callbacks that output silence because the track handle or its consumer was locked.
+    lock_misses: AtomicU64,
+    /// Times a playing track ran dry and fell back to `Loading`.
+    underruns: AtomicU64,
+    /// Errors the audio backend reported as buffer under/overruns.
+    backend_xruns: AtomicU64,
+    max_callback_us: AtomicU64,
+    max_callback_frames: AtomicU64,
+}
+
+/// A point-in-time copy of `AudioDiagnostics`, with every counter reset by taking it.
+#[derive(Debug, PartialEq, Eq)]
+struct DiagnosticsSnapshot {
+    callbacks: u64,
+    lock_misses: u64,
+    underruns: u64,
+    backend_xruns: u64,
+    max_callback_us: u64,
+    max_callback_frames: u64,
+}
+
+impl AudioDiagnostics {
+    fn take(&self) -> DiagnosticsSnapshot {
+        DiagnosticsSnapshot {
+            callbacks: self.callbacks.swap(0, Ordering::Relaxed),
+            lock_misses: self.lock_misses.swap(0, Ordering::Relaxed),
+            underruns: self.underruns.swap(0, Ordering::Relaxed),
+            backend_xruns: self.backend_xruns.swap(0, Ordering::Relaxed),
+            max_callback_us: self.max_callback_us.swap(0, Ordering::Relaxed),
+            max_callback_frames: self.max_callback_frames.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+impl DiagnosticsSnapshot {
+    /// Whether anything audible (or nearly so) happened in the window.
+    fn has_glitches(&self) -> bool {
+        self.lock_misses > 0 || self.underruns > 0 || self.backend_xruns > 0
+    }
+}
+
+/// The callback's side of a track's sample pipe. The decoder thread owns the matching
+/// `Producer`, so the two sides never share a lock.
 struct TrackBuffer {
-    samples: VecDeque<f32>,
-    finished: bool,
+    /// Locked only by the audio callback, so it is uncontended in practice.
+    consumer: Mutex<Consumer<f32>>,
+    /// Set by the decoder (with `Release`) after its last sample has been pushed.
+    finished: AtomicBool,
     stop_requested: AtomicBool,
 }
 
 impl TrackBuffer {
-    fn new() -> Self {
-        Self {
-            samples: VecDeque::new(),
-            finished: false,
+    /// Creates a track buffer holding up to `capacity_frames` frames of `channels` samples each,
+    /// returning the callback-side handle and the decoder-side producer.
+    fn new(capacity_frames: usize, channels: usize) -> (Arc<Self>, Producer<f32>) {
+        let (producer, consumer) = RingBuffer::new(capacity_frames * channels.max(1));
+        let buffer = Arc::new(Self {
+            consumer: Mutex::new(consumer),
+            finished: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
-        }
+        });
+        (buffer, producer)
     }
+}
 
-    fn buffered_frames(&self, channels: usize) -> usize {
-        if channels == 0 {
-            return 0;
+/// Pushes every sample into the ring, waiting for the callback to drain it when full.
+/// Returns `false` (dropping the remainder) if the track was asked to stop meanwhile.
+fn push_samples(producer: &mut Producer<f32>, buffer: &TrackBuffer, mut samples: &[f32]) -> bool {
+    while !samples.is_empty() {
+        if buffer.stop_requested.load(Ordering::Acquire) {
+            return false;
         }
-
-        self.samples.len() / channels
+        let n = producer.slots().min(samples.len());
+        if n == 0 {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let (now, rest) = samples.split_at(n);
+        if let Ok(chunk) = producer.write_chunk_uninit(n) {
+            chunk.fill_from_iter(now.iter().copied());
+        }
+        samples = rest;
     }
+    true
 }
 
 fn handle_command(
@@ -578,7 +658,7 @@ fn start_playback(
     let source = LocalFileSource::open(Path::new(&request.file_path))
         .with_context(|| format!("Failed to open {}", request.file_path))?;
 
-    let buffer = Arc::new(Mutex::new(TrackBuffer::new()));
+    let (buffer, producer) = TrackBuffer::new(MAX_BUFFER_FRAMES, usize::from(output_channels));
     let duration_ms = request.duration_ms.unwrap_or(source.duration_ms);
     let current_output_position = start_ms.saturating_mul(u64::from(output_rate)) / 1000;
 
@@ -637,6 +717,7 @@ fn start_playback(
         output_rate,
         output_channels,
         buffer,
+        producer,
         app.clone(),
     );
 
@@ -648,7 +729,8 @@ fn spawn_decoder_thread(
     start_ms: u64,
     output_rate: u32,
     output_channels: u16,
-    buffer: Arc<Mutex<TrackBuffer>>,
+    buffer: Arc<TrackBuffer>,
+    producer: Producer<f32>,
     app: AppHandle,
 ) {
     thread::Builder::new()
@@ -659,11 +741,10 @@ fn spawn_decoder_thread(
                 start_ms,
                 output_rate,
                 output_channels,
-                Arc::clone(&buffer),
+                &buffer,
+                producer,
             ) {
-                if let Ok(mut state) = buffer.lock() {
-                    state.finished = true;
-                }
+                buffer.finished.store(true, Ordering::Release);
                 emit_error(&app, error.to_string());
             }
         })
@@ -675,7 +756,8 @@ fn decode_into_buffer(
     start_ms: u64,
     output_rate: u32,
     output_channels: u16,
-    buffer: Arc<Mutex<TrackBuffer>>,
+    buffer: &TrackBuffer,
+    mut producer: Producer<f32>,
 ) -> Result<()> {
     tracing::info!(
         start_ms,
@@ -699,55 +781,50 @@ fn decode_into_buffer(
     );
 
     loop {
-        let state = buffer
-            .lock()
-            .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
-
-        if state.stop_requested.load(Ordering::Acquire) {
+        if buffer.stop_requested.load(Ordering::Acquire) {
             tracing::info!("Decoder worker stopping early");
             return Ok(());
         }
-
-        if state.buffered_frames(output_channels as usize) >= MAX_BUFFER_FRAMES {
-            drop(state);
-            thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-
-        drop(state);
 
         match source.decode_next()? {
             None => break,
             Some(input) => {
                 let output = resampler.push(&input);
-                if !output.is_empty() {
-                    let mut state = buffer
-                        .lock()
-                        .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
-                    if state.stop_requested.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    state.samples.extend(output);
+                if !push_samples(&mut producer, buffer, &output) {
+                    return Ok(());
                 }
             }
         }
     }
 
     let tail = resampler.finish();
-    if !tail.is_empty() {
-        let mut state = buffer
-            .lock()
-            .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
-        state.samples.extend(tail);
+    if !push_samples(&mut producer, buffer, &tail) {
+        return Ok(());
     }
-    {
-        let mut state = buffer
-            .lock()
-            .map_err(|_| anyhow!("Track buffer lock poisoned"))?;
-        state.finished = true;
-    }
+    buffer.finished.store(true, Ordering::Release);
     tracing::info!("Decoder worker finished");
     Ok(())
+}
+
+fn report_diagnostics(snapshot: DiagnosticsSnapshot) {
+    if snapshot.has_glitches() {
+        tracing::warn!(
+            callbacks = snapshot.callbacks,
+            lock_misses = snapshot.lock_misses,
+            underruns = snapshot.underruns,
+            backend_xruns = snapshot.backend_xruns,
+            max_callback_us = snapshot.max_callback_us,
+            max_callback_frames = snapshot.max_callback_frames,
+            "Audio callback glitches in the last interval"
+        );
+    } else if snapshot.callbacks > 0 {
+        tracing::debug!(
+            callbacks = snapshot.callbacks,
+            max_callback_us = snapshot.max_callback_us,
+            max_callback_frames = snapshot.max_callback_frames,
+            "Audio callback healthy"
+        );
+    }
 }
 
 fn emit_error(app: &AppHandle, message: String) {
@@ -932,6 +1009,32 @@ fn try_build_stream(
     Ok(output_stream)
 }
 
+/// Whether the stream is dead after a backend error of this kind. Glitch reports and
+/// notifications that the stream survived must not tear it down, since rebuilding audibly
+/// interrupts playback far longer than the glitch being reported.
+fn requires_stream_rebuild(kind: cpal::ErrorKind) -> bool {
+    !matches!(
+        kind,
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied | cpal::ErrorKind::DeviceChanged
+    )
+}
+
+fn handle_stream_error(ctx: &AudioCallbackCtx, app: &AppHandle, error: &cpal::Error) {
+    let kind = error.kind();
+    if kind == cpal::ErrorKind::Xrun {
+        ctx.diagnostics
+            .backend_xruns
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if requires_stream_rebuild(kind) {
+        ctx.stream_rebuild_needed.store(true, Ordering::Release);
+        emit_error(app, format!("Audio stream error: {error}"));
+    } else {
+        tracing::warn!(%error, "Audio stream reported a non-fatal condition");
+    }
+}
+
 fn device_name(device: &cpal::Device) -> String {
     device
         .description()
@@ -988,10 +1091,7 @@ fn build_output_stream(
                 .build_output_stream(
                     config,
                     move |data: &mut [f32], _| write_output_data_f32(data, &ctx_ref),
-                    move |error| {
-                        err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
-                        emit_error(&app_for_err, format!("Audio stream error: {error}"));
-                    },
+                    move |error| handle_stream_error(&err_ctx, &app_for_err, &error),
                     None,
                 )
                 .context("Failed to build f32 output stream")
@@ -1004,10 +1104,7 @@ fn build_output_stream(
                 .build_output_stream(
                     config,
                     move |data: &mut [i16], _| write_output_data_i16(data, &ctx_ref),
-                    move |error| {
-                        err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
-                        emit_error(&app_for_err, format!("Audio stream error: {error}"));
-                    },
+                    move |error| handle_stream_error(&err_ctx, &app_for_err, &error),
                     None,
                 )
                 .context("Failed to build i16 output stream")
@@ -1020,10 +1117,7 @@ fn build_output_stream(
                 .build_output_stream(
                     config,
                     move |data: &mut [u16], _| write_output_data_u16(data, &ctx_ref),
-                    move |error| {
-                        err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
-                        emit_error(&app_for_err, format!("Audio stream error: {error}"));
-                    },
+                    move |error| handle_stream_error(&err_ctx, &app_for_err, &error),
                     None,
                 )
                 .context("Failed to build u16 output stream")
@@ -1053,96 +1147,112 @@ where
     T: Copy,
     F: Fn(f32) -> T,
 {
-    let output_channels = ctx.output_channels.load(Ordering::Relaxed) as usize;
+    let started = Instant::now();
+    fill_output(output, ctx, &convert);
+
+    let diagnostics = &ctx.diagnostics;
+    let channels = usize::from(ctx.output_channels.load(Ordering::Relaxed)).max(1);
+    diagnostics.callbacks.fetch_add(1, Ordering::Relaxed);
+    diagnostics.max_callback_us.fetch_max(
+        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    diagnostics.max_callback_frames.fetch_max(
+        u64::try_from(output.len() / channels).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+fn fill_output<T, F>(output: &mut [T], ctx: &AudioCallbackCtx, convert: &F)
+where
+    T: Copy,
+    F: Fn(f32) -> T,
+{
+    let silence = convert(0.0);
+    let output_channels = usize::from(ctx.output_channels.load(Ordering::Relaxed));
     if output_channels == 0 {
-        for s in output.iter_mut() {
-            *s = convert(0.0);
-        }
+        output.fill(silence);
         return;
     }
 
+    // Take the track handle and its consumer once per callback rather than once per frame. They
+    // are contended only while the engine thread swaps tracks, in which case this whole callback
+    // is silence rather than a click-inducing scatter of dropped frames.
+    let track = match ctx.current_track.try_lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(track) => Arc::clone(track),
+            None => {
+                output.fill(silence);
+                return;
+            }
+        },
+        Err(_) => {
+            ctx.diagnostics.lock_misses.fetch_add(1, Ordering::Relaxed);
+            output.fill(silence);
+            return;
+        }
+    };
+    let mut consumer = match track.consumer.try_lock() {
+        Ok(consumer) => consumer,
+        Err(_) => {
+            ctx.diagnostics.lock_misses.fetch_add(1, Ordering::Relaxed);
+            output.fill(silence);
+            return;
+        }
+    };
+
     let mut emitted_pos = false;
+    let mut track_ended = false;
 
     for frame in output.chunks_mut(output_channels) {
-        let vol = {
-            let user_vol = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
-            if ctx.normalization_enabled.load(Ordering::Relaxed) {
-                let norm = f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed));
-                user_vol * norm
-            } else {
-                user_vol
-            }
-        };
+        if track_ended {
+            frame.fill(silence);
+            continue;
+        }
+
         let status = ctx.status.load(Ordering::Relaxed);
-        // Try to acquire the current track buffer without blocking.
-        let track_buffer = match ctx.current_track.try_lock() {
-            Ok(guard) => match guard.as_ref() {
-                Some(buf) => Arc::clone(buf),
-                None => {
-                    for s in frame.iter_mut() {
-                        *s = convert(0.0);
-                    }
-                    continue;
-                }
-            },
-            Err(_) => {
-                // Contended — play silence rather than blocking the audio thread.
-                for s in frame.iter_mut() {
-                    *s = convert(0.0);
-                }
-                continue;
-            }
-        };
-
-        let mut buffer = match track_buffer.try_lock() {
-            Ok(buf) => buf,
-            Err(_) => {
-                for s in frame.iter_mut() {
-                    *s = convert(0.0);
-                }
-                continue;
-            }
-        };
-
-        if status == STATUS_PAUSED {
-            for s in frame.iter_mut() {
-                *s = convert(0.0);
-            }
+        if status != STATUS_PLAYING && status != STATUS_LOADING {
+            frame.fill(silence);
             continue;
         }
 
-        let ready_frames = buffer.buffered_frames(output_channels);
+        // `finished` must be read before the ring's fill level: the decoder pushes its tail
+        // and only then sets `finished`, so seeing both "finished" and "empty" in this order
+        // means nothing more can arrive.
+        let finished = track.finished.load(Ordering::Acquire);
+        let ready_frames = consumer.slots() / output_channels;
 
-        // Transition from Loading → Playing once we have enough data.
-        if status == STATUS_LOADING
-            && (ready_frames >= PREBUFFER_FRAMES || (buffer.finished && ready_frames > 0))
-        {
-            drop(buffer);
-            ctx.status.store(STATUS_PLAYING, Ordering::Release);
-            let _ = ctx.state_tx.send(PlayerState {
-                status: PlaybackStatus::Playing,
-                source_id: ctx
-                    .current_source_id
-                    .try_lock()
-                    .ok()
-                    .and_then(|r| r.clone()),
-                title: None,
-                artist: None,
-                duration_ms: Some(ctx.track_duration_ms.load(Ordering::Relaxed)).filter(|&d| d > 0),
-                position_ms: ctx.position_ms(),
-                volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
-                normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
-                normalization_gain: f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
-                normalization_source: String::new(),
-            });
-            for s in frame.iter_mut() {
-                *s = convert(0.0);
+        if status == STATUS_LOADING {
+            // Transition from Loading → Playing once we have enough data. Until then, play
+            // silence and leave the buffered samples (and the position) untouched.
+            if ready_frames >= PREBUFFER_FRAMES || (finished && ready_frames > 0) {
+                ctx.status.store(STATUS_PLAYING, Ordering::Release);
+                let _ = ctx.state_tx.send(PlayerState {
+                    status: PlaybackStatus::Playing,
+                    source_id: ctx
+                        .current_source_id
+                        .try_lock()
+                        .ok()
+                        .and_then(|r| r.clone()),
+                    title: None,
+                    artist: None,
+                    duration_ms: Some(ctx.track_duration_ms.load(Ordering::Relaxed))
+                        .filter(|&d| d > 0),
+                    position_ms: ctx.position_ms(),
+                    volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+                    normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
+                    normalization_gain: f32::from_bits(
+                        ctx.normalization_gain.load(Ordering::Relaxed),
+                    ),
+                    normalization_source: String::new(),
+                });
             }
+            frame.fill(silence);
             continue;
         }
 
-        if status == STATUS_PLAYING && ready_frames == 0 {
-            if buffer.finished {
+        if ready_frames == 0 {
+            if finished {
                 // Track ended naturally – notify engine thread and clear state.
                 let ended = TrackEndedEvent {
                     source_id: ctx
@@ -1153,11 +1263,7 @@ where
                         .unwrap_or_default(),
                     position_ms: ctx.position_ms(),
                 };
-                // We're holding the TrackBuffer lock, but stop_requested is
-                // an AtomicBool so the decoder can check it independently.
-                buffer.stop_requested.store(true, Ordering::Release);
-                drop(buffer);
-                // Clear callback-side track state.
+                track.stop_requested.store(true, Ordering::Release);
                 ctx.status.store(STATUS_STOPPED, Ordering::Release);
                 if let Ok(mut t) = ctx.current_track.try_lock() {
                     *t = None;
@@ -1167,36 +1273,41 @@ where
                 }
                 ctx.track_duration_ms.store(0, Ordering::Relaxed);
                 let _ = ctx.track_ended_tx.send(ended);
-                for s in frame.iter_mut() {
-                    *s = convert(0.0);
-                }
-                break;
+                track_ended = true;
+            } else {
+                // Buffer underrun – go back to Loading.
+                ctx.diagnostics.underruns.fetch_add(1, Ordering::Relaxed);
+                ctx.status.store(STATUS_LOADING, Ordering::Release);
+                let _ = ctx.state_tx.send(PlayerState {
+                    status: PlaybackStatus::Loading,
+                    source_id: None,
+                    title: None,
+                    artist: None,
+                    duration_ms: None,
+                    position_ms: ctx.position_ms(),
+                    volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+                    normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
+                    normalization_gain: f32::from_bits(
+                        ctx.normalization_gain.load(Ordering::Relaxed),
+                    ),
+                    normalization_source: String::new(),
+                });
             }
-
-            // Buffer underrun – go back to Loading.
-            drop(buffer);
-            ctx.status.store(STATUS_LOADING, Ordering::Release);
-            let _ = ctx.state_tx.send(PlayerState {
-                status: PlaybackStatus::Loading,
-                source_id: None,
-                title: None,
-                artist: None,
-                duration_ms: None,
-                position_ms: ctx.position_ms(),
-                volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
-                normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
-                normalization_gain: f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
-                normalization_source: String::new(),
-            });
-            for s in frame.iter_mut() {
-                *s = convert(0.0);
-            }
+            frame.fill(silence);
             continue;
         }
 
-        // Read and convert samples.
+        let vol = {
+            let user_vol = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
+            if ctx.normalization_enabled.load(Ordering::Relaxed) {
+                let norm = f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed));
+                user_vol * norm
+            } else {
+                user_vol
+            }
+        };
         for s in frame.iter_mut() {
-            let raw = buffer.samples.pop_front().unwrap_or(0.0) * vol;
+            let raw = consumer.pop().unwrap_or(0.0) * vol;
             *s = convert(raw);
         }
 
@@ -1742,5 +1853,146 @@ mod tests {
         let source = source_result.unwrap();
         assert!(source.sample_rate > 0, "sample_rate should be set");
         assert!(source.channels > 0, "channels should be set");
+    }
+
+    const TEST_CHANNELS: usize = 2;
+
+    struct CallbackHarness {
+        ctx: AudioCallbackCtx,
+        track: Arc<TrackBuffer>,
+        producer: Producer<f32>,
+        track_ended: mpsc::Receiver<TrackEndedEvent>,
+    }
+
+    impl CallbackHarness {
+        fn new(status: u8) -> Self {
+            let (ptx, _prx) = mpsc::channel();
+            let (stx, _srx) = mpsc::channel();
+            let (ttx, track_ended) = mpsc::channel();
+            let ctx = AudioCallbackCtx::new(48_000, 2, ptx, stx, ttx);
+            let (track, producer) = TrackBuffer::new(1_000, TEST_CHANNELS);
+            *ctx.current_track.lock().unwrap() = Some(Arc::clone(&track));
+            ctx.status.store(status, Ordering::Release);
+            Self {
+                ctx,
+                track,
+                producer,
+                track_ended,
+            }
+        }
+
+        /// Pushes `frames` frames whose samples count up from `first`.
+        fn push_ramp(&mut self, first: usize, frames: usize) {
+            let samples: Vec<f32> = (first..first + frames * TEST_CHANNELS)
+                .map(|i| i as f32)
+                .collect();
+            assert!(push_samples(&mut self.producer, &self.track, &samples));
+        }
+
+        fn finish(&self) {
+            self.track.finished.store(true, Ordering::Release);
+        }
+
+        fn render(&self, frames: usize) -> Vec<f32> {
+            let mut out = vec![f32::NAN; frames * TEST_CHANNELS];
+            write_output_data(&mut out, &self.ctx, |s| s);
+            out
+        }
+    }
+
+    #[test]
+    fn playing_track_outputs_pushed_samples_in_order() {
+        let mut h = CallbackHarness::new(STATUS_PLAYING);
+        h.push_ramp(1, 4);
+        let out = h.render(4);
+        assert_eq!(out, (1..=8).map(|i| i as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn loading_track_with_too_little_data_is_silent_and_loses_nothing() {
+        let mut h = CallbackHarness::new(STATUS_LOADING);
+        h.push_ramp(1, 4);
+
+        assert!(h.render(8).iter().all(|&s| s == 0.0));
+        assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_LOADING);
+
+        h.finish();
+        let out = h.render(8);
+        let audible: Vec<f32> = out.iter().copied().filter(|&s| s != 0.0).collect();
+        assert_eq!(audible, (1..=8).map(|i| i as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn starved_playing_track_reports_underrun_and_returns_to_loading() {
+        let h = CallbackHarness::new(STATUS_PLAYING);
+        assert!(h.render(8).iter().all(|&s| s == 0.0));
+        assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_LOADING);
+        assert_eq!(h.ctx.diagnostics.take().underruns, 1);
+    }
+
+    #[test]
+    fn finished_track_plays_its_tail_then_signals_end_with_silence_after() {
+        let mut h = CallbackHarness::new(STATUS_PLAYING);
+        h.push_ramp(1, 3);
+        h.finish();
+
+        let out = h.render(8);
+        assert_eq!(&out[..6], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(out[6..].iter().all(|&s| s == 0.0));
+        assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_STOPPED);
+        assert!(h.track_ended.try_recv().is_ok());
+        assert!(h.track_ended.try_recv().is_err(), "end is signalled once");
+    }
+
+    #[test]
+    fn contended_track_handle_yields_silent_callback_and_is_counted() {
+        let mut h = CallbackHarness::new(STATUS_PLAYING);
+        h.push_ramp(1, 4);
+        let held = h.ctx.current_track.lock().unwrap();
+        assert!(h.render(4).iter().all(|&s| s == 0.0));
+        drop(held);
+        assert_eq!(h.ctx.diagnostics.take().lock_misses, 1);
+
+        assert_eq!(h.render(1), vec![1.0, 2.0], "samples were not consumed");
+    }
+
+    #[test]
+    fn push_samples_waits_for_the_consumer_and_delivers_everything() {
+        let (track, mut producer) = TrackBuffer::new(4, 1);
+        let expected: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        let sent = expected.clone();
+        let sender_track = Arc::clone(&track);
+        let sender = thread::spawn(move || push_samples(&mut producer, &sender_track, &sent));
+
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            if let Ok(sample) = track.consumer.lock().unwrap().pop() {
+                received.push(sample);
+            }
+        }
+        assert!(sender.join().unwrap());
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn push_samples_gives_up_when_stop_is_requested_while_full() {
+        let (track, mut producer) = TrackBuffer::new(2, 1);
+        track.stop_requested.store(true, Ordering::Release);
+        assert!(!push_samples(&mut producer, &track, &[0.0; 10]));
+    }
+
+    #[test]
+    fn glitch_reports_do_not_force_a_stream_rebuild() {
+        assert!(!requires_stream_rebuild(cpal::ErrorKind::Xrun));
+        assert!(!requires_stream_rebuild(cpal::ErrorKind::RealtimeDenied));
+        assert!(requires_stream_rebuild(cpal::ErrorKind::DeviceNotAvailable));
+    }
+
+    #[test]
+    fn taking_diagnostics_resets_them() {
+        let diagnostics = AudioDiagnostics::default();
+        diagnostics.underruns.fetch_add(2, Ordering::Relaxed);
+        assert!(diagnostics.take().has_glitches());
+        assert!(!diagnostics.take().has_glitches());
     }
 }
