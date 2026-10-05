@@ -987,7 +987,10 @@ fn try_build_stream(
     app: AppHandle,
 ) -> Result<cpal::Stream> {
     let (device, supported_config) = select_output_device(host)?;
-    let stream_config = supported_config.config();
+    let stream_config = cpal::StreamConfig {
+        buffer_size: output_buffer_size(supported_config.buffer_size()),
+        ..supported_config.config()
+    };
     let device_name = device_name(&device);
     tracing::info!(
         device = %device_name,
@@ -1002,7 +1005,13 @@ fn try_build_stream(
     ctx.output_channels
         .store(stream_config.channels, Ordering::Relaxed);
 
-    let output_stream = build_output_stream(&device, &supported_config, Arc::clone(ctx), app)?;
+    let output_stream = build_output_stream(
+        &device,
+        &stream_config,
+        supported_config.sample_format(),
+        Arc::clone(ctx),
+        app,
+    )?;
     output_stream
         .play()
         .context("Failed to start output stream")?;
@@ -1074,22 +1083,35 @@ fn select_output_device(host: &cpal::Host) -> Result<(cpal::Device, cpal::Suppor
     Err(anyhow!("No usable output audio device is available"))
 }
 
+/// Frames per output callback we ask for. A pause or stop only takes effect at the next callback,
+/// so this bounds how long audio keeps playing after the command; some backends (the ALSA JACK
+/// plugin) otherwise default to 65536-frame callbacks, i.e. ~1.4 s at 48 kHz.
+const TARGET_CALLBACK_FRAMES: cpal::FrameCount = 2_048;
+
+fn output_buffer_size(supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match supported {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed(TARGET_CALLBACK_FRAMES.clamp(*min, *max))
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    }
+}
+
 fn build_output_stream(
     device: &cpal::Device,
-    supported_config: &cpal::SupportedStreamConfig,
+    config: &cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
     ctx: Arc<AudioCallbackCtx>,
     app: AppHandle,
 ) -> Result<cpal::Stream> {
-    let config = supported_config.config();
-
-    match supported_config.sample_format() {
+    match sample_format {
         cpal::SampleFormat::F32 => {
             let ctx_ref = Arc::clone(&ctx);
             let err_ctx = Arc::clone(&ctx);
             let app_for_err = app.clone();
             device
                 .build_output_stream(
-                    config,
+                    *config,
                     move |data: &mut [f32], _| write_output_data_f32(data, &ctx_ref),
                     move |error| handle_stream_error(&err_ctx, &app_for_err, &error),
                     None,
@@ -1102,7 +1124,7 @@ fn build_output_stream(
             let app_for_err = app.clone();
             device
                 .build_output_stream(
-                    config,
+                    *config,
                     move |data: &mut [i16], _| write_output_data_i16(data, &ctx_ref),
                     move |error| handle_stream_error(&err_ctx, &app_for_err, &error),
                     None,
@@ -1115,7 +1137,7 @@ fn build_output_stream(
             let app_for_err = app.clone();
             device
                 .build_output_stream(
-                    config,
+                    *config,
                     move |data: &mut [u16], _| write_output_data_u16(data, &ctx_ref),
                     move |error| handle_stream_error(&err_ctx, &app_for_err, &error),
                     None,
