@@ -1,11 +1,13 @@
-use crate::audio_probe::{id3v2_end_offset, open_wave_mp3_payload, probe_media_source};
+use crate::audio_probe::{
+    default_audio_track, id3v2_end_offset, make_audio_decoder, open_wave_mp3_payload,
+    probe_media_source,
+};
 use anyhow::{anyhow, Context, Result};
 #[cfg(feature = "opus")]
 use opus::Decoder as OpusDecoder;
 use std::fs::File;
 use std::path::Path;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_OPUS};
+use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
 use symphonia::core::errors::Error as SymphoniaError;
 
 /// Default number of waveform data points (amplitude peaks) per track.
@@ -59,32 +61,34 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
         }
     };
 
-    let mut format = probed.format;
-    let track = format
-        .default_track()
+    let mut format = probed;
+    let (track, codec_params) = default_audio_track(format.as_ref())
         .ok_or_else(|| anyhow!("No default audio track found"))?;
 
     let track_id = track.id;
-    let codec_params = track.codec_params.clone();
-    let n_channels = codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
+    let codec_params = codec_params.clone();
+    let n_channels = codec_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u32)
+        .unwrap_or(2);
     let sample_rate = codec_params.sample_rate.unwrap_or(44100);
 
     // ── Opus path (libopus, not symphonia) ──────────────────────────────────
     #[cfg(feature = "opus")]
-    if codec_params.codec == CODEC_TYPE_OPUS {
+    if codec_params.codec == CODEC_ID_OPUS {
         return compute_waveform_opus(&mut format, track_id, n_channels, sample_rate, resolution);
     }
 
     // ── Symphonia path (all other codecs) ──────────────────────────────────
     #[cfg(not(feature = "opus"))]
-    if codec_params.codec == CODEC_TYPE_OPUS {
+    if codec_params.codec == CODEC_ID_OPUS {
         return Err(anyhow!(
             "Opus codec not supported (rebuild with the 'opus' feature and libopus)"
         ));
     }
 
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
+    let mut decoder = make_audio_decoder(&codec_params)
         .map_err(|_| anyhow!("Unsupported audio codec for waveform"))?;
 
     // We decode at a fine time resolution (~20ms slices) then downsample.
@@ -97,11 +101,12 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
     let mut slice_frame_count: u64 = 0;
     let mut slice_sum_sq: f64 = 0.0;
     let mut slice_n_samples: u64 = 0;
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut samples: Vec<f32> = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
@@ -115,7 +120,7 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
@@ -128,12 +133,8 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
             }
         };
 
-        let spec = *decoded.spec();
-        let buf = sample_buf
-            .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
-        buf.copy_interleaved_ref(decoded);
-        let samples = buf.samples();
-        let n_ch = spec.channels.count() as u32;
+        let n_ch = decoded.spec().channels().count() as u32;
+        decoded.copy_to_vec_interleaved(&mut samples);
 
         // Process frame-by-frame, accumulating sum of squares for RMS.
         for frame in samples.chunks(n_ch as usize) {
@@ -209,7 +210,8 @@ fn compute_waveform_opus(
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
@@ -219,7 +221,7 @@ fn compute_waveform_opus(
             }
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 

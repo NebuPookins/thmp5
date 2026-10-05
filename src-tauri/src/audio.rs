@@ -1,5 +1,6 @@
 use crate::audio_probe::{
-    id3v2_end_offset, open_wave_mp3_payload, probe_media_source as shared_probe_media_source,
+    default_audio_track, id3v2_end_offset, make_audio_decoder, open_wave_mp3_payload,
+    probe_media_source as shared_probe_media_source,
 };
 use crate::file_issues::FileIssueLog;
 use crate::models::{PlaybackStatus, PlayerState};
@@ -18,8 +19,8 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{CodecType, DecoderOptions, CODEC_TYPE_OPUS};
+use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::codecs::audio::{well_known::CODEC_ID_OPUS, AudioCodecId};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{SeekMode, SeekTo};
 use symphonia::core::units::Time;
@@ -1206,7 +1207,7 @@ where
 }
 
 enum AudioDecoder {
-    Symphonia(Box<dyn symphonia::core::codecs::Decoder>),
+    Symphonia(Box<dyn symphonia::core::codecs::audio::AudioDecoder>),
     /// Direct libopus decoder used for OGG/Opus files, which symphonia has no codec support for.
     #[cfg(feature = "opus")]
     Opus {
@@ -1276,27 +1277,29 @@ impl LocalFileSource {
     where
         M: symphonia::core::io::MediaSource + 'static,
     {
-        let probed = shared_probe_media_source(path, media_source, force_extension)?;
-        let format = probed.format;
-        let track = format
-            .default_track()
+        let format = shared_probe_media_source(path, media_source, force_extension)?;
+        let (track, codec_params) = default_audio_track(format.as_ref())
             .ok_or_else(|| anyhow!("No supported audio track found"))?;
         let track_id = track.id;
-        let sample_rate = track.codec_params.sample_rate;
-        let channels = track.codec_params.channels.map(|c| c.count() as u16);
-        let duration_ms = match (track.codec_params.n_frames, track.codec_params.sample_rate) {
+        let sample_rate = codec_params.sample_rate;
+        let channels = codec_params.channels.as_ref().map(|c| c.count() as u16);
+        let duration_ms = match (track.num_frames, codec_params.sample_rate) {
             (Some(frame_count), Some(rate)) if rate > 0 => {
                 frame_count.saturating_mul(1000) / u64::from(rate)
             }
             _ => 0,
         };
-        let codec = track.codec_params.codec;
+        let codec = codec_params.codec;
 
         // Symphonia has no Opus codec; when the feature is enabled, use libopus directly for
         // packet decoding.  The OGG format reader above still handles container/packet extraction.
         #[cfg(feature = "opus")]
-        let decoder = if codec == CODEC_TYPE_OPUS {
-            let n_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+        let decoder = if codec == CODEC_ID_OPUS {
+            let n_channels = codec_params
+                .channels
+                .as_ref()
+                .map(|c| c.count())
+                .unwrap_or(2);
             let opus_channels = if n_channels == 1 {
                 opus::Channels::Mono
             } else {
@@ -1309,26 +1312,19 @@ impl LocalFileSource {
             }
         } else {
             AudioDecoder::Symphonia(
-                symphonia::default::get_codecs()
-                    .make(&track.codec_params, &DecoderOptions::default())
+                make_audio_decoder(codec_params)
                     .map_err(|_| anyhow!("Unsupported audio codec: {}", codec_type_name(codec)))?,
             )
         };
 
         #[cfg(not(feature = "opus"))]
-        let decoder = AudioDecoder::Symphonia(
-            symphonia::default::get_codecs()
-                .make(&track.codec_params, &DecoderOptions::default())
-                .map_err(|_| {
-                    if codec == CODEC_TYPE_OPUS {
-                        anyhow!(
-                            "Opus codec not supported (rebuild with the 'opus' feature and libopus)"
-                        )
-                    } else {
-                        anyhow!("Unsupported audio codec: {}", codec_type_name(codec))
-                    }
-                })?,
-        );
+        let decoder = AudioDecoder::Symphonia(make_audio_decoder(codec_params).map_err(|_| {
+            if codec == CODEC_ID_OPUS {
+                anyhow!("Opus codec not supported (rebuild with the 'opus' feature and libopus)")
+            } else {
+                anyhow!("Unsupported audio codec: {}", codec_type_name(codec))
+            }
+        })?);
         // track borrow of format ends here (NLL)
 
         // Opus always decodes at 48 kHz; use the libopus channel count rather than whatever
@@ -1368,19 +1364,23 @@ impl LocalFileSource {
     /// the resulting samples in `pending` so they aren't lost.
     fn prime_spec(&mut self) -> Result<()> {
         loop {
-            let packet = self.format.next_packet()?;
-            if packet.track_id() != self.track_id {
+            let Some(packet) = self.format.next_packet()? else {
+                return Err(
+                    SymphoniaError::IoError(std::io::ErrorKind::UnexpectedEof.into()).into(),
+                );
+            };
+            if packet.track_id != self.track_id {
                 continue;
             }
             match &mut self.decoder {
                 AudioDecoder::Symphonia(dec) => match dec.decode(&packet) {
                     Ok(decoded) => {
-                        let spec = *decoded.spec();
+                        let spec = decoded.spec();
                         // Always use the decoded spec — container metadata may be wrong
                         // (e.g. HE-AAC reports post-SBR rate 44100 but decoder outputs
                         // at the core rate 22050).  Trust what the decoder actually produces.
-                        self.sample_rate = spec.rate;
-                        self.channels = spec.channels.count() as u16;
+                        self.sample_rate = spec.rate();
+                        self.channels = spec.channels().count() as u16;
                         append_audio_buffer(decoded, &mut self.pending);
                         return Ok(());
                     }
@@ -1414,7 +1414,8 @@ impl LocalFileSource {
         }
         loop {
             let packet = match self.format.next_packet() {
-                Ok(p) => p,
+                Ok(Some(p)) => p,
+                Ok(None) => return Ok(None),
                 Err(SymphoniaError::IoError(e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
@@ -1425,7 +1426,7 @@ impl LocalFileSource {
                 }
                 Err(e) => return Err(e.into()),
             };
-            if packet.track_id() != self.track_id {
+            if packet.track_id != self.track_id {
                 continue;
             }
             match &mut self.decoder {
@@ -1461,7 +1462,7 @@ impl LocalFileSource {
 
     fn seek_to_ms(&mut self, position_ms: u64) -> Result<()> {
         self.pending.clear();
-        let time = Time::from(position_ms as f64 / 1000.0);
+        let time = Time::from_millis_u64(position_ms);
         self.format
             .seek(
                 SeekMode::Accurate,
@@ -1475,10 +1476,10 @@ impl LocalFileSource {
     }
 }
 
-fn append_audio_buffer(decoded: AudioBufferRef<'_>, samples: &mut Vec<f32>) {
-    let mut interleaved = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-    interleaved.copy_interleaved_ref(decoded);
-    samples.extend_from_slice(interleaved.samples());
+fn append_audio_buffer(decoded: GenericAudioBufferRef<'_>, samples: &mut Vec<f32>) {
+    let mut interleaved = Vec::new();
+    decoded.copy_to_vec_interleaved(&mut interleaved);
+    samples.extend_from_slice(&interleaved);
 }
 
 struct StreamResampler {
@@ -1564,18 +1565,19 @@ impl StreamResampler {
     }
 }
 
-fn codec_type_name(codec: CodecType) -> &'static str {
-    use symphonia::core::codecs::*;
+fn codec_type_name(codec: AudioCodecId) -> &'static str {
+    use symphonia::core::codecs::audio::well_known::*;
     match codec {
-        CODEC_TYPE_OPUS => "Opus",
-        CODEC_TYPE_VORBIS => "Vorbis",
-        CODEC_TYPE_FLAC => "FLAC",
-        CODEC_TYPE_MP3 => "MP3",
-        CODEC_TYPE_AAC => "AAC",
-        CODEC_TYPE_ALAC => "ALAC",
-        CODEC_TYPE_PCM_S16LE | CODEC_TYPE_PCM_S24LE | CODEC_TYPE_PCM_S32LE
-        | CODEC_TYPE_PCM_S16BE | CODEC_TYPE_PCM_S24BE | CODEC_TYPE_PCM_S32BE
-        | CODEC_TYPE_PCM_F32LE | CODEC_TYPE_PCM_F64LE => "PCM",
+        CODEC_ID_OPUS => "Opus",
+        CODEC_ID_VORBIS => "Vorbis",
+        CODEC_ID_FLAC => "FLAC",
+        CODEC_ID_MP3 => "MP3",
+        CODEC_ID_AAC => "AAC",
+        CODEC_ID_ALAC => "ALAC",
+        CODEC_ID_PCM_S16LE | CODEC_ID_PCM_S24LE | CODEC_ID_PCM_S32LE | CODEC_ID_PCM_S16BE
+        | CODEC_ID_PCM_S24BE | CODEC_ID_PCM_S32BE | CODEC_ID_PCM_F32LE | CODEC_ID_PCM_F64LE => {
+            "PCM"
+        }
         _ => "unknown",
     }
 }
@@ -1677,23 +1679,25 @@ mod tests {
         let packet = source
             .format
             .next_packet()
-            .expect("read packet from HE-AAC file");
+            .expect("read packet from HE-AAC file")
+            .expect("HE-AAC file has a second packet");
         let decoded = match &mut source.decoder {
             AudioDecoder::Symphonia(dec) => dec.decode(&packet).expect("decode packet"),
             _ => panic!("HE-AAC file should use Symphonia decoder"),
         };
-        let spec = *decoded.spec();
+        let spec = decoded.spec().clone();
 
         assert_eq!(
-            source.sample_rate, spec.rate,
+            source.sample_rate,
+            spec.rate(),
             "source sample_rate must equal decoded spec rate, \
              not container metadata (HE-AAC file has container rate 44100, \
              decoder core rate {})",
-            spec.rate,
+            spec.rate(),
         );
         assert_eq!(
             source.channels as u16,
-            spec.channels.count() as u16,
+            spec.channels().count() as u16,
             "source channels must equal decoded spec channel count"
         );
     }

@@ -2,16 +2,20 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, Track, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::{Hint, ProbeResult};
+use symphonia::core::units::Duration;
 
 pub(crate) fn probe_media_source<M>(
     path: &Path,
     media_source: M,
     force_extension: Option<&str>,
-) -> Result<ProbeResult>
+) -> Result<Box<dyn FormatReader>>
 where
     M: MediaSource + 'static,
 {
@@ -24,13 +28,119 @@ where
     }
 
     symphonia::default::get_probe()
-        .format(
+        .probe(
             &hint,
             media_source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .context("Failed to probe audio format")
+}
+
+/// The default audio track of `format` together with its audio codec parameters.
+///
+/// `None` if the container has no audio track or the track's codec parameters are unknown.
+pub(crate) fn default_audio_track(
+    format: &dyn FormatReader,
+) -> Option<(&Track, &AudioCodecParameters)> {
+    let track = format.default_track(TrackType::Audio)?;
+    match track.codec_params.as_ref()? {
+        CodecParameters::Audio(params) => Some((track, params)),
+        _ => None,
+    }
+}
+
+/// Create a decoder for `params` that emits every frame the container holds (no gapless
+/// trimming of encoder delay/padding).
+///
+/// Symphonia 0.6's AAC decoder rejects HE-AAC streams whose AudioSpecificConfig explicitly
+/// signals SBR/PS, where 0.5 decoded just the AAC-LC core. For those streams, retry with the
+/// signalling stripped so the core is decoded as before.
+pub(crate) fn make_audio_decoder(
+    params: &AudioCodecParameters,
+) -> symphonia::core::errors::Result<Box<dyn AudioDecoder>> {
+    let codecs = symphonia::default::get_codecs();
+    let opts = AudioDecoderOptions::default().gapless(false);
+    codecs
+        .make_audio_decoder(params, &opts)
+        .or_else(|err| match aac_core_params(params) {
+            Some(core) => codecs.make_audio_decoder(&core, &opts),
+            None => Err(err),
+        })
+}
+
+/// `params` with an explicit SBR/PS AudioSpecificConfig (hierarchical signalling: object type 5
+/// or 29 wrapping AAC-LC) rewritten to the plain AAC-LC configuration of the core stream.
+fn aac_core_params(params: &AudioCodecParameters) -> Option<AudioCodecParameters> {
+    if params.codec != CODEC_ID_AAC {
+        return None;
+    }
+    let core = aac_core_config(params.extra_data.as_deref()?)?;
+    let mut core_params = params.clone();
+    core_params.with_extra_data(core.into());
+    Some(core_params)
+}
+
+/// Rewrite `AOT(5|29) rate chan extRate AOT(2) GASpecificConfig` as `AOT(2) rate chan
+/// GASpecificConfig` (ISO/IEC 14496-3 1.6.2.1). `None` for any other layout.
+fn aac_core_config(asc: &[u8]) -> Option<Vec<u8>> {
+    const AOT_LC: u32 = 2;
+    const AOT_SBR: u32 = 5;
+    const AOT_PS: u32 = 29;
+    const RATE_ESCAPE: u32 = 15;
+
+    // Reads `n` (<= 32) bits starting at bit `pos`.
+    let bits = |pos: usize, n: usize| -> Option<u32> {
+        (pos + n <= asc.len() * 8).then(|| {
+            (pos..pos + n).fold(0u32, |acc, i| {
+                (acc << 1) | u32::from(asc[i / 8] >> (7 - i % 8) & 1)
+            })
+        })
+    };
+    // Width of a sampling-frequency field: an index, or an index escape plus explicit rate.
+    let rate_len =
+        |pos: usize| -> Option<usize> { Some(if bits(pos, 4)? == RATE_ESCAPE { 28 } else { 4 }) };
+
+    let aot = bits(0, 5)?;
+    if aot != AOT_SBR && aot != AOT_PS {
+        return None;
+    }
+    let rate_pos = 5;
+    let rate_len_core = rate_len(rate_pos)?;
+    let chan_pos = rate_pos + rate_len_core;
+    let ext_rate_pos = chan_pos + 4;
+    let aot2_pos = ext_rate_pos + rate_len(ext_rate_pos)?;
+    if bits(aot2_pos, 5)? != AOT_LC {
+        return None;
+    }
+    // GASpecificConfig: frameLengthFlag, dependsOnCoreCoder, extensionFlag. Only the plain
+    // form (no core-coder delay, no extension) is rewritten.
+    let ga_pos = aot2_pos + 5;
+    let ga = bits(ga_pos, 3)?;
+    if ga & 0b011 != 0 {
+        return None;
+    }
+
+    let fields = [
+        (AOT_LC, 5),
+        (bits(rate_pos, rate_len_core)?, rate_len_core),
+        (bits(chan_pos, 4)?, 4),
+        (ga, 3),
+    ];
+    let bit_stream: Vec<bool> = fields
+        .iter()
+        .flat_map(|&(value, len)| (0..len).rev().map(move |i| value >> i & 1 == 1))
+        .collect();
+    Some(
+        bit_stream
+            .chunks(8)
+            .map(|byte| {
+                (0..8).fold(0u8, |acc, i| {
+                    (acc << 1) | u8::from(byte.get(i).copied().unwrap_or(false))
+                })
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn open_wave_mp3_payload(path: &Path) -> Result<Option<FileSegment>> {
@@ -181,7 +291,7 @@ fn wave_mp3_data_range(file: &mut File) -> Result<Option<(u64, u64)>> {
 
 /// Probe `path`, retrying past a malformed ID3v2 header or inside a RIFF/WAVE wrapper when the
 /// plain probe fails.
-pub(crate) fn probe_with_fallbacks(path: &Path) -> Result<ProbeResult> {
+pub(crate) fn probe_with_fallbacks(path: &Path) -> Result<Box<dyn FormatReader>> {
     let file = File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
     let probed = match probe_media_source(path, file, None) {
         Ok(probed) => probed,
@@ -236,21 +346,23 @@ const DURATION_TOLERANCE_MS: u64 = 1_000;
 ///
 /// Demuxes only — no audio is decoded — so it is cheap relative to a full decode.
 pub(crate) fn measure_duration_ms(path: &Path) -> Result<u64> {
-    let mut format = probe_with_fallbacks(path)?.format;
-    let track = format
-        .default_track()
-        .context("No default audio track found")?;
+    let mut format = probe_with_fallbacks(path)?;
+    let (track, _) =
+        default_audio_track(format.as_ref()).context("No default audio track found")?;
     let track_id = track.id;
-    let time_base = track
-        .codec_params
-        .time_base
-        .context("Track has no time base")?;
+    let time_base = track.time_base.context("Track has no time base")?;
 
-    let mut total_ticks: u64 = 0;
+    let mut total = Duration::ZERO;
     loop {
         match format.next_packet() {
-            Ok(packet) if packet.track_id() == track_id => total_ticks += packet.dur,
-            Ok(_) => {}
+            // Every frame the decoder emits for the packet, including encoder delay/padding:
+            // `dur` alone omits trimmed frames and some readers misreport trimmed mid-stream
+            // frames as padding (e.g. Ogg files with irregular granule positions).
+            Ok(Some(packet)) if packet.track_id == track_id => {
+                total = total.saturating_add(packet.block_dur())
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
             Err(symphonia::core::errors::Error::IoError(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -262,8 +374,10 @@ pub(crate) fn measure_duration_ms(path: &Path) -> Result<u64> {
         }
     }
 
-    let time = time_base.calc_time(total_ticks);
-    Ok(time.seconds * 1000 + (time.frac * 1000.0) as u64)
+    let time = time_base
+        .calc_duration(total)
+        .context("Measured duration overflows")?;
+    u64::try_from(time.as_millis()).context("Measured duration is negative")
 }
 
 /// Decide which duration to trust. Returns the measured value when it disagrees with the
@@ -298,5 +412,38 @@ mod duration_tests {
     #[test]
     fn failed_measurement_never_corrects() {
         assert_eq!(duration_correction(1_000_000, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod aac_core_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_sbr_config_is_reduced_to_the_aac_lc_core() {
+        // AOT 5 (SBR), 22050 Hz, mono, extension rate 44100 Hz, AOT 2 (LC), plain GASpecificConfig.
+        assert_eq!(
+            aac_core_config(&[0x2B, 0x8A, 0x08, 0x00]),
+            Some(vec![0x13, 0x88])
+        );
+    }
+
+    #[test]
+    fn explicit_ps_config_is_reduced_to_the_aac_lc_core() {
+        // AOT 29 (PS), 22050 Hz, mono, extension rate 44100 Hz, AOT 2 (LC), plain GASpecificConfig.
+        assert_eq!(
+            aac_core_config(&[0xEB, 0x8A, 0x08, 0x00]),
+            Some(vec![0x13, 0x88])
+        );
+    }
+
+    #[test]
+    fn plain_aac_lc_config_is_left_alone() {
+        assert_eq!(aac_core_config(&[0x13, 0x88]), None);
+    }
+
+    #[test]
+    fn truncated_config_is_rejected() {
+        assert_eq!(aac_core_config(&[0x2B, 0x8A]), None);
     }
 }
