@@ -56,6 +56,9 @@ pub struct PlayRequest {
     pub artist: Option<String>,
     pub normalization_gain: f32,
     pub normalization_source: String,
+    /// Authoritative, non-zero track duration from the library DB. When absent, the duration
+    /// the decoder derives from container headers is used instead.
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -503,6 +506,8 @@ fn handle_command(
                     artist: state.current_artist.clone(),
                     normalization_gain: norm_gain,
                     normalization_source: state.normalization_source.clone(),
+                    duration_ms: Some(ctx.track_duration_ms.load(Ordering::Relaxed))
+                        .filter(|&d| d > 0),
                 }
             };
 
@@ -573,7 +578,7 @@ fn start_playback(
         .with_context(|| format!("Failed to open {}", request.file_path))?;
 
     let buffer = Arc::new(Mutex::new(TrackBuffer::new()));
-    let duration_ms = source.duration_ms;
+    let duration_ms = request.duration_ms.unwrap_or(source.duration_ms);
     let current_output_position = start_ms.saturating_mul(u64::from(output_rate)) / 1000;
 
     {

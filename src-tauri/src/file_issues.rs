@@ -9,6 +9,7 @@ pub enum FileIssueKind {
     OrphanSource,
     DuplicateFrame,
     BackupFileExists,
+    DurationMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -138,6 +139,34 @@ impl FileIssueLog {
                 field_name: Some(field_name),
                 lofty_value: Some(lofty_value),
                 corrected_value: Some(corrected_value),
+                backup_path: None,
+            });
+        }
+    }
+
+    /// Report that the header-declared duration disagreed with the duration measured from the
+    /// file's packets; the measured value has been stored.
+    pub fn push_duration_mismatch(
+        &self,
+        file_path: impl Into<String>,
+        header_ms: u64,
+        measured_ms: u64,
+    ) {
+        let file_path = file_path.into();
+        if let Ok(mut issues) = self.issues.lock() {
+            issues.push(FileIssue {
+                file_path,
+                kind: FileIssueKind::DurationMismatch,
+                message: format!(
+                    "File header claims a duration of {header_ms} ms, but the audio is \
+                     {measured_ms} ms long; using {measured_ms} ms."
+                ),
+                source_id: None,
+                recording_id: None,
+                frame_id: None,
+                field_name: None,
+                lofty_value: None,
+                corrected_value: None,
                 backup_path: None,
             });
         }

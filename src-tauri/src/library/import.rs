@@ -1,8 +1,8 @@
-use super::scanner::{build_raw_tags_json, is_audio_file, read_metadata};
+use super::scanner::{build_raw_tags_json, is_audio_file, read_metadata, verify_duration};
 use crate::db::DbPool;
 use crate::file_issues::{FileIssueKind, FileIssueLog};
 use crate::fingerprint::{self, AcoustIdMatch};
-use crate::models::{DuplicateFrameInfo, ImportStats, TrackMetadata};
+use crate::models::{DuplicateFrameInfo, DurationCorrection, ImportStats, TrackMetadata};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use sqlx::Connection;
@@ -129,6 +129,7 @@ pub async fn rescan_source(
         warnings: Vec<String>,
         fp: Option<fingerprint::FingerprintResult>,
         duplicate_frames: Vec<DuplicateFrameInfo>,
+        duration_correction: Option<DurationCorrection>,
         raw_tags_json: String,
     }
 
@@ -137,7 +138,8 @@ pub async fn rescan_source(
         let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Min);
         set_io_priority_idle();
         let hash = file_sha256(&p).context("Failed to hash file")?;
-        let metadata_read = read_metadata(&p).context("Failed to read metadata")?;
+        let mut metadata_read = read_metadata(&p).context("Failed to read metadata")?;
+        verify_duration(&p, &mut metadata_read);
         let fp = match fingerprint::generate_fingerprint(&p) {
             Ok(fp) => Some(fp),
             Err(e) => {
@@ -156,6 +158,7 @@ pub async fn rescan_source(
             warnings: metadata_read.warning.into_iter().collect(),
             fp,
             duplicate_frames: metadata_read.duplicate_frames,
+            duration_correction: metadata_read.duration_correction,
             raw_tags_json,
         })
     })
@@ -246,6 +249,14 @@ pub async fn rescan_source(
     tracing::info!(path = %path.display(), source_id = %source_id, "Rescanned source");
     for warning in blocking.warnings {
         println!("[importer] rescan warning: {}: {}", path.display(), warning);
+    }
+
+    let path_str = path.display().to_string();
+    file_issues.retain(|issue| {
+        !(issue.kind == FileIssueKind::DurationMismatch && issue.file_path == path_str)
+    });
+    if let Some(c) = &blocking.duration_correction {
+        file_issues.push_duration_mismatch(path_str, c.header_ms, c.measured_ms);
     }
 
     // Clear stale DuplicateFrame issues for this file, then push new ones.
@@ -399,7 +410,8 @@ pub(crate) async fn prepare_import(
         };
 
         // Metadata and raw_tags_json: always needed (see early-return above).
-        let metadata_read = read_metadata(&p).context("Failed to read metadata")?;
+        let mut metadata_read = read_metadata(&p).context("Failed to read metadata")?;
+        verify_duration(&p, &mut metadata_read);
         let raw_tags_json = build_raw_tags_json(&p, &metadata_read.meta, &metadata_read.all_tags);
 
         // Fingerprint: only when needed (file changed or no existing fingerprint).

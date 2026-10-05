@@ -1,3 +1,4 @@
+use crate::audio_probe::{duration_correction, measure_duration_ms};
 use crate::models::{
     DuplicateFrameInfo, Id3FrameDebugInfo, MetadataReadResult, TagProperty, TaglibHelperResponse,
     TrackMetadata,
@@ -703,6 +704,7 @@ fn try_taglib_helper(path: &Path, primary_error: &str) -> Result<Option<Metadata
             warning,
             all_tags: response.all_tags,
             duplicate_frames,
+            duration_correction: None,
         }));
     }
 
@@ -906,6 +908,7 @@ pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
             warning: None,
             all_tags: Vec::new(),
             duplicate_frames,
+            duration_correction: None,
         },
         Err(error) => {
             let primary_error = format!("{error:#}");
@@ -938,6 +941,29 @@ pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
     }
 
     Ok(result)
+}
+
+/// Replace a header-derived duration with the one measured from the file's packets when they
+/// disagree (Xing/VBRI frame counts and bitrate estimates can be wrong). Costs a full demux of
+/// the file, so call it only where the duration is stored.
+pub fn verify_duration(path: &Path, result: &mut MetadataReadResult) {
+    match measure_duration_ms(path) {
+        Ok(measured_ms) => {
+            if let Some(c) = duration_correction(result.meta.duration_ms, measured_ms) {
+                tracing::warn!(
+                    path = %path.display(),
+                    header_ms = c.header_ms,
+                    measured_ms = c.measured_ms,
+                    "Header duration disagrees with measured duration; using measured"
+                );
+                result.meta.duration_ms = c.measured_ms;
+                result.duration_correction = Some(c);
+            }
+        }
+        Err(e) => {
+            tracing::debug!(path = %path.display(), "Could not measure duration: {e:#}");
+        }
+    }
 }
 
 /// Parse a comment field into tags.

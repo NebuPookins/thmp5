@@ -2139,3 +2139,8 @@ thead th {
 .toggle-switch input:checked + .toggle-slider::before {
   transform: translateX(18px);
 }
+
+.issue-kind-duration_mismatch {
+  background: rgba(222, 170, 72, 0.18);
+  color: #e0b25c;
+}

@@ -282,6 +282,13 @@ pub struct DuplicateFrameInfo {
     pub corrected_value: String,
 }
 
+/// The header-derived duration disagreed with the duration measured from the file's packets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurationCorrection {
+    pub header_ms: u64,
+    pub measured_ms: u64,
+}
+
 #[derive(Debug)]
 pub struct MetadataReadResult {
     pub meta: TrackMetadata,
@@ -289,6 +296,8 @@ pub struct MetadataReadResult {
     pub all_tags: Vec<TagProperty>,
     /// Frame IDs that had conflicting values across multiple ID3v2 tags.
     pub duplicate_frames: Vec<DuplicateFrameInfo>,
+    /// Set when `meta.duration_ms` was overwritten because the header value was wrong.
+    pub duration_correction: Option<DurationCorrection>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1082,11 +1082,21 @@ pub async fn play(
         "Resolved play request"
     );
 
+    let duration_ms: Option<i64> =
+        sqlx::query_scalar("SELECT duration_ms FROM source WHERE id = ?")
+            .bind(&source_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
     state
         .player
         .play(EnginePlayRequest {
             source_id,
             file_path,
+            duration_ms: duration_ms
+                .and_then(|d| u64::try_from(d).ok())
+                .filter(|&d| d > 0),
             title,
             artist,
             normalization_gain,

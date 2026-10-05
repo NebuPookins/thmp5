@@ -178,3 +178,125 @@ fn wave_mp3_data_range(file: &mut File) -> Result<Option<(u64, u64)>> {
     let is_mp3_wave = matches!(format_tag, Some(0x0050 | 0x0055));
     Ok(if is_mp3_wave { data_range } else { None })
 }
+
+/// Probe `path`, retrying past a malformed ID3v2 header or inside a RIFF/WAVE wrapper when the
+/// plain probe fails.
+pub(crate) fn probe_with_fallbacks(path: &Path) -> Result<ProbeResult> {
+    let file = File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    let probed = match probe_media_source(path, file, None) {
+        Ok(probed) => probed,
+        Err(first_err) => {
+            let msg = format!("{first_err:#}");
+            let id3_issue = msg.contains("id3v2") || msg.contains("malformed");
+            let retry = if id3_issue {
+                File::open(path)
+                    .ok()
+                    .and_then(|mut f| {
+                        let offset = id3v2_end_offset(&mut f)?;
+                        use std::io::Seek;
+                        f.seek(std::io::SeekFrom::Start(offset)).ok()?;
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %first_err,
+                            "Retrying probe after skipping malformed ID3v2 header"
+                        );
+                        Some(f)
+                    })
+                    .and_then(|f2| probe_media_source(path, f2, None).ok())
+            } else {
+                None
+            };
+            match retry {
+                Some(result) => result,
+                None => {
+                    if let Some(segment) = open_wave_mp3_payload(path)? {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %first_err,
+                            "Retrying probe by decoding MP3 payload from RIFF/WAVE wrapper"
+                        );
+                        probe_media_source(path, segment, Some("mp3"))?
+                    } else {
+                        return Err(first_err);
+                    }
+                }
+            }
+        }
+    };
+    Ok(probed)
+}
+
+/// Maximum disagreement between the header-derived and the measured duration that is still
+/// treated as agreement (encoder delay/padding and rounding account for tens of milliseconds).
+const DURATION_TOLERANCE_MS: u64 = 1_000;
+
+/// Measure the real duration of the default audio track by summing the duration of every
+/// packet actually present in the container, rather than trusting header fields (Xing/VBRI
+/// frame counts, bitrate-based estimates) that can be wrong or missing.
+///
+/// Demuxes only — no audio is decoded — so it is cheap relative to a full decode.
+pub(crate) fn measure_duration_ms(path: &Path) -> Result<u64> {
+    let mut format = probe_with_fallbacks(path)?.format;
+    let track = format
+        .default_track()
+        .context("No default audio track found")?;
+    let track_id = track.id;
+    let time_base = track
+        .codec_params
+        .time_base
+        .context("Track has no time base")?;
+
+    let mut total_ticks: u64 = 0;
+    loop {
+        match format.next_packet() {
+            Ok(packet) if packet.track_id() == track_id => total_ticks += packet.dur,
+            Ok(_) => {}
+            Err(symphonia::core::errors::Error::IoError(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
+            // Any other error means the sum is incomplete; report failure rather than a
+            // partial duration so callers keep the header value.
+            Err(e) => return Err(anyhow::Error::new(e).context("Failed while measuring duration")),
+        }
+    }
+
+    let time = time_base.calc_time(total_ticks);
+    Ok(time.seconds * 1000 + (time.frac * 1000.0) as u64)
+}
+
+/// Decide which duration to trust. Returns the measured value when it disagrees with the
+/// header-derived one by more than [`DURATION_TOLERANCE_MS`], otherwise `None`.
+pub(crate) fn duration_correction(
+    header_ms: u64,
+    measured_ms: u64,
+) -> Option<crate::models::DurationCorrection> {
+    (measured_ms > 0 && header_ms.abs_diff(measured_ms) > DURATION_TOLERANCE_MS).then_some(
+        crate::models::DurationCorrection {
+            header_ms,
+            measured_ms,
+        },
+    )
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn agreeing_durations_need_no_correction() {
+        assert_eq!(duration_correction(1_398_230, 1_398_300), None);
+    }
+
+    #[test]
+    fn disagreeing_durations_report_the_measured_value() {
+        let c = duration_correction(2_291_905, 1_398_230).unwrap();
+        assert_eq!((c.header_ms, c.measured_ms), (2_291_905, 1_398_230));
+    }
+
+    #[test]
+    fn failed_measurement_never_corrects() {
+        assert_eq!(duration_correction(1_000_000, 0), None);
+    }
+}

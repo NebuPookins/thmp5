@@ -185,7 +185,7 @@ type PlayerErrorEvent = {
 
 type FileIssue = {
   file_path: string;
-  kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists";
+  kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch";
   message: string;
   source_id?: string;
   recording_id?: string;
@@ -3320,7 +3320,7 @@ function App() {
                       >
                         <div className="issue-item-header">
                           <span className={`issue-kind issue-kind-${issue.kind}`}>
-                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : issue.kind === "duplicate_frame" ? "Duplicate Tag" : issue.kind === "backup_file_exists" ? "Backup" : "Playback"}
+                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : issue.kind === "duplicate_frame" ? "Duplicate Tag" : issue.kind === "backup_file_exists" ? "Backup" : issue.kind === "duration_mismatch" ? "Duration" : "Playback"}
                           </span>
                           {issue.kind === "orphan_source" ? (
                             <button

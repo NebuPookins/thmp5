@@ -38,3 +38,5 @@ cargo test           # run Rust unit tests
   - `source` table: `file_path`, `track_total`, `raw_tags_json` (JSON array of `[frame_id, value]` pairs, e.g. `["TRCK","2/50\u0000"]`). Query e.g. `select file_path, raw_tags_json from source where raw_tags_json like '%<album title>%'`.
   - Other tables: `play_history`, `playlist`, `playlist_track`, `source_rating`, `app_config`.
 - **Gotcha**: real-world ID3 values often carry a trailing `\0` (TRCK, TPOS, multi-value frames); always `trim_end_matches('\0')` before parsing numbers.
+- **Gotcha**: `source.duration_ms` is the single source of truth for track length, and playback uses it. Don't trust header-derived durations (symphonia `n_frames`, lofty, Xing): symphonia 0.5.5 reported 38:11 for an MP3 whose real length is 23:18 despite a valid Xing header. `audio_probe::measure_duration_ms` (sum of packet durations) corrects them at import/rescan. For ground truth use `ffmpeg -i <file> -f null -`.
+- **Gotcha**: `Cargo.lock` pins symphonia 0.5.x, but `~/.cargo/registry/src` also contains 0.6.x. Read the version directory matching the lockfile when checking symphonia behavior.
