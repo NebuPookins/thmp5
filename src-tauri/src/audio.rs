@@ -911,17 +911,17 @@ fn try_build_stream(
 ) -> Result<cpal::Stream> {
     let (device, supported_config) = select_output_device(host)?;
     let stream_config = supported_config.config();
-    let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let device_name = device_name(&device);
     tracing::info!(
         device = %device_name,
-        sample_rate = stream_config.sample_rate.0,
+        sample_rate = stream_config.sample_rate,
         channels = stream_config.channels,
         format = ?supported_config.sample_format(),
         "Using output device"
     );
 
     ctx.output_sample_rate
-        .store(stream_config.sample_rate.0, Ordering::Relaxed);
+        .store(stream_config.sample_rate, Ordering::Relaxed);
     ctx.output_channels
         .store(stream_config.channels, Ordering::Relaxed);
 
@@ -930,6 +930,18 @@ fn try_build_stream(
         .play()
         .context("Failed to start output stream")?;
     Ok(output_stream)
+}
+
+fn device_name(device: &cpal::Device) -> String {
+    device
+        .description()
+        .map_or_else(|_| "<unknown>".to_string(), |d| d.name().to_string())
+}
+
+/// ALSA's `null` sink accepts any stream and discards it. cpal 0.18 lists it first and it probes
+/// as usable, so without this filter the fallback below would pick it and play silence.
+fn is_discard_sink(device: &cpal::Device) -> bool {
+    device.id().is_ok_and(|id| id.id() == "null")
 }
 
 fn select_output_device(host: &cpal::Host) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
@@ -946,11 +958,11 @@ fn select_output_device(host: &cpal::Host) -> Result<(cpal::Device, cpal::Suppor
         .output_devices()
         .context("Failed to enumerate output audio devices")?;
 
-    for device in devices {
+    for device in devices.filter(|device| !is_discard_sink(device)) {
         match device.default_output_config() {
             Ok(config) => return Ok((device, config)),
             Err(error) => {
-                let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+                let name = device_name(&device);
                 tracing::warn!("Skipping output device {name}: {error}");
             }
         }
@@ -974,7 +986,7 @@ fn build_output_stream(
             let app_for_err = app.clone();
             device
                 .build_output_stream(
-                    &config,
+                    config,
                     move |data: &mut [f32], _| write_output_data_f32(data, &ctx_ref),
                     move |error| {
                         err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
@@ -990,7 +1002,7 @@ fn build_output_stream(
             let app_for_err = app.clone();
             device
                 .build_output_stream(
-                    &config,
+                    config,
                     move |data: &mut [i16], _| write_output_data_i16(data, &ctx_ref),
                     move |error| {
                         err_ctx.stream_rebuild_needed.store(true, Ordering::Release);
@@ -1006,7 +1018,7 @@ fn build_output_stream(
             let app_for_err = app.clone();
             device
                 .build_output_stream(
-                    &config,
+                    config,
                     move |data: &mut [u16], _| write_output_data_u16(data, &ctx_ref),
                     move |error| {
                         err_ctx.stream_rebuild_needed.store(true, Ordering::Release);

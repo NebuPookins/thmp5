@@ -75,7 +75,7 @@ nonempty = { version = "0.11", features = ["serialize"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-cpal = "0.15"
+cpal = "0.18"
 dbus = "0.9"
 x11rb = { version = "0.13", features = ["dpms"] }
 
