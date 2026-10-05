@@ -82,3 +82,10 @@ rtrb = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Keep target/ small: line tables give usable backtraces; dependencies get no debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
