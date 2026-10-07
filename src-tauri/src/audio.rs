@@ -64,10 +64,22 @@ pub struct PlayRequest {
     pub duration_ms: Option<u64>,
 }
 
+/// Why the decoder stopped producing samples for a track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackEndReason {
+    /// The decoder reached the end of the stream.
+    Completed,
+    /// The decoder hit an error (already reported as a `player-error`); whatever was buffered
+    /// played, but the track should not count as listened to.
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackEndedEvent {
     pub source_id: String,
     pub position_ms: u64,
+    pub reason: TrackEndReason,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,9 +507,36 @@ impl DiagnosticsSnapshot {
 struct TrackBuffer {
     /// Locked only by the audio callback, so it is uncontended in practice.
     consumer: Mutex<Consumer<f32>>,
-    /// Set by the decoder (with `Release`) after its last sample has been pushed.
-    finished: AtomicBool,
+    /// Set by the decoder after its last sample has been pushed.
+    end: DecoderEnd,
     stop_requested: AtomicBool,
+}
+
+/// A decoder's end-of-stream flag: unset while decoding, then the `TrackEndReason`.
+#[derive(Default)]
+struct DecoderEnd(AtomicU8);
+
+impl DecoderEnd {
+    const DECODING: u8 = 0;
+    const COMPLETED: u8 = 1;
+    const FAILED: u8 = 2;
+
+    /// Publishes the end (with `Release`, so it follows every sample already pushed).
+    fn mark(&self, reason: TrackEndReason) {
+        let value = match reason {
+            TrackEndReason::Completed => Self::COMPLETED,
+            TrackEndReason::Failed => Self::FAILED,
+        };
+        self.0.store(value, Ordering::Release);
+    }
+
+    fn load(&self) -> Option<TrackEndReason> {
+        match self.0.load(Ordering::Acquire) {
+            Self::DECODING => None,
+            Self::COMPLETED => Some(TrackEndReason::Completed),
+            _ => Some(TrackEndReason::Failed),
+        }
+    }
 }
 
 impl TrackBuffer {
@@ -507,7 +546,7 @@ impl TrackBuffer {
         let (producer, consumer) = RingBuffer::new(capacity_frames * channels.max(1));
         let buffer = Arc::new(Self {
             consumer: Mutex::new(consumer),
-            finished: AtomicBool::new(false),
+            end: DecoderEnd::default(),
             stop_requested: AtomicBool::new(false),
         });
         (buffer, producer)
@@ -744,7 +783,7 @@ fn spawn_decoder_thread(
                 &buffer,
                 producer,
             ) {
-                buffer.finished.store(true, Ordering::Release);
+                buffer.end.mark(TrackEndReason::Failed);
                 emit_error(&app, error.to_string());
             }
         })
@@ -801,7 +840,7 @@ fn decode_into_buffer(
     if !push_samples(&mut producer, buffer, &tail) {
         return Ok(());
     }
-    buffer.finished.store(true, Ordering::Release);
+    buffer.end.mark(TrackEndReason::Completed);
     tracing::info!("Decoder worker finished");
     Ok(())
 }
@@ -874,8 +913,8 @@ fn drain_events(
         let _ = app.emit(PLAYER_POSITION_EVENT, pos_ms);
     }
     while let Ok(event) = events.track_ended.try_recv() {
-        // Send Last.fm scrobble before clearing metadata.
-        if let Ok(state) = shared.lock() {
+        // Send Last.fm scrobble before clearing metadata. A failed decode wasn't listened to.
+        if let (TrackEndReason::Completed, Ok(state)) = (event.reason, shared.lock()) {
             if let (Some(track), Some(artist), Some(started_at), Some(ref tx)) = (
                 &state.current_title,
                 &state.current_artist,
@@ -1238,16 +1277,43 @@ where
             continue;
         }
 
-        // `finished` must be read before the ring's fill level: the decoder pushes its tail
-        // and only then sets `finished`, so seeing both "finished" and "empty" in this order
+        // The decoder's end must be read before the ring's fill level: the decoder pushes its
+        // tail and only then marks the end, so seeing both "ended" and "empty" in this order
         // means nothing more can arrive.
-        let finished = track.finished.load(Ordering::Acquire);
+        let end = track.end.load();
         let ready_frames = consumer.slots() / output_channels;
+
+        // An ended decoder with an empty ring is the end of the track, whether we were playing
+        // or still loading (an underrun just before the end, or a decoder that failed or
+        // produced nothing, leaves us in Loading with no more data coming).
+        if let (Some(reason), 0) = (end, ready_frames) {
+            // Notify the engine thread and clear state.
+            let ended = TrackEndedEvent {
+                source_id: ctx
+                    .current_source_id
+                    .try_lock()
+                    .ok()
+                    .and_then(|mut g| g.take())
+                    .unwrap_or_default(),
+                position_ms: ctx.position_ms(),
+                reason,
+            };
+            track.stop_requested.store(true, Ordering::Release);
+            ctx.status.store(STATUS_STOPPED, Ordering::Release);
+            if let Ok(mut t) = ctx.current_track.try_lock() {
+                *t = None;
+            }
+            ctx.track_duration_ms.store(0, Ordering::Relaxed);
+            let _ = ctx.track_ended_tx.send(ended);
+            track_ended = true;
+            frame.fill(silence);
+            continue;
+        }
 
         if status == STATUS_LOADING {
             // Transition from Loading → Playing once we have enough data. Until then, play
             // silence and leave the buffered samples (and the position) untouched.
-            if ready_frames >= PREBUFFER_FRAMES || (finished && ready_frames > 0) {
+            if ready_frames >= PREBUFFER_FRAMES || end.is_some() {
                 ctx.status.store(STATUS_PLAYING, Ordering::Release);
                 let _ = ctx.state_tx.send(PlayerState {
                     status: PlaybackStatus::Playing,
@@ -1274,47 +1340,21 @@ where
         }
 
         if ready_frames == 0 {
-            if finished {
-                // Track ended naturally – notify engine thread and clear state.
-                let ended = TrackEndedEvent {
-                    source_id: ctx
-                        .current_source_id
-                        .try_lock()
-                        .ok()
-                        .and_then(|g| g.clone())
-                        .unwrap_or_default(),
-                    position_ms: ctx.position_ms(),
-                };
-                track.stop_requested.store(true, Ordering::Release);
-                ctx.status.store(STATUS_STOPPED, Ordering::Release);
-                if let Ok(mut t) = ctx.current_track.try_lock() {
-                    *t = None;
-                }
-                if let Ok(mut id) = ctx.current_source_id.try_lock() {
-                    *id = None;
-                }
-                ctx.track_duration_ms.store(0, Ordering::Relaxed);
-                let _ = ctx.track_ended_tx.send(ended);
-                track_ended = true;
-            } else {
-                // Buffer underrun – go back to Loading.
-                ctx.diagnostics.underruns.fetch_add(1, Ordering::Relaxed);
-                ctx.status.store(STATUS_LOADING, Ordering::Release);
-                let _ = ctx.state_tx.send(PlayerState {
-                    status: PlaybackStatus::Loading,
-                    source_id: None,
-                    title: None,
-                    artist: None,
-                    duration_ms: None,
-                    position_ms: ctx.position_ms(),
-                    volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
-                    normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
-                    normalization_gain: f32::from_bits(
-                        ctx.normalization_gain.load(Ordering::Relaxed),
-                    ),
-                    normalization_source: String::new(),
-                });
-            }
+            // Buffer underrun – go back to Loading.
+            ctx.diagnostics.underruns.fetch_add(1, Ordering::Relaxed);
+            ctx.status.store(STATUS_LOADING, Ordering::Release);
+            let _ = ctx.state_tx.send(PlayerState {
+                status: PlaybackStatus::Loading,
+                source_id: None,
+                title: None,
+                artist: None,
+                duration_ms: None,
+                position_ms: ctx.position_ms(),
+                volume: f32::from_bits(ctx.volume.load(Ordering::Relaxed)),
+                normalization_enabled: ctx.normalization_enabled.load(Ordering::Relaxed),
+                normalization_gain: f32::from_bits(ctx.normalization_gain.load(Ordering::Relaxed)),
+                normalization_source: String::new(),
+            });
             frame.fill(silence);
             continue;
         }
@@ -1912,7 +1952,11 @@ mod tests {
         }
 
         fn finish(&self) {
-            self.track.finished.store(true, Ordering::Release);
+            self.track.end.mark(TrackEndReason::Completed);
+        }
+
+        fn fail(&self) {
+            self.track.end.mark(TrackEndReason::Failed);
         }
 
         fn render(&self, frames: usize) -> Vec<f32> {
@@ -1964,6 +2008,47 @@ mod tests {
         assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_STOPPED);
         assert!(h.track_ended.try_recv().is_ok());
         assert!(h.track_ended.try_recv().is_err(), "end is signalled once");
+    }
+
+    #[test]
+    fn loading_track_whose_decoder_finishes_with_nothing_buffered_signals_end() {
+        let h = CallbackHarness::new(STATUS_LOADING);
+        h.finish();
+
+        assert!(h.render(8).iter().all(|&s| s == 0.0));
+        assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_STOPPED);
+        assert_eq!(
+            h.track_ended.try_recv().unwrap().reason,
+            TrackEndReason::Completed
+        );
+    }
+
+    #[test]
+    fn loading_track_whose_decoder_fails_signals_a_failed_end() {
+        let h = CallbackHarness::new(STATUS_LOADING);
+        h.fail();
+
+        assert!(h.render(8).iter().all(|&s| s == 0.0));
+        assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_STOPPED);
+        assert_eq!(
+            h.track_ended.try_recv().unwrap().reason,
+            TrackEndReason::Failed
+        );
+    }
+
+    #[test]
+    fn underrun_just_before_the_end_still_signals_end() {
+        let h = CallbackHarness::new(STATUS_PLAYING);
+        h.render(1);
+        assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_LOADING);
+
+        h.finish();
+        h.render(1);
+        assert_eq!(h.ctx.status.load(Ordering::Acquire), STATUS_STOPPED);
+        assert_eq!(
+            h.track_ended.try_recv().unwrap().reason,
+            TrackEndReason::Completed
+        );
     }
 
     #[test]

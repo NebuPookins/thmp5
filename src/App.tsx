@@ -183,6 +183,13 @@ type PlayerErrorEvent = {
   message: string;
 };
 
+type TrackEndedEvent = {
+  source_id: string;
+  position_ms: number;
+  /** "failed": the decoder errored (reported via player-error); not counted as a play. */
+  reason: "completed" | "failed";
+};
+
 type FileIssue = {
   file_path: string;
   kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch";
@@ -1442,11 +1449,13 @@ function App() {
           position_ms: event.payload,
         }));
 	      });
-	      const unlistenEnded = await listen<{
-        source_id: string;
-        position_ms: number;
-      }>("player-track-ended", (event) => {
-        if (isMounted) {
+	      const unlistenEnded = await listen<TrackEndedEvent>("player-track-ended", (event) => {
+        if (!isMounted) {
+          return;
+        }
+        if (event.payload.reason === "failed") {
+          clearCurrentTrack();
+        } else {
           void completeCurrentTrack(event.payload.position_ms);
         }
       });
@@ -1674,6 +1683,10 @@ function App() {
       setHistory((current) => [finishedTrack, ...current].slice(0, queueHistoryLimit));
     }
 
+    clearCurrentTrack();
+  }
+
+  function clearCurrentTrack() {
     setCurrentTrack(null);
     setPlayerState((current) => ({
       ...current,
