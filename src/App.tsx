@@ -192,7 +192,7 @@ type TrackEndedEvent = {
 
 type FileIssue = {
   file_path: string;
-  kind: "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch";
+  kind: "manual" | "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch";
   message: string;
   source_id?: string;
   recording_id?: string;
@@ -202,6 +202,29 @@ type FileIssue = {
   corrected_value?: string;
   backup_path?: string;
 };
+
+const fileIssueLabel = (kind: FileIssue["kind"]): string => ({
+  manual: "File issue",
+  import_error: "Import error",
+  playback_error: "Playback error",
+  orphan_source: "Orphan source",
+  duplicate_frame: "Duplicate tag",
+  backup_file_exists: "Backup file",
+  duration_mismatch: "Duration mismatch",
+}[kind]);
+
+function FileIssueIndicator({ paths, issuesByPath }: {
+  paths: readonly string[];
+  issuesByPath: ReadonlyMap<string, readonly FileIssue[]>;
+}) {
+  const affected = paths.flatMap((path) => (issuesByPath.get(path) ?? []).map((issue) => ({ path, issue })));
+  if (affected.length === 0) return null;
+  const includePaths = paths.length > 1;
+  const tooltip = affected.map(({ path, issue }) => (
+    `${includePaths ? `${path}: ` : ""}${fileIssueLabel(issue.kind)} — ${issue.message}`
+  )).join("\n");
+  return <span className="file-issue-indicator" title={tooltip} aria-label={tooltip}>⚠</span>;
+}
 
 type LastFmStatus = {
   configured: boolean;
@@ -648,6 +671,15 @@ function App() {
   fileIssuesRef.current = fileIssues;
   const pendingFileIssuesRef = useRef<FileIssue[] | null>(pendingFileIssues);
   pendingFileIssuesRef.current = pendingFileIssues;
+  const issuesByPath = useMemo(() => {
+    const result = new Map<string, FileIssue[]>();
+    for (const issue of fileIssues) {
+      const current = result.get(issue.file_path);
+      if (current) current.push(issue);
+      else result.set(issue.file_path, [issue]);
+    }
+    return result;
+  }, [fileIssues]);
 
   const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
   const [deletingBackups, setDeletingBackups] = useState<Set<string>>(new Set());
@@ -1823,6 +1855,34 @@ function App() {
     }
   }
 
+  async function handleFileIssue(path: string, existingNote: string | null) {
+    const note = window.prompt(existingNote === null ? "Describe the file issue:" : "Edit the file issue:", existingNote ?? "");
+    if (note === null) return;
+    try {
+      if (note.trim()) {
+        await invoke("set_source_file_issue", { filePath: path, note });
+      } else if (existingNote !== null) {
+        await invoke("clear_source_file_issue", { filePath: path });
+      } else {
+        return;
+      }
+      const issues = await invoke<FileIssue[]>("get_file_issues");
+      updateFileIssues(issues, true);
+    } catch (issueError) {
+      setError(issueError instanceof Error ? issueError.message : String(issueError));
+    }
+  }
+
+  async function handleClearFileIssue(path: string) {
+    try {
+      await invoke("clear_source_file_issue", { filePath: path });
+      const issues = await invoke<FileIssue[]>("get_file_issues");
+      updateFileIssues(issues, true);
+    } catch (issueError) {
+      setError(issueError instanceof Error ? issueError.message : String(issueError));
+    }
+  }
+
   async function handleRescanSources(paths: string[]) {
     try {
       setError(null);
@@ -1880,6 +1940,16 @@ function App() {
   function openEntitySourceContextMenu(e: React.MouseEvent, filePath: string) {
     e.preventDefault();
     setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: filePath });
+  }
+
+  function openQueueSourceContextMenu(e: React.MouseEvent, item: QueueItem) {
+    const path = item.primary_source_path;
+    if (path) openEntitySourceContextMenu(e, path);
+    else openRecordingContextMenu(e, item);
+  }
+
+  function manualFileIssue(path: string): string | null {
+    return (issuesByPath.get(path) ?? []).find((issue) => issue.kind === "manual")?.message ?? null;
   }
 
   function enqueueRecording(recording: RecordingRow) {
@@ -2612,6 +2682,28 @@ function App() {
                   onForward={() => dispatchNav({ type: "forward" })}
                   onClose={() => dispatchNav({ type: "close" })}
                   onSourceContextMenu={openEntitySourceContextMenu}
+                  sourceIssueTooltip={(path) => (issuesByPath.get(path) ?? []).map((issue) => `${fileIssueLabel(issue.kind)} — ${issue.message}`).join("\n") || null}
+                  onEnqueueSource={(recording, source) => {
+                    if (!source.file_path) {
+                      setError(`No playable local file is available for "${recording.title}".`);
+                      return;
+                    }
+                    enqueueRecording({
+                      id: recording.id,
+                      title: recording.title,
+                      duration_ms: source.duration_ms ?? recording.duration_ms,
+                      primary_artist_id: recording.primary_artist_id,
+                      artist_credit_name: recording.artist_credit_name,
+                      genre: recording.genre,
+                      rating: recording.rating,
+                      predicted_rating: null,
+                      play_count: recording.play_count,
+                      last_played: recording.last_played,
+                      primary_source_id: source.id,
+                      primary_source_path: source.file_path,
+                      tags: [], artist_ids: [], source_paths: [source.file_path], releases: recording.releases,
+                    });
+                  }}
                   onEnqueueTrack={(track) => {
                     if (!track.has_source || !track.primary_source_id) {
                       setError(`No playable source available for "${track.recording_title}".`);
@@ -2684,7 +2776,7 @@ function App() {
                                 onDoubleClick={() => enqueueRecording(recording)}
                                 title={recording.primary_source_id ? "Double click to queue" : "No playable file"}
                               >
-                                <td>{recording.title}</td>
+                                <td><FileIssueIndicator paths={recording.source_paths} issuesByPath={issuesByPath} />{recording.title}</td>
                                 <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
                                 <td>
                                   {recording.releases.length === 0
@@ -2822,7 +2914,7 @@ function App() {
                                       : "No playable local file"
                                   }
                                 >
-                                  <td>{recording.title}</td>
+                                  <td><FileIssueIndicator paths={recording.source_paths} issuesByPath={issuesByPath} />{recording.title}</td>
                                   <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
                                   <td className="releases-cell">
                                     {recording.releases.length === 0
@@ -2886,6 +2978,7 @@ function App() {
                                           setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: p });
                                         }}
                                       >
+                                        <FileIssueIndicator paths={[p]} issuesByPath={issuesByPath} />
                                         {p}
                                       </div>
                                     ))}
@@ -2982,10 +3075,10 @@ function App() {
                     <li
                       className="queue-history-item"
                       key={`history-${i}-${item.id}`}
-                      onContextMenu={(e) => openRecordingContextMenu(e, item)}
+                      onContextMenu={(e) => openQueueSourceContextMenu(e, item)}
                     >
                       <div className="queue-row">
-                        <strong>{item.title}</strong>
+                        <strong><FileIssueIndicator paths={item.primary_source_path ? [item.primary_source_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
                       </div>
                       <div className="queue-row">
@@ -3001,9 +3094,9 @@ function App() {
                     </li>
                   ))}
                   {currentTrack ? (
-                    <li className="queue-now-playing" onContextMenu={(e) => openRecordingContextMenu(e, currentTrack)}>
+                    <li className="queue-now-playing" onContextMenu={(e) => openQueueSourceContextMenu(e, currentTrack)}>
                       <div className="queue-row">
-                        <strong>{currentTrack.title}</strong>
+                        <strong><FileIssueIndicator paths={currentTrack.primary_source_path ? [currentTrack.primary_source_path] : currentTrack.source_paths} issuesByPath={issuesByPath} />{currentTrack.title}</strong>
                         <span className="queue-duration">{formatDuration(currentTrack.duration_ms)}</span>
                       </div>
                       <div className="queue-row">
@@ -3058,10 +3151,10 @@ function App() {
                           moveQueueItemByKey(fromKey, key, "item");
                         }
                       }}
-                      onContextMenu={(e) => openRecordingContextMenu(e, item)}
+                      onContextMenu={(e) => openQueueSourceContextMenu(e, item)}
                     >
                       <div className="queue-row">
-                        <strong>{item.title}</strong>
+                        <strong><FileIssueIndicator paths={item.primary_source_path ? [item.primary_source_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
                         <button
                           className="queue-remove-btn"
@@ -3318,7 +3411,7 @@ function App() {
                   </div>
                 )}
                 {fileIssues.length === 0 ? (
-                  <p className="issue-empty">No file issues recorded this session.</p>
+                  <p className="issue-empty">No file issues recorded.</p>
                 ) : (
                   <ol className="issue-list">
                     {fileIssues.map((issue, i) => {
@@ -3333,9 +3426,17 @@ function App() {
                       >
                         <div className="issue-item-header">
                           <span className={`issue-kind issue-kind-${issue.kind}`}>
-                            {issue.kind === "import_error" ? "Import" : issue.kind === "orphan_source" ? "Orphan Source" : issue.kind === "duplicate_frame" ? "Duplicate Tag" : issue.kind === "backup_file_exists" ? "Backup" : issue.kind === "duration_mismatch" ? "Duration" : "Playback"}
+                            {fileIssueLabel(issue.kind)}
                           </span>
-                          {issue.kind === "orphan_source" ? (
+                          {issue.kind === "manual" ? (
+                            <button
+                              className="fix-orphan-btn"
+                              type="button"
+                              onClick={() => { void handleClearFileIssue(issue.file_path); }}
+                            >
+                              Clear
+                            </button>
+                          ) : issue.kind === "orphan_source" ? (
                             <button
                               className="fix-orphan-btn"
                               type="button"
@@ -3806,6 +3907,24 @@ function App() {
                     </button>
                   </li>
                 ) : null}
+                {contextMenu.recording.source_paths.length === 1 && (
+                  <>
+                    <li>
+                      <button className="ctx-menu-item" type="button" onClick={() => {
+                        void handleFileIssue(contextMenu.recording.source_paths[0], manualFileIssue(contextMenu.recording.source_paths[0]));
+                        setContextMenu(null);
+                      }}>
+                        {manualFileIssue(contextMenu.recording.source_paths[0]) === null ? "Record file issue…" : "Edit file issue…"}
+                      </button>
+                    </li>
+                    {manualFileIssue(contextMenu.recording.source_paths[0]) !== null && <li>
+                      <button className="ctx-menu-item" type="button" onClick={() => {
+                        void handleClearFileIssue(contextMenu.recording.source_paths[0]);
+                        setContextMenu(null);
+                      }}>Clear file issue</button>
+                    </li>}
+                  </>
+                )}
                 {contextMenu.recording.source_paths.length > 1 && (
                   <li>
                     <button
@@ -3823,18 +3942,34 @@ function App() {
               </>
             )}
             {contextMenu.kind === "source" && (
-              <li>
-                <button
-                  className="ctx-menu-item"
-                  type="button"
-                  onClick={() => {
-                    void handleRescanSource(contextMenu.path);
+              <>
+                <li>
+                  <button
+                    className="ctx-menu-item"
+                    type="button"
+                    onClick={() => {
+                      void handleRescanSource(contextMenu.path);
+                      setContextMenu(null);
+                    }}
+                  >
+                    Rescan source
+                  </button>
+                </li>
+                <li>
+                  <button className="ctx-menu-item" type="button" onClick={() => {
+                    void handleFileIssue(contextMenu.path, manualFileIssue(contextMenu.path));
                     setContextMenu(null);
-                  }}
-                >
-                  Rescan source
-                </button>
-              </li>
+                  }}>
+                    {manualFileIssue(contextMenu.path) === null ? "Record file issue…" : "Edit file issue…"}
+                  </button>
+                </li>
+                {manualFileIssue(contextMenu.path) !== null && <li>
+                  <button className="ctx-menu-item" type="button" onClick={() => {
+                    void handleClearFileIssue(contextMenu.path);
+                    setContextMenu(null);
+                  }}>Clear file issue</button>
+                </li>}
+              </>
             )}
             {contextMenu.kind === "artist" && (
               <>

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileIssueKind {
+    Manual,
     ImportError,
     PlaybackError,
     OrphanSource,

@@ -278,6 +278,8 @@ pub fn run() {
             commands::save_smart_playlist,
             commands::delete_playlist,
             commands::get_file_issues,
+            commands::set_source_file_issue,
+            commands::clear_source_file_issue,
             commands::delete_backup_file,
             commands::write_tag_frame,
             commands::delete_tag_frame,

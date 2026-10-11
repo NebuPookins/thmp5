@@ -1178,6 +1178,13 @@ thead th {
 }
 
 /* ── File issues list ────────────────────────────────────────────────────────── */
+.file-issue-indicator {
+  color: #d99000;
+  cursor: help;
+  display: inline-block;
+  font-size: 0.82em;
+  margin-right: 0.32rem;
+}
 
 .pending-updates-badge {
   display: inline-flex;

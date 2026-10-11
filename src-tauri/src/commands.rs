@@ -667,7 +667,92 @@ pub async fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<Fi
     let mut issues = state.file_issues.all();
     let catalog = state.catalog.read().await;
     issues.extend(catalog.file_issues());
+    drop(catalog);
+
+    let mut conn = state
+        .db
+        .acquire("command.get_file_issues")
+        .await
+        .map_err(|e| e.to_string())?;
+    let manual_issues = sqlx::query(
+        "SELECT s.file_path, s.id AS source_id, s.recording_id, i.note
+         FROM source_file_issue i JOIN source s ON s.id = i.source_id",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .filter_map(|row| {
+        row.get::<Option<String>, _>("file_path")
+            .map(|file_path| FileIssue {
+                file_path,
+                kind: FileIssueKind::Manual,
+                message: row.get("note"),
+                source_id: Some(row.get("source_id")),
+                recording_id: Some(row.get("recording_id")),
+                frame_id: None,
+                field_name: None,
+                lofty_value: None,
+                corrected_value: None,
+                backup_path: None,
+            })
+    });
+    issues.extend(manual_issues);
     Ok(issues)
+}
+
+/// Store the single user-authored issue note for a local source file.
+#[tauri::command]
+pub async fn set_source_file_issue(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+    note: String,
+) -> Result<(), String> {
+    let note = note.trim();
+    if note.is_empty() {
+        return Err("A file issue note cannot be empty".to_string());
+    }
+    let mut conn = state
+        .db
+        .acquire("command.set_source_file_issue")
+        .await
+        .map_err(|e| e.to_string())?;
+    let result = sqlx::query(
+        "INSERT INTO source_file_issue (source_id, note, updated_at)
+         SELECT id, ?, datetime('now') FROM source WHERE file_path = ?
+         ON CONFLICT(source_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at",
+    )
+    .bind(note)
+    .bind(&file_path)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+    if result.rows_affected() == 0 {
+        return Err(format!("Local source not found: {file_path}"));
+    }
+    Ok(())
+}
+
+/// Remove the user-authored issue note for a local source file. Detected issues
+/// remain in the session log and are deliberately not affected.
+#[tauri::command]
+pub async fn clear_source_file_issue(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+) -> Result<(), String> {
+    let mut conn = state
+        .db
+        .acquire("command.clear_source_file_issue")
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(
+        "DELETE FROM source_file_issue WHERE source_id = (SELECT id FROM source WHERE file_path = ?)",
+    )
+    .bind(file_path)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Delete a `.thmp5bak` backup file created by a previous tag edit.

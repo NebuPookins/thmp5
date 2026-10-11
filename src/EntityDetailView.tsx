@@ -67,6 +67,8 @@ type Props = {
   onForward: () => void;
   onClose: () => void;
   onSourceContextMenu?: (e: React.MouseEvent<HTMLDivElement>, filePath: string) => void;
+  sourceIssueTooltip?: (filePath: string) => string | null;
+  onEnqueueSource?: (recording: RecordingDetail, source: SourceDetail) => void;
   onEnqueueTrack?: (track: TrackDetail) => void;
   onRescanRecording?: (recordingId: string) => void;
   onRescanReleaseGroup?: (releaseGroupId: string) => void;
@@ -163,7 +165,7 @@ function renderTagValue(tag: SourceTagInfo): React.ReactNode {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, onEnqueueTrack, onRescanRecording, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, sourceIssueTooltip, onEnqueueSource, onEnqueueTrack, onRescanRecording, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
   const [detailState, detailDispatch] = useReducer(detailReducer, { phase: "loading", requestId: 0 });
   const nextDetailRequestId = useRequestId();
   const loading = detailState.phase === "loading";
@@ -722,8 +724,10 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                   key={source.id}
                   className="entity-detail-source"
                   onContextMenu={source.file_path ? (e) => onSourceContextMenu?.(e, source.file_path!) : undefined}
+                  onDoubleClick={() => onEnqueueSource?.(recording, source)}
                 >
                   <div className="entity-detail-source-header">
+                    {source.file_path && sourceIssueTooltip?.(source.file_path) && <span className="file-issue-indicator" title={sourceIssueTooltip(source.file_path)!}>⚠</span>}
                     <span className="entity-detail-badge">{source.source_type}</span>
                     {source.format && <span className="entity-detail-badge">{source.format}</span>}
                     {source.duration_ms && <span className="subtle-text">{formatDuration(source.duration_ms)}</span>}
