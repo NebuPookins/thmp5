@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import { pickNextTrack } from "./autoDj";
+import { describeLastPlayed } from "./lastPlayed";
 import { loveToggleAction } from "./lastfmLove";
 import { calculatePomodoroBatch, parsePomodoroDuration, formatPomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
 import {
@@ -3091,6 +3092,7 @@ function App() {
                           isPredicted={item.rating === null}
                         />
                       </div>
+                      <div className="queue-last-played">{describeLastPlayed(item.last_played, new Date())}</div>
                     </li>
                   ))}
                   {currentTrack ? (
@@ -3109,6 +3111,7 @@ function App() {
                           isPredicted={currentTrack.rating === null}
                         />
                       </div>
+                      <div className="queue-last-played">{describeLastPlayed(currentTrack.last_played, new Date())}</div>
                     </li>
                   ) : null}
                   {queue.map(({ key, recording: item }, index) => (
@@ -3176,6 +3179,7 @@ function App() {
                           isPredicted={item.rating === null}
                         />
                       </div>
+                      <div className="queue-last-played">{describeLastPlayed(item.last_played, new Date())}</div>
                     </li>
                   ))}
                 </>

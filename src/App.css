@@ -2151,3 +2151,8 @@ thead th {
   background: rgba(222, 170, 72, 0.18);
   color: #e0b25c;
 }
+
+.queue-list li .queue-last-played {
+  font-size: 0.72rem;
+  color: #6b819c;
+}
