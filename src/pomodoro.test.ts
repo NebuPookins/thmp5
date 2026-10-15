@@ -6,8 +6,8 @@ import {
   formatPomodoroDuration,
   type RecordingRow,
 } from "./pomodoro";
-import { parsePlayedAt } from "./autoDj";
-import { FAKE_NOW, ONE_DAY_MS, makeRecording } from "./testHelpers";
+import { parsePlayedAt, type QueueItem } from "./autoDj";
+import { FAKE_NOW, ONE_DAY_MS, makeQueueItem } from "./testHelpers";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -18,8 +18,8 @@ function lpEpoch(lastPlayed: string | null): number | null {
 
 function mk(
   overrides: Partial<RecordingRow> & { id: string },
-): RecordingRow {
-  return makeRecording({ duration_ms: 240_000, ...overrides } as Partial<RecordingRow> & { id: string });
+): QueueItem {
+  return makeQueueItem({ duration_ms: 240_000, ...overrides } as Partial<RecordingRow> & { id: string });
 }
 
 /**
@@ -36,9 +36,9 @@ function assertConsistently(runs: number, fn: () => void): void {
 function manyTracks(
   count: number,
   overrides: (i: number) => Partial<RecordingRow>,
-): RecordingRow[] {
+): QueueItem[] {
   return Array.from({ length: count }, (_, i) =>
-    makeRecording({ id: String(i), duration_ms: 240_000, ...overrides(i) } as Partial<RecordingRow> & { id: string }),
+    makeQueueItem({ id: String(i), duration_ms: 240_000, ...overrides(i) } as Partial<RecordingRow> & { id: string }),
   );
 }
 
@@ -216,14 +216,14 @@ describe("calculatePomodoroBatch", () => {
       last_played: null,
     }));
     const tracks = [
-      makeRecording({ id: "current", duration_ms: 5 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
+      makeQueueItem({ id: "current", duration_ms: 5 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
       ...base,
     ];
     const batch = calculatePomodoroBatch({
       playable: tracks,
       queue: [],
       history: [],
-      currentTrack: { id: "current" } as RecordingRow,
+      currentTrack: makeQueueItem({ id: "current" }),
       targetDurationMs: 25 * 60 * 1000,
     });
     expect(batch.map((r) => r.id)).not.toContain("current");
@@ -236,12 +236,12 @@ describe("calculatePomodoroBatch", () => {
       last_played: null,
     }));
     const tracks = [
-      makeRecording({ id: "queued", duration_ms: 5 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
+      makeQueueItem({ id: "queued", duration_ms: 5 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
       ...base,
     ];
     const batch = calculatePomodoroBatch({
       playable: tracks,
-      queue: [{ id: "queued" } as RecordingRow],
+      queue: [makeQueueItem({ id: "queued" })],
       history: [],
       currentTrack: null,
       targetDurationMs: 25 * 60 * 1000,
@@ -256,11 +256,11 @@ describe("calculatePomodoroBatch", () => {
       last_played: null,
     }));
     const history = [
-      { id: "0" } as RecordingRow,
-      { id: "1" } as RecordingRow,
-      { id: "2" } as RecordingRow,
-      { id: "3" } as RecordingRow,
-      { id: "4" } as RecordingRow,
+      makeQueueItem({ id: "0" }),
+      makeQueueItem({ id: "1" }),
+      makeQueueItem({ id: "2" }),
+      makeQueueItem({ id: "3" }),
+      makeQueueItem({ id: "4" }),
     ];
     const batch = calculatePomodoroBatch({
       playable: tracks,
@@ -346,7 +346,7 @@ describe("calculatePomodoroBatch", () => {
       last_played: null,
     }));
     const tracks = [
-      makeRecording({ id: "nodur", duration_ms: null, rating: 5 } as Partial<RecordingRow> & { id: string }),
+      makeQueueItem({ id: "nodur", duration_ms: null, rating: 5 } as Partial<RecordingRow> & { id: string }),
       ...base,
     ];
     const batch = calculatePomodoroBatch({
@@ -361,7 +361,7 @@ describe("calculatePomodoroBatch", () => {
 
   it("returns empty when all tracks are too long", () => {
     const tracks = [
-      makeRecording({ id: "long", duration_ms: 40 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
+      makeQueueItem({ id: "long", duration_ms: 40 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
     ];
     const batch = calculatePomodoroBatch({
       playable: tracks,
@@ -378,7 +378,7 @@ describe("calculatePomodoroBatch", () => {
     // Regression: when target ≤ tolerance, lowerBound ≤ 0, which used to
     // cause the while loop to skip entirely.
     const tracks = [
-      makeRecording({ id: "short", duration_ms: 4 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
+      makeQueueItem({ id: "short", duration_ms: 4 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
     ];
     const batch = calculatePomodoroBatch({
       playable: tracks,
@@ -394,7 +394,7 @@ describe("calculatePomodoroBatch", () => {
 
   it("returns best effort even if under target", () => {
     const tracks = [
-      makeRecording({ id: "only", duration_ms: 10 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
+      makeQueueItem({ id: "only", duration_ms: 10 * 60 * 1000, rating: 5 } as Partial<RecordingRow> & { id: string }),
     ];
     const batch = calculatePomodoroBatch({
       playable: tracks,

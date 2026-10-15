@@ -4,7 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
-import { pickNextTrack } from "./autoDj";
+import { pickNextTrack, pinPrimarySource, pinSource, type QueueItem, type RecordingRow } from "./autoDj";
+import { applySourceRating, applySourceRatingToItem } from "./sourceRating";
 import { describeLastPlayed } from "./lastPlayed";
 import { loveToggleAction } from "./lastfmLove";
 import { calculatePomodoroBatch, parsePomodoroDuration, formatPomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
@@ -87,33 +88,6 @@ type AppBootstrap = {
   config: AppConfig;
   import_progress: ImportProgress;
   library_summary: LibrarySummary;
-};
-
-type ReleaseInfo = {
-  release_group_id: string;
-  release_group_title: string;
-  track_position: number | null;
-  disc_position: number | null;
-  disc_total: number | null;
-};
-
-type RecordingRow = {
-  id: string;
-  title: string;
-  duration_ms: number | null;
-  primary_artist_id: string | null;
-  artist_credit_name: string | null;
-  genre: string | null;
-  rating: number | null;
-  predicted_rating: number | null;
-  play_count: number;
-  last_played: string | null;
-  primary_source_id: string | null;
-  primary_source_path: string | null;
-  tags: string[];
-  artist_ids: string[];
-  source_paths: string[];
-  releases: ReleaseInfo[];
 };
 
 const RECORDINGS_PAGE_SIZE = 5_000;
@@ -239,8 +213,6 @@ type LastFmLovedStatusEvent = {
   artist: string;
   track: string;
 };
-
-type QueueItem = RecordingRow;
 
 type ContextMenuState =
   | { kind: "recording"; x: number; y: number; path: string; recording: RecordingRow }
@@ -481,13 +453,14 @@ function compareRecordings(a: RecordingRow, b: RecordingRow, col: SortColumn, as
 
 type RatingStarsProps = {
   value: number | null;
-  recordingId: string;
-  onRate: (recordingId: string, value: number | null) => void;
+  /** The source the rating applies to; null when there is nothing playable to rate. */
+  sourceId: string | null;
+  onRate: (sourceId: string, value: number | null) => void;
   disabled?: boolean;
   isPredicted?: boolean;
 };
 
-const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disabled = false, isPredicted = false }: RatingStarsProps) {
+const RatingStars = memo(function RatingStars({ value, sourceId, onRate, disabled = false, isPredicted = false }: RatingStarsProps) {
   const fillClass = isPredicted ? "rating-star-predicted" : "rating-star-filled";
   return (
     <div className="rating-stars" role="group">
@@ -497,12 +470,14 @@ const RatingStars = memo(function RatingStars({ value, recordingId, onRate, disa
           <button
             aria-label={`Set rating to ${star}`}
             className={`rating-star ${filled ? fillClass : ""}`}
-            disabled={disabled}
+            disabled={disabled || sourceId === null}
             key={star}
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              onRate(recordingId, isPredicted ? star : (value === star ? null : star));
+              if (sourceId !== null) {
+                onRate(sourceId, isPredicted ? star : (value === star ? null : star));
+              }
             }}
             type="button"
           >
@@ -528,21 +503,30 @@ async function reportPoolTimeout(context: string, value: unknown) {
   }
 }
 
-function applyRatingToRecording(recording: RecordingRow, recordingId: string, stars: number | null): RecordingRow {
-  return recording.id === recordingId ? { ...recording, rating: stars } : recording;
-}
-
 function reconcileRecording(recording: RecordingRow, recordingsById: Map<string, RecordingRow>): RecordingRow {
   return recordingsById.get(recording.id) ?? recording;
 }
 
-function reconcileRecordingList(
-  items: RecordingRow[],
+/** Refresh an item's recording data while keeping it pinned to the same source. */
+function reconcileItem(item: QueueItem, recordingsById: Map<string, RecordingRow>): QueueItem {
+  const fresh = recordingsById.get(item.id);
+  if (!fresh) {
+    return item;
+  }
+  const source = fresh.sources.find((s) => s.id === item.source.id) ?? item.source;
+  // Already derived from this exact recording: keep the reference so the
+  // reconcile effect (which depends on the lists it updates) settles.
+  return item.sources === fresh.sources && item.source === source ? item : { ...fresh, source };
+}
+
+function reconcileRecordingList<T extends RecordingRow>(
+  items: T[],
   recordingsById: Map<string, RecordingRow>,
-): RecordingRow[] {
+  reconcile: (item: T, byId: Map<string, RecordingRow>) => T,
+): T[] {
   let changed = false;
   const nextItems = items.map((item) => {
-    const nextItem = reconcileRecording(item, recordingsById);
+    const nextItem = reconcile(item, recordingsById);
     if (nextItem !== item) {
       changed = true;
     }
@@ -1080,7 +1064,7 @@ function App() {
   }
 
   function enqueueAll(recordings: RecordingRow[]) {
-    const playable = recordings.filter((r) => r.primary_source_id !== null);
+    const playable = recordings.flatMap((r) => pinPrimarySource(r) ?? []);
     if (playable.length === 0) {
       setError("No playable tracks in results.");
       return;
@@ -1088,11 +1072,11 @@ function App() {
     setError(null);
     if (!currentTrack && playerState.status === "stopped" && playable.length > 0) {
       const [first, ...rest] = playable;
-      const restEntries = rest.map((recording) => makeQueueEntry(recording));
+      const restEntries = rest.map((item) => makeQueueEntry(item));
       setCurrentTrack(first);
       setQueue((q) => [...q, ...restEntries]);
     } else {
-      const entries = playable.map((recording) => makeQueueEntry(recording));
+      const entries = playable.map((item) => makeQueueEntry(item));
       setQueue((q) => [...q, ...entries]);
     }
   }
@@ -1442,14 +1426,14 @@ function App() {
     }
 
     const recordingsById = new Map(recordings.map((recording) => [recording.id, recording] as const));
-    setHistory((current) => reconcileRecordingList(current, recordingsById));
-    setQueue((current) => mapQueueEntryRecording(current, (recording) => reconcileRecording(recording, recordingsById)));
-    setCurrentTrack((current) => (current ? reconcileRecording(current, recordingsById) : current));
+    setHistory((current) => reconcileRecordingList(current, recordingsById, reconcileItem));
+    setQueue((current) => mapQueueEntryRecording(current, (item) => reconcileItem(item, recordingsById)));
+    setCurrentTrack((current) => (current ? reconcileItem(current, recordingsById) : current));
     setSmartResult((current) => (
       current
         ? {
             ...current,
-            recordings: reconcileRecordingList(current.recordings, recordingsById),
+            recordings: reconcileRecordingList(current.recordings, recordingsById, reconcileRecording),
           }
         : current
     ));
@@ -1461,7 +1445,7 @@ function App() {
           }
         : current
     ));
-  }, [recordings]);
+  }, [recordings, currentTrack, queue, history, smartResult]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1556,25 +1540,26 @@ function App() {
       currentTrack,
     });
 
-    if (pick) {
-      const entry = makeQueueEntry(pick);
+    const pinnedPick = pick ? pinPrimarySource(pick) : null;
+    if (pinnedPick) {
+      const entry = makeQueueEntry(pinnedPick);
       setQueue((current) => [...current, entry]);
     }
   }, [autoDj, queue, recordings, history, currentTrack]);
 
   useEffect(() => {
-    if (!currentTrack?.primary_source_id) {
+    if (!currentTrack) {
       return;
     }
 
     setError(null);
     void invoke<PlayerState>("play", {
-      request: { source_id: currentTrack.primary_source_id },
+      request: { source_id: currentTrack.source.id },
     }).catch((playError) => {
       setError(playError instanceof Error ? playError.message : String(playError));
       setCurrentTrack(null);
     });
-  }, [currentTrack?.id, currentTrack?.primary_source_id]);
+  }, [currentTrack?.source.id]);
 
   useEffect(() => {
     if (!playerState.source_id) {
@@ -1693,7 +1678,7 @@ function App() {
       try {
         await invoke("record_play_history", {
           input: {
-            source_id: finishedTrack.primary_source_id!,
+            source_id: finishedTrack.source.id,
             duration_played_ms: positionMs ?? playerState.position_ms,
           },
         });
@@ -1944,7 +1929,7 @@ function App() {
   }
 
   function openQueueSourceContextMenu(e: React.MouseEvent, item: QueueItem) {
-    const path = item.primary_source_path;
+    const path = item.source.file_path;
     if (path) openEntitySourceContextMenu(e, path);
     else openRecordingContextMenu(e, item);
   }
@@ -1954,19 +1939,33 @@ function App() {
   }
 
   function enqueueRecording(recording: RecordingRow) {
-    if (!recording.primary_source_id) {
+    const item = pinPrimarySource(recording);
+    if (!item) {
       setError(`No playable local file is available for "${recording.title}".`);
       return;
     }
+    enqueueItem(item);
+  }
 
+  function enqueueItem(item: QueueItem) {
     setError(null);
     if (!currentTrack && playerState.status === "stopped") {
-      setCurrentTrack(recording);
+      setCurrentTrack(item);
       return;
     }
 
-    const entry = makeQueueEntry(recording);
+    const entry = makeQueueEntry(item);
     setQueue((current) => [...current, entry]);
+  }
+
+  /** Pin a library recording to one of its sources, reporting an error if unknown. */
+  function pinLibrarySource(recordingId: string, sourceId: string | null, label: string): QueueItem | null {
+    const recording = recordings.find((r) => r.id === recordingId);
+    const item = recording ? pinSource(recording, sourceId) : null;
+    if (!item) {
+      setError(`No playable source available for "${label}".`);
+    }
+    return item;
   }
 
   function removeFromQueue(index: number) {
@@ -2101,10 +2100,15 @@ function App() {
     }
   }
 
-  const handleRate = useCallback((recordingId: string, stars: number | null) => {
-    void updateRecordingRating(recordingId, stars);
+  // Latest displayed state, so the rating callback stays referentially stable
+  // (keeping memo(RatingStars) effective) while still seeing fresh values.
+  const latestRef = useRef({ recordings, currentTrack, queue, history });
+  latestRef.current = { recordings, currentTrack, queue, history };
+
+  const handleRate = useCallback((sourceId: string, stars: number | null) => {
+    void updateSourceRating(sourceId, stars);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recordings]);
+  }, []);
 
   async function handleLoveTrack() {
     if (!currentTrack?.artist_credit_name || !currentTrack?.title || !lastfmStatus?.logged_in) return;
@@ -2186,41 +2190,38 @@ function App() {
     }
   }
 
-  async function updateRecordingRating(recordingId: string, stars: number | null) {
-    const ratingKey = `recording:${recordingId}`;
-    // The pre-optimistic rating for this recording, used to roll back on error.
-    // Read from `recordings` (which is a dependency of handleRate's useCallback, so
-    // it is fresh) rather than from stale-closure snapshots of queue/history, which
-    // would silently discard unrelated concurrent changes (enqueues, auto-advance).
-    const previousRating = recordings.find((r) => r.id === recordingId)?.rating ?? null;
+  // The source's current own rating, wherever it is displayed. Used to roll
+  // back on error.
+  function findSourceRating(sourceId: string): number | null {
+    const { recordings, currentTrack, queue, history } = latestRef.current;
+    const pinned = [currentTrack, ...queue.map((entry) => entry.recording), ...history]
+      .find((item) => item?.source.id === sourceId);
+    if (pinned) {
+      return pinned.source.rating;
+    }
+    return recordings.flatMap((r) => r.sources).find((src) => src.id === sourceId)?.rating ?? null;
+  }
+
+  async function updateSourceRating(sourceId: string, stars: number | null) {
+    const ratingKey = `source:${sourceId}`;
+    const previousRating = findSourceRating(sourceId);
     setRatingKeyInFlight(ratingKey);
-    setRecordings((current) =>
-      current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
-    );
-    setHistory((current) =>
-      current.map((recording) => applyRatingToRecording(recording, recordingId, stars)),
-    );
-    setQueue((current) =>
-      mapQueueEntryRecording(current, (recording) => applyRatingToRecording(recording, recordingId, stars)),
-    );
-    setCurrentTrack((current) =>
-      current ? applyRatingToRecording(current, recordingId, stars) : current,
-    );
-    setSmartResult((current) =>
-      current
-        ? {
-            ...current,
-            recordings: current.recordings.map((recording) =>
-              applyRatingToRecording(recording, recordingId, stars),
-            ),
-          }
-        : current,
-    );
+    // Functional updaters, so unrelated concurrent changes (enqueues,
+    // auto-advance) survive both the optimistic update and a rollback.
+    const applyEverywhere = (value: number | null) => {
+      const row = (recording: RecordingRow) => applySourceRating(recording, sourceId, value);
+      const item = (queued: QueueItem) => applySourceRatingToItem(queued, sourceId, value);
+      setRecordings((current) => current.map(row));
+      setHistory((current) => current.map(item));
+      setQueue((current) => mapQueueEntryRecording(current, item));
+      setCurrentTrack((current) => (current ? item(current) : current));
+      setSmartResult((current) =>
+        current ? { ...current, recordings: current.recordings.map(row) } : current,
+      );
+    };
+    applyEverywhere(stars);
 
     try {
-      const rec = recordings.find((r) => r.id === recordingId);
-      const sourceId = rec?.primary_source_id;
-      if (!sourceId) throw new Error("No source available to rate");
       const updateResult = await invoke<RecordingRatingUpdateResult>("set_source_rating", {
         request: { source_id: sourceId, stars },
       });
@@ -2259,16 +2260,7 @@ function App() {
         );
       }
     } catch (ratingError) {
-      // Roll back only the optimistic rating for this recording, via functional
-      // updaters so unrelated concurrent changes (enqueues, auto-advance) survive.
-      const revertRating = (recording: RecordingRow) => applyRatingToRecording(recording, recordingId, previousRating);
-      setRecordings((current) => current.map(revertRating));
-      setHistory((current) => current.map(revertRating));
-      setQueue((current) => mapQueueEntryRecording(current, revertRating));
-      setCurrentTrack((current) => (current ? revertRating(current) : current));
-      setSmartResult((current) =>
-        current ? { ...current, recordings: current.recordings.map(revertRating) } : current,
-      );
+      applyEverywhere(previousRating);
       setError(ratingError instanceof Error ? ratingError.message : String(ratingError));
     } finally {
       setRatingKeyInFlight((current) => (current === ratingKey ? null : current));
@@ -2372,11 +2364,11 @@ function App() {
             {currentTrack ? (
               <span className="now-playing-rating">
                 <RatingStars
-                disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
+                disabled={ratingKeyInFlight === `source:${currentTrack.source.id}`}
                 onRate={handleRate}
-                recordingId={currentTrack.id}
-                value={currentTrack.rating !== null ? currentTrack.rating : currentTrack.predicted_rating}
-                isPredicted={currentTrack.rating === null}
+                sourceId={currentTrack.source.id}
+                value={currentTrack.source.rating !== null ? currentTrack.source.rating : currentTrack.predicted_rating}
+                isPredicted={currentTrack.source.rating === null}
               />
               {lastfmStatus?.logged_in ? (
                 <button
@@ -2689,52 +2681,12 @@ function App() {
                       setError(`No playable local file is available for "${recording.title}".`);
                       return;
                     }
-                    enqueueRecording({
-                      id: recording.id,
-                      title: recording.title,
-                      duration_ms: source.duration_ms ?? recording.duration_ms,
-                      primary_artist_id: recording.primary_artist_id,
-                      artist_credit_name: recording.artist_credit_name,
-                      genre: recording.genre,
-                      rating: recording.rating,
-                      predicted_rating: null,
-                      play_count: recording.play_count,
-                      last_played: recording.last_played,
-                      primary_source_id: source.id,
-                      primary_source_path: source.file_path,
-                      tags: [], artist_ids: [], source_paths: [source.file_path], releases: recording.releases,
-                    });
+                    const item = pinLibrarySource(recording.id, source.id, recording.title);
+                    if (item) enqueueItem(item);
                   }}
                   onEnqueueTrack={(track) => {
-                    if (!track.has_source || !track.primary_source_id) {
-                      setError(`No playable source available for "${track.recording_title}".`);
-                      return;
-                    }
-                    setError(null);
-                    const item: RecordingRow = {
-                      id: track.recording_id,
-                      title: track.recording_title,
-                      duration_ms: track.duration_ms,
-                      primary_artist_id: track.primary_artist_id,
-                      artist_credit_name: track.artist_credit_name,
-                      primary_source_id: track.primary_source_id,
-                      primary_source_path: null,
-                      genre: null,
-                      rating: null,
-                      predicted_rating: null,
-                      play_count: 0,
-                      last_played: null,
-                      tags: [],
-                      artist_ids: [],
-                      source_paths: [],
-                      releases: [],
-                    };
-                    if (!currentTrack && playerState.status === "stopped") {
-                      setCurrentTrack(item);
-                    } else {
-                      const entry = makeQueueEntry(item);
-                      setQueue((q) => [...q, entry]);
-                    }
+                    const item = pinLibrarySource(track.recording_id, track.primary_source_id, track.recording_title);
+                    if (item) enqueueItem(item);
                   }}
                   onRescanRecording={(recordingId) => { void handleRescanRecording(recordingId); }}
                   onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
@@ -2789,9 +2741,9 @@ function App() {
                                 </td>
                                 <td>
                                   <RatingStars
-                                    disabled={ratingKeyInFlight === `recording:${recording.id}`}
+                                    disabled={ratingKeyInFlight === `source:${recording.primary_source_id}`}
                                     onRate={handleRate}
-                                    recordingId={recording.id}
+                                    sourceId={recording.primary_source_id}
                                     value={recording.rating !== null ? recording.rating : recording.predicted_rating}
                                     isPredicted={recording.rating === null}
                                   />
@@ -2937,9 +2889,9 @@ function App() {
                                   <td>{recording.genre ?? "—"}</td>
                                   <td>
                                     <RatingStars
-                                      disabled={ratingKeyInFlight === `recording:${recording.id}`}
+                                      disabled={ratingKeyInFlight === `source:${recording.primary_source_id}`}
                                       onRate={handleRate}
-                                      recordingId={recording.id}
+                                      sourceId={recording.primary_source_id}
                                       value={recording.rating !== null ? recording.rating : recording.predicted_rating}
                                       isPredicted={recording.rating === null}
                                     />
@@ -3079,17 +3031,17 @@ function App() {
                       onContextMenu={(e) => openQueueSourceContextMenu(e, item)}
                     >
                       <div className="queue-row">
-                        <strong><FileIssueIndicator paths={item.primary_source_path ? [item.primary_source_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
+                        <strong><FileIssueIndicator paths={item.source.file_path ? [item.source.file_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
                       </div>
                       <div className="queue-row">
                         <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
                         <RatingStars
-                          disabled={ratingKeyInFlight === `recording:${item.id}`}
+                          disabled={ratingKeyInFlight === `source:${item.source.id}`}
                           onRate={handleRate}
-                          recordingId={item.id}
-                          value={item.rating !== null ? item.rating : item.predicted_rating}
-                          isPredicted={item.rating === null}
+                          sourceId={item.source.id}
+                          value={item.source.rating !== null ? item.source.rating : item.predicted_rating}
+                          isPredicted={item.source.rating === null}
                         />
                       </div>
                       <div className="queue-last-played">{describeLastPlayed(item.last_played, new Date())}</div>
@@ -3098,17 +3050,17 @@ function App() {
                   {currentTrack ? (
                     <li className="queue-now-playing" onContextMenu={(e) => openQueueSourceContextMenu(e, currentTrack)}>
                       <div className="queue-row">
-                        <strong><FileIssueIndicator paths={currentTrack.primary_source_path ? [currentTrack.primary_source_path] : currentTrack.source_paths} issuesByPath={issuesByPath} />{currentTrack.title}</strong>
+                        <strong><FileIssueIndicator paths={currentTrack.source.file_path ? [currentTrack.source.file_path] : currentTrack.source_paths} issuesByPath={issuesByPath} />{currentTrack.title}</strong>
                         <span className="queue-duration">{formatDuration(currentTrack.duration_ms)}</span>
                       </div>
                       <div className="queue-row">
                         <span>{currentTrack.artist_credit_name ?? "Unknown Artist"}</span>
                         <RatingStars
-                          disabled={ratingKeyInFlight === `recording:${currentTrack.id}`}
+                          disabled={ratingKeyInFlight === `source:${currentTrack.source.id}`}
                           onRate={handleRate}
-                          recordingId={currentTrack.id}
-                          value={currentTrack.rating !== null ? currentTrack.rating : currentTrack.predicted_rating}
-                          isPredicted={currentTrack.rating === null}
+                          sourceId={currentTrack.source.id}
+                          value={currentTrack.source.rating !== null ? currentTrack.source.rating : currentTrack.predicted_rating}
+                          isPredicted={currentTrack.source.rating === null}
                         />
                       </div>
                       <div className="queue-last-played">{describeLastPlayed(currentTrack.last_played, new Date())}</div>
@@ -3157,7 +3109,7 @@ function App() {
                       onContextMenu={(e) => openQueueSourceContextMenu(e, item)}
                     >
                       <div className="queue-row">
-                        <strong><FileIssueIndicator paths={item.primary_source_path ? [item.primary_source_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
+                        <strong><FileIssueIndicator paths={item.source.file_path ? [item.source.file_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
                         <button
                           className="queue-remove-btn"
@@ -3172,11 +3124,11 @@ function App() {
                       <div className="queue-row">
                         <span>{item.artist_credit_name ?? "Unknown Artist"}</span>
                         <RatingStars
-                          disabled={ratingKeyInFlight === `recording:${item.id}`}
+                          disabled={ratingKeyInFlight === `source:${item.source.id}`}
                           onRate={handleRate}
-                          recordingId={item.id}
-                          value={item.rating !== null ? item.rating : item.predicted_rating}
-                          isPredicted={item.rating === null}
+                          sourceId={item.source.id}
+                          value={item.source.rating !== null ? item.source.rating : item.predicted_rating}
+                          isPredicted={item.source.rating === null}
                         />
                       </div>
                       <div className="queue-last-played">{describeLastPlayed(item.last_played, new Date())}</div>
@@ -3475,41 +3427,29 @@ function App() {
                                 type="button"
                                 title="Play the current file to confirm it's still valid before deleting the backup"
                                 onClick={() => {
-                                  const targetTrack: RecordingRow = recordings.find(
+                                  const owner = recordings.find(
                                     (r) =>
-                                      (issue.source_id && r.primary_source_id === issue.source_id) ||
+                                      (issue.source_id && r.sources.some((src) => src.id === issue.source_id)) ||
                                       r.source_paths.includes(issue.file_path)
-                                  ) ?? {
-                                    id: issue.recording_id ?? issue.source_id ?? issue.file_path,
-                                    title: issue.file_path.split("/").pop() ?? issue.file_path,
-                                    duration_ms: null,
-                                    primary_artist_id: null,
-                                    artist_credit_name: null,
-                                    genre: null,
-                                    rating: null,
-                                    predicted_rating: null,
-                                    play_count: 0,
-                                    last_played: null,
-                                    primary_source_id: issue.source_id ?? null,
-                                    primary_source_path: issue.file_path,
-                                    tags: [],
-                                    artist_ids: [],
-                                    source_paths: [issue.file_path],
-                                    releases: [],
-                                  };
+                                  );
+                                  const ownerSourceId = owner?.sources.find(
+                                    (src) => src.id === issue.source_id || src.file_path === issue.file_path
+                                  )?.id ?? null;
+                                  const targetTrack = owner ? pinSource(owner, ownerSourceId) : null;
+                                  if (!targetTrack) {
+                                    setError(`"${issue.file_path}" is not in the library.`);
+                                    return;
+                                  }
 
                                   if (currentTrack) {
                                     setHistory((prev) => [currentTrack, ...prev].slice(0, queueHistoryLimit));
                                   }
                                   setCurrentTrack(targetTrack);
-                                  const sourceIdToPlay = targetTrack.primary_source_id ?? issue.source_id;
-                                  if (sourceIdToPlay) {
-                                    void invoke<PlayerState>("play", {
-                                      request: { source_id: sourceIdToPlay },
-                                    }).catch((playError) => {
-                                      setError(playError instanceof Error ? playError.message : String(playError));
-                                    });
-                                  }
+                                  void invoke<PlayerState>("play", {
+                                    request: { source_id: targetTrack.source.id },
+                                  }).catch((playError) => {
+                                    setError(playError instanceof Error ? playError.message : String(playError));
+                                  });
                                 }}
                               >
                                 Play file

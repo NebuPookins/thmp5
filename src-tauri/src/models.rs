@@ -139,6 +139,18 @@ pub struct ReleaseInfo {
     pub disc_total: Option<i64>,
 }
 
+/// One playable file/stream backing a recording. Ratings, play counts and
+/// last-played are tracked here; a recording's values are derived from these.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceRow {
+    pub id: String,
+    pub file_path: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub rating: Option<f64>,
+    pub play_count: i64,
+    pub last_played: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordingRow {
     pub id: String,
@@ -156,6 +168,7 @@ pub struct RecordingRow {
     pub tags: Vec<String>,
     pub artist_ids: Vec<String>,
     pub source_paths: Vec<String>,
+    pub sources: Vec<SourceRow>,
     pub releases: Vec<ReleaseInfo>,
 }
 

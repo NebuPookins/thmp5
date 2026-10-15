@@ -18,7 +18,18 @@ export interface RecordingRow {
   tags: string[];
   artist_ids: string[];
   source_paths: string[];
+  sources: SourceRow[];
   releases: ReleaseInfo[];
+}
+
+/** One playable file/stream backing a recording; ratings are tracked per source. */
+export interface SourceRow {
+  id: string;
+  file_path: string | null;
+  duration_ms: number | null;
+  rating: number | null;
+  play_count: number;
+  last_played: string | null;
 }
 
 export interface ReleaseInfo {
@@ -29,7 +40,23 @@ export interface ReleaseInfo {
   disc_total: number | null;
 }
 
-export type QueueItem = RecordingRow;
+/**
+ * A recording pinned to the specific source that is queued, playing or was
+ * played. `rating` is still the recording's derived average; the source's own
+ * rating is `source.rating`.
+ */
+export type QueueItem = RecordingRow & { source: SourceRow };
+
+/** Pin `recording` to the source `sourceId`, or null when it has no such source. */
+export function pinSource(recording: RecordingRow, sourceId: string | null): QueueItem | null {
+  const source = recording.sources.find((s) => s.id === sourceId);
+  return source ? { ...recording, source } : null;
+}
+
+/** Pin `recording` to its primary source, or null when it has no playable source. */
+export function pinPrimarySource(recording: RecordingRow): QueueItem | null {
+  return pinSource(recording, recording.primary_source_id);
+}
 
 export interface PickOptions {
   /** All playable recordings (those with primary_source_id !== null). */

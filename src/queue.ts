@@ -6,13 +6,13 @@
  * mid-drag (auto-advance) and is reconciled into fresh objects.
  */
 
-import type { RecordingRow } from "./autoDj";
+import type { QueueItem } from "./autoDj";
 
 /** A single upcoming queue item: a stable key plus the recording it references. */
 export interface QueueEntry {
   /** Stable, unique-per-enqueue identity (unlike recording id, which may repeat). */
   key: string;
-  recording: RecordingRow;
+  recording: QueueItem;
 }
 
 // Monotonic source of keys so each enqueue is uniquely addressable even when the
@@ -26,7 +26,7 @@ function nextKey(): string {
   return `queue-${keyCounter}`;
 }
 
-export function makeQueueEntry(recording: RecordingRow, key?: string): QueueEntry {
+export function makeQueueEntry(recording: QueueItem, key?: string): QueueEntry {
   return { key: key ?? nextKey(), recording };
 }
 
@@ -124,7 +124,7 @@ export function moveEntryByKey<T extends { key: string }>(
  */
 export function mapQueueEntryRecording(
   entries: QueueEntry[],
-  fn: (recording: RecordingRow) => RecordingRow,
+  fn: (recording: QueueItem) => QueueItem,
 ): QueueEntry[] {
   let changed = false;
   const next = entries.map((entry) => {

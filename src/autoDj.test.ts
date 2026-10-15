@@ -6,7 +6,7 @@ import {
   pickNextTrack,
   parsePlayedAt,
 } from "./autoDj";
-import { FAKE_NOW, ONE_DAY_MS, makeRecording } from "./testHelpers";
+import { FAKE_NOW, ONE_DAY_MS, makeQueueItem } from "./testHelpers";
 
 // ── parsePlayedAt ────────────────────────────────────────────────────────────
 
@@ -34,28 +34,28 @@ describe("parsePlayedAt", () => {
 
 describe("excludeRecentlyPlayed", () => {
   it("keeps items with no last_played", () => {
-    const a = makeRecording({ id: "a", last_played: null });
+    const a = makeQueueItem({ id: "a", last_played: null });
     const result = excludeRecentlyPlayed([a], FAKE_NOW);
     expect(result).toEqual([a]);
   });
 
   it("excludes items played less than 24h ago", () => {
     const recent = new Date(FAKE_NOW - 1000).toISOString();
-    const a = makeRecording({ id: "a", last_played: recent });
+    const a = makeQueueItem({ id: "a", last_played: recent });
     const result = excludeRecentlyPlayed([a], FAKE_NOW);
     expect(result).toEqual([]);
   });
 
   it("keeps items played more than 24h ago", () => {
     const old = new Date(FAKE_NOW - ONE_DAY_MS - 1).toISOString();
-    const a = makeRecording({ id: "a", last_played: old });
+    const a = makeQueueItem({ id: "a", last_played: old });
     const result = excludeRecentlyPlayed([a], FAKE_NOW);
     expect(result).toEqual([a]);
   });
 
   it("keeps items played exactly 24h ago (boundary)", () => {
     const boundary = new Date(FAKE_NOW - ONE_DAY_MS).toISOString();
-    const a = makeRecording({ id: "a", last_played: boundary });
+    const a = makeQueueItem({ id: "a", last_played: boundary });
     // exactly 24h → playedAt = FAKE_NOW - 86400000
     // cutoff = FAKE_NOW - 86400000
     // playedAt === cutoff → NOT < cutoff → excluded
@@ -64,11 +64,11 @@ describe("excludeRecentlyPlayed", () => {
   });
 
   it("uses UTC for SQLite-format timestamps from the backend", () => {
-    const recent = makeRecording({
+    const recent = makeQueueItem({
       id: "recent",
       last_played: toSqliteDatetime(FAKE_NOW - ONE_DAY_MS + 60_000),
     });
-    const old = makeRecording({
+    const old = makeQueueItem({
       id: "old",
       last_played: toSqliteDatetime(FAKE_NOW - ONE_DAY_MS - 60_000),
     });
@@ -76,21 +76,21 @@ describe("excludeRecentlyPlayed", () => {
   });
 
   it("handles malformed last_played gracefully", () => {
-    const a = makeRecording({ id: "a", last_played: "not-a-date" });
+    const a = makeQueueItem({ id: "a", last_played: "not-a-date" });
     const result = excludeRecentlyPlayed([a], FAKE_NOW);
     expect(result).toEqual([]);
   });
 
   it("mixed bag: recently played excluded, old kept, null kept", () => {
-    const old = makeRecording({
+    const old = makeQueueItem({
       id: "old",
       last_played: new Date(FAKE_NOW - ONE_DAY_MS - 100_000).toISOString(),
     });
-    const recent = makeRecording({
+    const recent = makeQueueItem({
       id: "recent",
       last_played: new Date(FAKE_NOW - 1000).toISOString(),
     });
-    const never = makeRecording({ id: "never", last_played: null });
+    const never = makeQueueItem({ id: "never", last_played: null });
     const result = excludeRecentlyPlayed([old, recent, never], FAKE_NOW);
     expect(result).toEqual([old, never]);
   });
@@ -100,22 +100,22 @@ describe("excludeRecentlyPlayed", () => {
 
 describe("excludeIds", () => {
   it("excludes items whose id is in the set", () => {
-    const a = makeRecording({ id: "a" });
-    const b = makeRecording({ id: "b" });
+    const a = makeQueueItem({ id: "a" });
+    const b = makeQueueItem({ id: "b" });
     const result = excludeIds([a, b], new Set(["a"]));
     expect(result).toEqual([b]);
   });
 
   it("returns all items when set is empty", () => {
-    const a = makeRecording({ id: "a" });
-    const b = makeRecording({ id: "b" });
+    const a = makeQueueItem({ id: "a" });
+    const b = makeQueueItem({ id: "b" });
     const result = excludeIds([a, b], new Set());
     expect(result).toEqual([a, b]);
   });
 
   it("returns empty array when all items excluded", () => {
-    const a = makeRecording({ id: "a" });
-    const b = makeRecording({ id: "b" });
+    const a = makeQueueItem({ id: "a" });
+    const b = makeQueueItem({ id: "b" });
     const result = excludeIds([a, b], new Set(["a", "b"]));
     expect(result).toEqual([]);
   });
@@ -133,26 +133,26 @@ describe("pickByRatingStrategy", () => {
     // Run multiple times to see if we ever get the rated one without
     // the unrated being available.
     // If only unrated is available we must always get it.
-    const unrated = makeRecording({ id: "un", rating: null, primary_source_id: "src-un" });
+    const unrated = makeQueueItem({ id: "un", rating: null, primary_source_id: "src-un" });
     const result = pickByRatingStrategy([], [unrated]);
     expect(result).toBeDefined();
     expect(result!.id).toBe("un");
   });
 
   it("with no rated history and only rated candidates, picks from candidates", () => {
-    const rated = makeRecording({ id: "rated", rating: 4, primary_source_id: "src-rated" });
+    const rated = makeQueueItem({ id: "rated", rating: 4, primary_source_id: "src-rated" });
     const result = pickByRatingStrategy([], [rated]);
     expect(result).toBeDefined();
     expect(result!.id).toBe("rated");
   });
 
   it("with neutral avg rating, prefers 4+ candidates", () => {
-    const high = makeRecording({ id: "high", rating: 4, primary_source_id: "src-high" });
-    const low = makeRecording({ id: "low", rating: 2, primary_source_id: "src-low" });
+    const high = makeQueueItem({ id: "high", rating: 4, primary_source_id: "src-high" });
+    const low = makeQueueItem({ id: "low", rating: 2, primary_source_id: "src-low" });
     // History with avg 3.0 (neutral)
     const history = [
-      makeRecording({ id: "h1", rating: 3 }),
-      makeRecording({ id: "h2", rating: 3 }),
+      makeQueueItem({ id: "h1", rating: 3 }),
+      makeQueueItem({ id: "h2", rating: 3 }),
     ];
     const result = pickByRatingStrategy(history, [high, low]);
     // Can't assert which one is picked (random), but can assert it's one of them
@@ -165,19 +165,19 @@ describe("pickByRatingStrategy", () => {
 
 describe("pickNextTrack", () => {
   const playable = [
-    makeRecording({ id: "a", last_played: null }),
-    makeRecording({ id: "b", last_played: null }),
-    makeRecording({ id: "c", last_played: null }),
-    makeRecording({ id: "d", last_played: null }),
-    makeRecording({ id: "e", last_played: null }),
-    makeRecording({ id: "f", last_played: null }),
-    makeRecording({ id: "g", last_played: null }),
+    makeQueueItem({ id: "a", last_played: null }),
+    makeQueueItem({ id: "b", last_played: null }),
+    makeQueueItem({ id: "c", last_played: null }),
+    makeQueueItem({ id: "d", last_played: null }),
+    makeQueueItem({ id: "e", last_played: null }),
+    makeQueueItem({ id: "f", last_played: null }),
+    makeQueueItem({ id: "g", last_played: null }),
   ];
 
   it("does not pick a song that is currently in the queue", () => {
     const queue = [
-      makeRecording({ id: "a" }),
-      makeRecording({ id: "b" }),
+      makeQueueItem({ id: "a" }),
+      makeQueueItem({ id: "b" }),
     ];
     const result = pickNextTrack({
       playable,
@@ -192,7 +192,7 @@ describe("pickNextTrack", () => {
   });
 
   it("does not pick the currently playing track", () => {
-    const current = makeRecording({ id: "a" });
+    const current = makeQueueItem({ id: "a" });
     const result = pickNextTrack({
       playable,
       queue: [],
@@ -205,11 +205,11 @@ describe("pickNextTrack", () => {
   });
 
   it("does not pick a song played less than 24h ago when others exist", () => {
-    const recent = makeRecording({
+    const recent = makeQueueItem({
       id: "recent",
       last_played: new Date(FAKE_NOW - 1000).toISOString(),
     });
-    const available = makeRecording({ id: "available", last_played: null });
+    const available = makeQueueItem({ id: "available", last_played: null });
     const result = pickNextTrack({
       playable: [recent, available],
       queue: [],
@@ -222,7 +222,7 @@ describe("pickNextTrack", () => {
   });
 
   it("falls back to recently-played when no other candidates exist", () => {
-    const recent = makeRecording({
+    const recent = makeQueueItem({
       id: "only-song",
       last_played: new Date(FAKE_NOW - 1000).toISOString(),
     });
@@ -243,16 +243,16 @@ describe("pickNextTrack", () => {
     // Queue was [A, B, C, D, E, F, G] where A-E are played, F was current, G was next.
     // After F finishes: history = [B, C, D, E, F], G becomes currentTrack.
     // AutoDJ picks next -> must not pick G.
-    const currentTrack = makeRecording({ id: "g", last_played: null });
+    const currentTrack = makeQueueItem({ id: "g", last_played: null });
     const result = pickNextTrack({
       playable: playable.filter((r) => r.id !== "e" && r.id !== "f"), // keep all except history-settled ones
       queue: [],
       history: [
-        makeRecording({ id: "b", rating: 3 }),
-        makeRecording({ id: "c", rating: 3 }),
-        makeRecording({ id: "d", rating: 3 }),
-        makeRecording({ id: "e", rating: 3 }),
-        makeRecording({ id: "f", rating: 3 }),
+        makeQueueItem({ id: "b", rating: 3 }),
+        makeQueueItem({ id: "c", rating: 3 }),
+        makeQueueItem({ id: "d", rating: 3 }),
+        makeQueueItem({ id: "e", rating: 3 }),
+        makeQueueItem({ id: "f", rating: 3 }),
       ],
       currentTrack,
       now: FAKE_NOW,
@@ -266,8 +266,8 @@ describe("pickNextTrack", () => {
     // setting currentTrack=null and adding HANABI to history[0].
     // AutoDJ then fires with queue=[], currentTrack=null.
     // It must NOT re-pick the same song just because it's no longer currentTrack.
-    const justFinished = makeRecording({ id: "hanabi", last_played: null });
-    const other = makeRecording({ id: "other-song", last_played: null });
+    const justFinished = makeQueueItem({ id: "hanabi", last_played: null });
+    const other = makeQueueItem({ id: "other-song", last_played: null });
     const result = pickNextTrack({
       playable: [justFinished, other],
       queue: [],

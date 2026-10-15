@@ -8,10 +8,10 @@ import {
   mapQueueEntryRecording,
   type QueueEntry,
 } from "./queue";
-import { makeRecording } from "./testHelpers";
+import { makeQueueItem } from "./testHelpers";
 
 function entry(key: string, recordingId: string): QueueEntry {
-  return makeQueueEntry(makeRecording({ id: recordingId }), key);
+  return makeQueueEntry(makeQueueItem({ id: recordingId }), key);
 }
 
 // ── moveItem ─────────────────────────────────────────────────────────────────

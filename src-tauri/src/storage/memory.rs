@@ -5,7 +5,7 @@ use crate::models::{
     ArtistDetail, ArtistReleaseGroup, ArtistRow, GuestAppearanceReleaseGroup, GuestAppearanceTrack,
     LibrarySummary, MediumDetail, MissingTrackDetail, RecordingArtistInfo, RecordingDetail,
     RecordingRow, ReleaseCompleteness, ReleaseDetail, ReleaseGroupDetail, ReleaseGroupRow,
-    ReleaseInfo, SmartPlaylistResult, SourceDetail, SourceTagInfo, TrackDetail,
+    ReleaseInfo, SmartPlaylistResult, SourceDetail, SourceRow, SourceTagInfo, TrackDetail,
 };
 use crate::query::{CmpOp, Expr, LastPlayedDir, LimitUnit, Predicate, StrOp, TimeUnit};
 use anyhow::Result;
@@ -1324,6 +1324,18 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
             .sources
             .iter()
             .filter_map(|s| s.file_path.clone())
+            .collect(),
+        sources: rec
+            .sources
+            .iter()
+            .map(|s| SourceRow {
+                id: s.id.clone(),
+                file_path: s.file_path.clone(),
+                duration_ms: s.duration_ms,
+                rating: s.rating(),
+                play_count: s.play_count,
+                last_played: s.last_played.clone(),
+            })
             .collect(),
         releases,
     }
