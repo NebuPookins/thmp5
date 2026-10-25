@@ -2,8 +2,7 @@ use crate::db::DbPool;
 use crate::fingerprint;
 use crate::library::import::import_file;
 use crate::models::FixMergedRecordingsStats;
-use anyhow::Result;
-use sqlx::Row;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::Semaphore;
@@ -26,29 +25,29 @@ pub async fn fix_merged_recordings(
     };
 
     let mut conn = db.acquire("fix_merges.list_sources").await?;
-    let rows = sqlx::query(
-        "SELECT id, file_path, raw_tags_json FROM source
-         WHERE source_type = 'local_file' AND file_path IS NOT NULL",
+    let rows = sqlx::query!(
+        r#"SELECT id AS "id!", file_path AS "file_path!", raw_tags_json FROM source
+         WHERE source_type = 'local_file' AND file_path IS NOT NULL"#
     )
     .fetch_all(&mut *conn)
-    .await?;
+    .await
+    .context("Failed to list local sources for merge fixing")?;
     drop(conn);
 
     // Group sources by MBID extracted from raw_tags_json.
     type SourceEntry = (String, String); // (id, file_path)
     let mut mbid_groups: HashMap<String, Vec<SourceEntry>> = HashMap::new();
 
-    for row in &rows {
-        let id: String = row.get("id");
-        let file_path: String = row.get("file_path");
-        let raw_tags_json: Option<String> = row.get("raw_tags_json");
-
-        let mbid = match extract_single_mbid(&raw_tags_json) {
+    for row in rows {
+        let mbid = match extract_single_mbid(&row.raw_tags_json) {
             Some(m) => m,
             None => continue,
         };
 
-        mbid_groups.entry(mbid).or_default().push((id, file_path));
+        mbid_groups
+            .entry(mbid)
+            .or_default()
+            .push((row.id, row.file_path));
     }
 
     for (mbid, sources) in &mbid_groups {
@@ -59,6 +58,7 @@ pub async fn fix_merged_recordings(
         if let Err(e) =
             process_mbid_group(db, mbid, sources, acoustid_key, serializer, &mut stats).await
         {
+            tracing::error!(mbid = %mbid, "Failed to process MBID group during merge fixing: {e:#}");
             stats.errors.push(format!("MBID {mbid}: {e:#}"));
         }
     }
@@ -159,10 +159,12 @@ async fn process_mbid_group(
         let mut conn = db
             .acquire(format!("fix_merges.delete_source source_id={source_id}"))
             .await?;
-        sqlx::query("DELETE FROM source WHERE id = ?")
-            .bind(&source_id)
+        sqlx::query!("DELETE FROM source WHERE id = ?", source_id)
             .execute(&mut *conn)
-            .await?;
+            .await
+            .with_context(|| {
+                format!("Failed to delete mismatched source source_id={source_id} path={file_path}")
+            })?;
         drop(conn);
 
         match import_file(db, Path::new(&file_path), acoustid_key, serializer).await {
@@ -171,6 +173,7 @@ async fn process_mbid_group(
                 tracing::info!(path = %file_path, "Re-imported split source");
             }
             Err(e) => {
+                tracing::error!(path = %file_path, "Re-import of split source failed: {e:#}");
                 stats
                     .errors
                     .push(format!("{file_path}: re-import failed: {e:#}"));

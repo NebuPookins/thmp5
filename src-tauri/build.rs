@@ -16,6 +16,7 @@ fn main() {
     }
 
     run_rustfmt(&rust_files);
+    build_query_check_db(&manifest_dir);
     build_taglib_helper(&manifest_dir);
     tauri_build::build()
 }
@@ -177,4 +178,68 @@ fn run_command(command: &mut Command, description: &str) {
     if !status.success() {
         panic!("{description} failed with status {status}");
     }
+}
+
+/// Builds a scratch SQLite database from every migration and points
+/// `DATABASE_URL` at it, so `sqlx::query!` macros are checked against the
+/// schema the migrations actually produce (not a stale snapshot).
+///
+/// Uses sqlx's own `Migrator` (same code path as the app's `migrate!`), which
+/// also avoids a second SQLite binding that could conflict on `links = "sqlite3"`.
+fn build_query_check_db(manifest_dir: &Path) {
+    let migrations_dir = manifest_dir.join("migrations");
+    // Directory mtime catches added/removed migrations; each file catches edits.
+    println!("cargo:rerun-if-changed={}", migrations_dir.display());
+    fs::read_dir(&migrations_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", migrations_dir.display()))
+        .flatten()
+        .for_each(|entry| println!("cargo:rerun-if-changed={}", entry.path().display()));
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("missing OUT_DIR"));
+    let db_path = out_dir.join("query-check.db");
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let stale = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if let Err(error) = fs::remove_file(&stale) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                panic!("failed to remove stale {}: {error}", stale.display());
+            }
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("failed to start tokio runtime for migrations");
+    runtime.block_on(async {
+        let migrator = sqlx::migrate::Migrator::new(migrations_dir.as_path())
+            .await
+            .unwrap_or_else(|error| panic!("failed to load migrations: {error}"));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            // Matches the app pool; migration 001 sets WAL, which cannot change inside a transaction.
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let mut conn = sqlx::ConnectOptions::connect(&options)
+            .await
+            .unwrap_or_else(|error| panic!("failed to create {}: {error}", db_path.display()));
+        sqlx::migrate::Migrate::ensure_migrations_table(&mut conn)
+            .await
+            .unwrap_or_else(|error| panic!("failed to create migrations table: {error}"));
+        // Apply one at a time so a failure names the offending migration file.
+        for migration in migrator.iter() {
+            sqlx::migrate::Migrate::apply(&mut conn, migration)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "migration {:03}_{} failed while building the query-check database: {error}",
+                        migration.version, migration.description
+                    )
+                });
+        }
+    });
+
+    println!(
+        "cargo:rustc-env=DATABASE_URL=sqlite://{}",
+        db_path.display()
+    );
 }

@@ -22,6 +22,9 @@ jack = ["cpal/jack"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Used by build.rs to create the schema database that sqlx::query! macros check against.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+tokio = { version = "1", features = ["rt"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }

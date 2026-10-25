@@ -108,15 +108,15 @@ pub async fn rescan_source(
         .acquire(format!("source_rescan.lookup path={path_str}"))
         .await
         .context("Failed to acquire DB connection for source rescan lookup")?;
-    let existing_source = sqlx::query_scalar::<_, String>(
-        "SELECT id
+    let existing_source = sqlx::query_scalar!(
+        r#"SELECT id AS "id!"
          FROM source
-         WHERE file_path = ? AND source_type = 'local_file'",
+         WHERE file_path = ? AND source_type = 'local_file'"#,
+        path_str,
     )
-    .bind(&path_str)
     .fetch_optional(&mut *conn)
     .await
-    .context("Failed to load source for rescan")?
+    .with_context(|| format!("Failed to load source for rescan path={path_str}"))?
     .ok_or_else(|| anyhow::anyhow!("Source not found for path: {}", path.display()))?;
 
     let source_id = existing_source;
@@ -208,7 +208,9 @@ pub async fn rescan_source(
 
     let fingerprint_str = blocking.fp.as_ref().map(|f| f.fingerprint.as_str());
 
-    sqlx::query(
+    let duration_ms = blocking.meta.duration_ms as i64;
+    let track_total = blocking.meta.track_total.map(|v| v as i64);
+    sqlx::query!(
         "UPDATE source
          SET file_hash = ?,
              format = ?,
@@ -224,23 +226,25 @@ pub async fn rescan_source(
              raw_tags_json = ?,
              last_verified = datetime('now')
          WHERE id = ?",
+        blocking.hash,
+        blocking.meta.format,
+        duration_ms,
+        fingerprint_str,
+        file_size,
+        file_mtime_ms,
+        track_total,
+        blocking.meta.replay_gain_track_db,
+        blocking.meta.replay_gain_track_peak,
+        blocking.meta.replay_gain_album_db,
+        blocking.meta.replay_gain_album_peak,
+        blocking.raw_tags_json,
+        source_id,
     )
-    .bind(&blocking.hash)
-    .bind(&blocking.meta.format)
-    .bind(blocking.meta.duration_ms as i64)
-    .bind(fingerprint_str)
-    .bind(file_size)
-    .bind(file_mtime_ms)
-    .bind(blocking.meta.track_total.map(|v| v as i64))
-    .bind(blocking.meta.replay_gain_track_db)
-    .bind(blocking.meta.replay_gain_track_peak)
-    .bind(blocking.meta.replay_gain_album_db)
-    .bind(blocking.meta.replay_gain_album_peak)
-    .bind(&blocking.raw_tags_json)
-    .bind(&source_id)
     .execute(&mut *tx)
     .await
-    .context("Failed to update source during rescan")?;
+    .with_context(|| {
+        format!("Failed to update source during rescan source_id={source_id} path={path_str}")
+    })?;
 
     tx.commit()
         .await
@@ -332,53 +336,38 @@ pub(crate) async fn prepare_import(
         ))
         .await
         .context("Failed to acquire DB connection for import path check")?;
-    let existing_source = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<i64>,
-            Option<i64>,
-            bool,
-            Option<String>,
-            Option<String>,
-        ),
-    >(
-        "SELECT id, file_size, file_mtime_ms, raw_tags_json IS NOT NULL,
+    let existing_source = sqlx::query!(
+        r#"SELECT id AS "id!", file_size, file_mtime_ms,
+                raw_tags_json IS NOT NULL AS "has_raw_tags!: bool",
                 file_hash, fingerprint
-         FROM source WHERE file_path = ?",
+         FROM source WHERE file_path = ?"#,
+        path_str,
     )
-    .bind(&path_str)
     .fetch_optional(&mut *conn)
     .await
-    .context("DB error checking existing path")?;
+    .with_context(|| format!("DB error checking existing path={path_str}"))?;
 
-    let file_unchanged = existing_source
-        .as_ref()
-        .is_some_and(|(_, es, em, _, _, _)| es == &Some(file_size) && em == &Some(file_mtime_ms));
+    let file_unchanged = existing_source.as_ref().is_some_and(|es| {
+        es.file_size == Some(file_size) && es.file_mtime_ms == Some(file_mtime_ms)
+    });
 
     // Each operation has its own pre-requisite. If all are satisfied, skip entirely.
     let has_hash = existing_source
         .as_ref()
-        .and_then(|(_, _, _, _, h, _)| h.as_deref())
+        .and_then(|es| es.file_hash.as_deref())
         .is_some();
-    let has_raw_tags = existing_source
-        .as_ref()
-        .is_some_and(|(_, _, _, r, _, _)| *r);
+    let has_raw_tags = existing_source.as_ref().is_some_and(|es| es.has_raw_tags);
     let has_fingerprint = existing_source
         .as_ref()
-        .and_then(|(_, _, _, _, _, f)| f.as_deref())
+        .and_then(|es| es.fingerprint.as_deref())
         .is_some();
 
     if file_unchanged && has_hash && has_raw_tags && has_fingerprint {
         return Ok(None);
     }
 
-    let existing_source_id = existing_source
-        .as_ref()
-        .map(|(id, _, _, _, _, _)| id.as_str());
-    let existing_hash = existing_source
-        .as_ref()
-        .and_then(|(_, _, _, _, h, _)| h.clone());
+    let existing_source_id = existing_source.as_ref().map(|es| es.id.as_str());
+    let existing_hash = existing_source.as_ref().and_then(|es| es.file_hash.clone());
 
     // Only compute what's actually needed.
     let needs_hash = !file_unchanged || !has_hash;
@@ -547,7 +536,9 @@ pub(crate) async fn store_prepared_import(
         .await
         .context("Failed to start import transaction")?;
 
-    sqlx::query(
+    let duration_ms = meta.duration_ms as i64;
+    let track_total = meta.track_total.map(|v| v as i64);
+    sqlx::query!(
         "INSERT INTO source (
             id, source_type, file_path, file_hash, format, duration_ms,
             fingerprint, file_size, file_mtime_ms, track_total,
@@ -568,24 +559,24 @@ pub(crate) async fn store_prepared_import(
             replay_gain_album_db = excluded.replay_gain_album_db,
             replay_gain_album_peak = excluded.replay_gain_album_peak,
             raw_tags_json = excluded.raw_tags_json",
+        source_id,
+        path_str,
+        hash,
+        meta.format,
+        duration_ms,
+        fingerprint_str,
+        file_size,
+        file_mtime_ms,
+        track_total,
+        meta.replay_gain_track_db,
+        meta.replay_gain_track_peak,
+        meta.replay_gain_album_db,
+        meta.replay_gain_album_peak,
+        raw_tags_json,
     )
-    .bind(&source_id)
-    .bind(&path_str)
-    .bind(&hash)
-    .bind(&meta.format)
-    .bind(meta.duration_ms as i64)
-    .bind(fingerprint_str)
-    .bind(file_size)
-    .bind(file_mtime_ms)
-    .bind(meta.track_total.map(|v| v as i64))
-    .bind(meta.replay_gain_track_db)
-    .bind(meta.replay_gain_track_peak)
-    .bind(meta.replay_gain_album_db)
-    .bind(meta.replay_gain_album_peak)
-    .bind(&raw_tags_json)
     .execute(&mut *tx)
     .await
-    .context("Failed to insert source")?;
+    .with_context(|| format!("Failed to insert source source_id={source_id} path={path_str}"))?;
 
     tx.commit()
         .await
@@ -727,10 +718,10 @@ mod tests {
     async fn source_id_for_path(pool: &crate::db::DbPool, path: &Path) -> String {
         let path_str = path.to_string_lossy().to_string();
         let mut conn = pool.acquire("test.source_id_for_path").await.unwrap();
-        sqlx::query_scalar(
-            "SELECT id FROM source WHERE file_path = ? AND source_type = 'local_file'",
+        sqlx::query_scalar!(
+            r#"SELECT id AS "id!" FROM source WHERE file_path = ? AND source_type = 'local_file'"#,
+            path_str,
         )
-        .bind(path_str)
         .fetch_one(&mut *conn)
         .await
         .unwrap()

@@ -24,7 +24,8 @@ A desktop music player built with **Tauri** (Rust backend + TypeScript/React fro
 - Run `cargo fmt` and `cargo clippy` before committing Rust code
 - All Tauri commands are typed end-to-end (Rust `#[tauri::command]` + generated TypeScript types)
 - Database migrations live in `src-tauri/migrations/` and are managed by `sqlx migrate`
-- Use `sqlx::query!` macros for compile-time query checking where possible
+- Use `sqlx::query!` macros for compile-time query checking where possible. `build.rs` builds a scratch DB from `migrations/` and sets `DATABASE_URL` to it, so queries are always checked against the current schema (no `.sqlx` offline data, no `.env` needed). SQLite's nullability inference is conservative: TEXT primary keys and `INTEGER PRIMARY KEY` come out as `Option`, so use `AS "id!"` overrides; only mark a nullable column like `file_path` with `!` when the query filters `IS NOT NULL`
+- Tauri commands return `Result<T, CommandError>` (`src-tauri/src/command_error.rs`) and use `?`/`.context(...)`; converting an error into `CommandError` logs it once, with the command's span fields. Annotate every `#[tauri::command]` with `#[tracing::instrument(skip_all, fields(...))]` listing its identifying inputs (never secrets) as `fields(id = id)` / `fields(%path)` — a bare `fields(id)` records an *empty* field. Use `CommandError::rejected(msg)` for invalid input / not found. Only `#[tauri::command]` fns return `CommandError`; helpers and background tasks (e.g. the Last.fm listener in `lib.rs`) return `anyhow::Result` (with `Option` for "not configured"), because converting into `CommandError` logs an ERROR "Command failed" even outside a command.
 
 ## Build & Run
 ```sh

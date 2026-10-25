@@ -1,5 +1,6 @@
 mod audio;
 mod audio_probe;
+mod command_error;
 mod commands;
 mod db;
 pub mod file_issues;
@@ -62,8 +63,10 @@ pub fn run() {
             tracing::info!("Database path: {}", db_path.display());
             tracing::info!("Log path: {}", log_path.display());
 
-            let pool = tauri::async_runtime::block_on(db::init_pool(&db_path))
-                .map_err(|e| format!("Failed to initialize database: {e}"))?;
+            let pool = tauri::async_runtime::block_on(db::init_pool(&db_path)).map_err(|e| {
+                tracing::error!(db_path = %db_path.display(), "Failed to initialize database: {e:#}");
+                format!("Failed to initialize database: {e}")
+            })?;
 
             let acoustid_api_key = std::env::var("ACOUSTID_API_KEY").ok();
             if acoustid_api_key.is_some() {
@@ -86,22 +89,27 @@ pub fn run() {
                             artist,
                             track,
                         } => {
-                            let config =
-                                match crate::commands::load_lastfm_config(&db_for_lastfm).await {
-                                    Ok(c) => c,
-                                    Err(_) => continue,
-                                };
-                            let session_key = match crate::commands::load_lastfm_session_key(
+                            let (config, session_key) = match crate::commands::load_lastfm_credentials(
                                 &db_for_lastfm,
                             )
                             .await
                             {
-                                Ok(k) => k,
-                                Err(_) => continue,
+                                Ok(Some(credentials)) => credentials,
+                                Ok(None) => {
+                                    tracing::debug!("Last.fm not set up; skipping now-playing");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(artist, track, "Last.fm: failed to load credentials for now-playing: {e:#}");
+                                    continue;
+                                }
                             };
-                            let _ =
+                            if let Err(e) =
                                 lastfm::now_playing(&config, &session_key, &artist, &track, None)
-                                    .await;
+                                    .await
+                            {
+                                tracing::warn!(artist, track, "Last.fm: now-playing update failed: {e}");
+                            }
                             // Query loved status and push to frontend so the heart button updates.
                             match lastfm::get_track_loved(&config, &session_key, &artist, &track)
                                 .await
@@ -173,20 +181,22 @@ pub fn run() {
                                 );
                                 continue;
                             }
-                            let config =
-                                match crate::commands::load_lastfm_config(&db_for_lastfm).await {
-                                    Ok(c) => c,
-                                    Err(_) => continue,
-                                };
-                            let session_key = match crate::commands::load_lastfm_session_key(
+                            let (config, session_key) = match crate::commands::load_lastfm_credentials(
                                 &db_for_lastfm,
                             )
                             .await
                             {
-                                Ok(k) => k,
-                                Err(_) => continue,
+                                Ok(Some(credentials)) => credentials,
+                                Ok(None) => {
+                                    tracing::debug!("Last.fm not set up; skipping scrobble");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(artist, track, "Last.fm: failed to load credentials for scrobble: {e:#}");
+                                    continue;
+                                }
                             };
-                            let _ = lastfm::scrobble(
+                            if let Err(e) = lastfm::scrobble(
                                 &config,
                                 &session_key,
                                 &artist,
@@ -194,7 +204,10 @@ pub fn run() {
                                 None,
                                 started_at_secs,
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::warn!(artist, track, started_at_secs, "Last.fm: scrobble failed: {e}");
+                            }
                         }
                     }
                 }
@@ -225,12 +238,14 @@ pub fn run() {
                 lastfm_auth_token: Mutex::new(None),
             };
 
-            if let Ok(Some(root_path)) =
-                tauri::async_runtime::block_on(commands::load_music_root(&pool))
-            {
-                state
-                    .importer
-                    .spawn_scan(pool.clone(), root_path, acoustid_api_key.clone());
+            match tauri::async_runtime::block_on(commands::load_music_root(&pool)) {
+                Ok(Some(root_path)) => {
+                    state
+                        .importer
+                        .spawn_scan(pool.clone(), root_path, acoustid_api_key.clone());
+                }
+                Ok(None) => tracing::info!("No music root configured; skipping startup scan"),
+                Err(e) => tracing::error!("Failed to load music root for startup scan: {e:#}"),
             }
 
             app.manage(state);

@@ -58,6 +58,12 @@ impl Catalog {
             Catalog::Memory(c) => c.file_issues().to_vec(),
         }
     }
+
+    pub fn recording_id_for_source(&self, source_id: &str) -> Option<String> {
+        match self {
+            Catalog::Memory(c) => c.recording_id_for_source(source_id),
+        }
+    }
 }
 
 impl CatalogReader for Catalog {

@@ -77,7 +77,7 @@ impl ImportManager {
                 state.is_running = false;
                 state.finished_at = Some(now_iso());
                 if let Err(error) = &result {
-                    eprintln!("[importer] scan error: {error:#}");
+                    tracing::error!(root = %root_path, "Library scan failed: {error:#}");
                     state.errors += 1;
                     state.error_messages.push(error.to_string());
                 } else {
@@ -93,7 +93,7 @@ impl ImportManager {
                     println!("[importer] catalog reloaded after scan");
                 }
                 Err(e) => {
-                    eprintln!("[importer] catalog reload failed: {e:#}");
+                    tracing::error!(root = %root_path, "Catalog reload after scan failed: {e:#}");
                 }
             }
         });
@@ -161,7 +161,7 @@ async fn run_scan(
                 let mut state = progress.lock().expect("import progress mutex poisoned");
                 state.errors += 1;
                 let msg = error.to_string();
-                println!("[importer] import error: {msg}");
+                tracing::error!(path = ?error.path(), "Directory walk error during import: {msg}");
                 if let Some(p) = error.path() {
                     file_issues.push_import_error(p.to_string_lossy(), msg.clone());
                 }
@@ -206,7 +206,7 @@ async fn handle_task_result(
                 Err(error) => {
                     let detail = format!("{:#}", error);
                     let msg = format!("{}: {}", path.display(), detail);
-                    println!("[importer] import error: {msg}");
+                    tracing::error!(path = %path.display(), "Import (store) failed: {detail}");
                     file_issues.push_import_error(path.to_string_lossy(), detail);
                     let mut state = progress.lock().expect("import progress mutex poisoned");
                     state.errors += 1;
@@ -221,14 +221,14 @@ async fn handle_task_result(
         Ok((path, Err(error))) => {
             let detail = format!("{:#}", error);
             let msg = format!("{}: {}", path.display(), detail);
-            println!("[importer] import error: {msg}");
+            tracing::error!(path = %path.display(), "Import (prepare) failed: {detail}");
             file_issues.push_import_error(path.to_string_lossy(), detail);
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.errors += 1;
             state.error_messages.push(msg);
         }
         Err(error) => {
-            println!("[importer] importer task failed: {error}");
+            tracing::error!("Importer task failed: {error}");
             let mut state = progress.lock().expect("import progress mutex poisoned");
             state.errors += 1;
             state

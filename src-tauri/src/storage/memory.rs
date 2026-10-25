@@ -8,10 +8,9 @@ use crate::models::{
     ReleaseInfo, SmartPlaylistResult, SourceDetail, SourceRow, SourceTagInfo, TrackDetail,
 };
 use crate::query::{CmpOp, Expr, LastPlayedDir, LimitUnit, Predicate, StrOp, TimeUnit};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use nonempty::NonEmpty;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -150,6 +149,8 @@ fn compute_predicted_rating(
 pub struct MemoryCatalog {
     recordings: Vec<MemRecording>,
     recordings_by_id: HashMap<String, usize>,
+    /// Source ID -> index into `recordings` of the recording that groups it.
+    recording_index_by_source: HashMap<String, usize>,
     artists: Vec<MemArtist>,
     artists_by_id: HashMap<String, usize>,
     release_groups: Vec<MemReleaseGroup>,
@@ -215,60 +216,61 @@ impl MemoryCatalog {
         &self.file_issues
     }
 
+    /// The ID of the recording that groups the given source, if the source is
+    /// in the catalog.
+    pub fn recording_id_for_source(&self, source_id: &str) -> Option<String> {
+        self.recording_index_by_source
+            .get(source_id)
+            .map(|&idx| self.recordings[idx].id.clone())
+    }
+
     pub async fn load_from_db(db: &DbPool) -> Result<Self> {
         let mut conn = db.acquire("memory_catalog.load").await?;
 
         // ── Load source rows ──────────────────────────────────────────────────
-        let source_rows = sqlx::query(
-            "SELECT id, source_type, file_path, format, duration_ms,
+        let source_rows = sqlx::query!(
+            r#"SELECT id AS "id!", source_type, file_path, format, duration_ms,
                     file_hash, fingerprint,
                     replay_gain_track_db, replay_gain_track_peak, raw_tags_json
-             FROM source",
+             FROM source"#
         )
         .fetch_all(&mut *conn)
-        .await?;
+        .await
+        .context("Failed to load source rows for the in-memory catalog")?;
         let source_count = source_rows.len() as i64;
 
         // ── Load user data ────────────────────────────────────────────────────
         let source_ratings: HashMap<String, i64> =
-            sqlx::query("SELECT source_id, stars FROM source_rating")
+            sqlx::query!(r#"SELECT source_id AS "source_id!", stars FROM source_rating"#)
                 .fetch_all(&mut *conn)
-                .await?
+                .await
+                .context("Failed to load source ratings for the in-memory catalog")?
                 .into_iter()
-                .map(|r| (r.get::<String, _>("source_id"), r.get::<i64, _>("stars")))
+                .map(|r| (r.source_id, r.stars))
                 .collect();
 
-        let source_play_data: HashMap<String, (i64, String)> = sqlx::query(
-            "SELECT source_id, COUNT(*) AS play_count, MAX(played_at) AS last_played
-             FROM play_history GROUP BY source_id",
+        let source_play_data: HashMap<String, (i64, String)> = sqlx::query!(
+            r#"SELECT source_id AS "source_id!", COUNT(*) AS "play_count!: i64", MAX(played_at) AS "last_played!"
+             FROM play_history GROUP BY source_id"#
         )
         .fetch_all(&mut *conn)
-        .await?
+        .await
+        .context("Failed to load play history for the in-memory catalog")?
         .into_iter()
-        .filter_map(|r| {
-            let last: Option<String> = r.get("last_played");
-            last.map(|lp| {
-                (
-                    r.get::<String, _>("source_id"),
-                    (r.get::<i64, _>("play_count"), lp),
-                )
-            })
-        })
+        .map(|r| (r.source_id, (r.play_count, r.last_played)))
         .collect();
 
         // Playlists now reference source_id directly (no recording_id).
         let mut playlists: HashMap<String, HashSet<String>> = HashMap::new();
-        for r in sqlx::query(
+        for r in sqlx::query!(
             "SELECT p.name, pt.source_id
-             FROM playlist p JOIN playlist_track pt ON pt.playlist_id = p.id",
+             FROM playlist p JOIN playlist_track pt ON pt.playlist_id = p.id"
         )
         .fetch_all(&mut *conn)
-        .await?
+        .await
+        .context("Failed to load playlist membership for the in-memory catalog")?
         {
-            playlists
-                .entry(r.get::<String, _>("name"))
-                .or_default()
-                .insert(r.get::<String, _>("source_id"));
+            playlists.entry(r.name).or_default().insert(r.source_id);
         }
 
         drop(conn);
@@ -277,13 +279,13 @@ impl MemoryCatalog {
         let mut all_sources: Vec<RawSource> = Vec::with_capacity(source_rows.len());
         let mut all_issues: Vec<FileIssue> = Vec::new();
         for row in source_rows {
-            let raw_json: Option<String> = row.get("raw_tags_json");
-            let raw_tags: Vec<(String, String)> = raw_json
+            let raw_tags: Vec<(String, String)> = row
+                .raw_tags_json
                 .as_deref()
                 .and_then(|j| serde_json::from_str(j).ok())
                 .unwrap_or_default();
-            let source_id: String = row.get("id");
-            let file_path: Option<String> = row.get("file_path");
+            let source_id = row.id;
+            let file_path = row.file_path;
 
             // Deduplicate raw tags that appear multiple times (consecutive ID3v2
             // tags), so that downstream logic sees a single coherent value.
@@ -300,14 +302,14 @@ impl MemoryCatalog {
                 .unwrap_or((0, None));
             all_sources.push(RawSource {
                 id: source_id,
-                source_type: row.get("source_type"),
-                file_path: row.get("file_path"),
-                format: row.get("format"),
-                duration_ms: row.get("duration_ms"),
-                file_hash: row.get("file_hash"),
-                fingerprint: row.get("fingerprint"),
-                replay_gain_track_db: row.get("replay_gain_track_db"),
-                replay_gain_track_peak: row.get("replay_gain_track_peak"),
+                source_type: row.source_type,
+                file_path,
+                format: row.format,
+                duration_ms: row.duration_ms,
+                file_hash: row.file_hash,
+                fingerprint: row.fingerprint,
+                replay_gain_track_db: row.replay_gain_track_db,
+                replay_gain_track_peak: row.replay_gain_track_peak,
                 tags,
                 rating,
                 play_count,
@@ -679,6 +681,12 @@ impl MemoryCatalog {
             .map(|(i, r)| (r.id.clone(), i))
             .collect();
 
+        let recording_index_by_source: HashMap<String, usize> = recordings
+            .iter()
+            .enumerate()
+            .flat_map(|(i, r)| r.sources.iter().map(move |s| (s.id.clone(), i)))
+            .collect();
+
         let artists_by_id: HashMap<String, usize> = artists
             .iter()
             .enumerate()
@@ -724,6 +732,7 @@ impl MemoryCatalog {
         Ok(MemoryCatalog {
             recordings,
             recordings_by_id,
+            recording_index_by_source,
             artists,
             artists_by_id,
             release_groups,

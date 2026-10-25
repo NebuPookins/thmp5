@@ -1,21 +1,23 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
+use crate::command_error::CommandError;
 use crate::file_issues::{FileIssue, FileIssueKind};
 use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistRow, CompoundArtistCheck, DbPoolDebugSnapshot,
-    ExternalCommand, FixMergedRecordingsStats, Id3FrameDebugInfo, Id3FrameDebugRequest,
-    ImportProgress, ImportStats, InitialSetupRequest, LastFmAuthUrl, LastFmGetTrackLovedRequest,
-    LastFmLoveTrackRequest, LastFmNowPlayingRequest, LastFmScrobbleRequest, LastFmStatus,
-    LibrarySummary, PlayHistoryInput, PlayRequest, PlayerState, PlaylistRow, QueueSettingsUpdate,
-    RecordingDetail, RecordingRatingUpdateResult, RecordingRow, ReleaseGroupDetail,
-    ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest, SmartPlaylistResult,
-    SourceRatingUpdateRequest, VolumeRequest,
+    EntityRatingUpdate, ExternalCommand, FixMergedRecordingsStats, Id3FrameDebugInfo,
+    Id3FrameDebugRequest, ImportProgress, ImportStats, InitialSetupRequest, LastFmAuthUrl,
+    LastFmGetTrackLovedRequest, LastFmLoveTrackRequest, LastFmNowPlayingRequest,
+    LastFmScrobbleRequest, LastFmStatus, LibrarySummary, PlayHistoryInput, PlayRequest,
+    PlayerState, PlaylistRow, QueueSettingsUpdate, RecordingDetail, RecordingRatingUpdateResult,
+    RecordingRow, ReleaseGroupDetail, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
+    SmartPlaylistResult, SourceRatingUpdateRequest, VolumeRequest,
 };
 use crate::query;
-use crate::storage::CatalogReader;
+use crate::storage::{Catalog, CatalogReader};
 use crate::AppState;
+use anyhow::Context;
 use serde::Serialize;
-use sqlx::{Acquire, Row};
+use sqlx::Acquire;
 use std::sync::atomic::Ordering;
 use tauri::Emitter;
 
@@ -73,34 +75,37 @@ async fn rescan_and_reload(state: &AppState, path: &std::path::Path) -> anyhow::
 // ── Import ────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(paths = ?paths))]
 pub async fn import_paths(
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
-) -> Result<ImportStats, String> {
+) -> Result<ImportStats, CommandError> {
     let result = do_import(
         &state.db,
         paths,
         state.acoustid_api_key.as_deref(),
         &state.write_serializer,
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     reload_catalog(&state).await;
     Ok(result)
 }
 
 #[tauri::command]
-pub async fn get_app_bootstrap(state: tauri::State<'_, AppState>) -> Result<AppBootstrap, String> {
+#[tracing::instrument(skip_all)]
+pub async fn get_app_bootstrap(
+    state: tauri::State<'_, AppState>,
+) -> Result<AppBootstrap, CommandError> {
     let config = load_app_config(&state.db)
         .await
-        .map_err(|e| e.to_string())?;
+        .context("Failed to load app config")?;
     let library_summary = state
         .catalog
         .read()
         .await
         .get_library_summary()
         .await
-        .map_err(|e| e.to_string())?;
+        .context("Failed to load library summary")?;
     let import_progress = state.importer.snapshot();
     let needs_setup = config.music_root.is_none();
 
@@ -113,27 +118,29 @@ pub async fn get_app_bootstrap(state: tauri::State<'_, AppState>) -> Result<AppB
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(music_root = %request.music_root))]
 pub async fn complete_initial_setup(
     state: tauri::State<'_, AppState>,
     request: InitialSetupRequest,
-) -> Result<AppConfig, String> {
+) -> Result<AppConfig, CommandError> {
     let root = request.music_root.trim();
     if root.is_empty() {
-        return Err("Music root cannot be empty.".to_string());
+        return Err(CommandError::rejected("Music root cannot be empty."));
     }
 
     let path = std::path::Path::new(root);
     if !path.is_dir() {
-        return Err(format!("Music root is not a directory: {}", path.display()));
+        return Err(CommandError::rejected(format!(
+            "Music root is not a directory: {}",
+            path.display()
+        )));
     }
 
-    set_config_value(&state.db, "music_root", root)
-        .await
-        .map_err(|e| e.to_string())?;
+    set_config_value(&state.db, "music_root", root).await?;
 
     let config = load_app_config(&state.db)
         .await
-        .map_err(|e| e.to_string())?;
+        .context("Failed to reload app config")?;
     state.importer.spawn_scan(
         state.db.clone(),
         root.to_string(),
@@ -143,35 +150,37 @@ pub async fn complete_initial_setup(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub async fn get_import_progress(
     state: tauri::State<'_, AppState>,
-) -> Result<ImportProgress, String> {
+) -> Result<ImportProgress, CommandError> {
     Ok(state.importer.snapshot())
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub async fn fix_merged_recordings(
     state: tauri::State<'_, AppState>,
-) -> Result<FixMergedRecordingsStats, String> {
+) -> Result<FixMergedRecordingsStats, CommandError> {
     let result = crate::library::fix_merges::fix_merged_recordings(
         &state.db,
         state.acoustid_api_key.as_deref(),
         &state.write_serializer,
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     reload_catalog(&state).await;
     Ok(result)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub async fn trigger_library_scan(
     state: tauri::State<'_, AppState>,
-) -> Result<ImportProgress, String> {
+) -> Result<ImportProgress, CommandError> {
     let root = load_music_root(&state.db)
         .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Music root is not configured.".to_string())?;
+        .context("Failed to load music root")?
+        .ok_or_else(|| CommandError::rejected("Music root is not configured."))?;
 
     state
         .importer
@@ -181,19 +190,23 @@ pub async fn trigger_library_scan(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(path = %path))]
 pub async fn rescan_source(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        return Err("Source path cannot be empty.".to_string());
+        return Err(CommandError::rejected("Source path cannot be empty."));
     }
 
     let source_path = std::path::Path::new(trimmed);
     if !source_path.is_file() {
-        return Err(format!("Source file is missing: {}", source_path.display()));
+        return Err(CommandError::rejected(format!(
+            "Source file is missing: {}",
+            source_path.display()
+        )));
     }
 
     state.pending_jobs.fetch_add(1, Ordering::Relaxed);
@@ -208,31 +221,33 @@ pub async fn rescan_source(
     )
     .await
     .map(|_| ())
-    .map_err(|e| format!("Failed to rescan {}:\n{e:#}", source_path.display()));
+    .with_context(|| format!("Failed to rescan {}", source_path.display()));
 
     state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
     emit_job_update(&app, &state, "rescan");
 
     reload_catalog(&state).await;
-    result
+    Ok(result?)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(count = paths.len()))]
 pub async fn rescan_sources(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     paths: Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     if paths.is_empty() {
-        return Err("At least one source path is required.".to_string());
+        return Err(CommandError::rejected(
+            "At least one source path is required.",
+        ));
     }
     let trimmed: Vec<String> = paths
         .iter()
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect();
-    rescan_path_list(&app, &state, trimmed).await?;
-    Ok(())
+    rescan_path_list(&app, &state, trimmed).await
 }
 
 /// Shared loop: track per-file counter in AppState, emit `job-update` after each file.
@@ -240,28 +255,29 @@ async fn rescan_path_list(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     paths: Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let count = paths.len() as i64;
     state.pending_jobs.fetch_add(count, Ordering::Relaxed);
     emit_job_update(app, state, "rescan");
 
-    let mut failures = Vec::new();
+    let total = paths.len();
+    let mut failed_paths: Vec<String> = Vec::new();
     for path in paths {
         let source_path = std::path::Path::new(&path);
         if !source_path.is_file() {
-            failures.push(format!("{}: Source file is missing", source_path.display()));
-        } else {
-            if let Err(error) = do_rescan_source(
-                &state.db,
-                source_path,
-                state.acoustid_api_key.as_deref(),
-                &state.write_serializer,
-                &state.file_issues,
-            )
-            .await
-            {
-                failures.push(format!("{}:\n{error:#}", source_path.display()));
-            }
+            tracing::error!(path = %source_path.display(), "Rescan skipped: source file is missing");
+            failed_paths.push(source_path.display().to_string());
+        } else if let Err(error) = do_rescan_source(
+            &state.db,
+            source_path,
+            state.acoustid_api_key.as_deref(),
+            &state.write_serializer,
+            &state.file_issues,
+        )
+        .await
+        {
+            tracing::error!(path = %source_path.display(), "Rescan failed: {error:#}");
+            failed_paths.push(source_path.display().to_string());
         }
         state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
         emit_job_update(app, state, "rescan");
@@ -269,179 +285,196 @@ async fn rescan_path_list(
 
     reload_catalog(state).await;
 
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Failed to rescan {} source(s):\n{}",
-            failures.len(),
-            failures.join("\n\n")
-        ))
+    // Each failure was already logged above with full context; the returned
+    // error is only a summary so it is not logged a second time in full.
+    match failed_paths.first() {
+        None => Ok(()),
+        Some(first) => Err(anyhow::anyhow!(
+            "Failed to rescan {} of {} files (see log for details); first failure: {}",
+            failed_paths.len(),
+            total,
+            first
+        )
+        .into()),
     }
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(artist_id = %artist_id))]
 pub async fn rescan_sources_for_artist(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     artist_id: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let paths: Vec<String> = {
         let cat = state.catalog.read().await;
         cat.source_paths_for_artist(&artist_id).1
     };
 
     if paths.is_empty() {
-        return Err("No local sources found for this artist.".to_string());
+        return Err(CommandError::rejected(
+            "No local sources found for this artist.",
+        ));
     }
 
     rescan_path_list(&app, &state, paths).await
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(release_group_id = %release_group_id))]
 pub async fn rescan_sources_for_release_group(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     release_group_id: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let paths: Vec<String> = {
         let cat = state.catalog.read().await;
         cat.source_paths_for_release_group(&release_group_id)
     };
 
     if paths.is_empty() {
-        return Err("No local sources found for this album.".to_string());
+        return Err(CommandError::rejected(
+            "No local sources found for this album.",
+        ));
     }
 
     rescan_path_list(&app, &state, paths).await
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(recording_id = %recording_id))]
 pub async fn rescan_sources_for_recording(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     recording_id: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     // Resolve recording_id to source paths via the in-memory catalog.
     let paths: Vec<String> = {
         let catalog = state.catalog.read().await;
         let recs = catalog
             .list_recordings()
             .await
-            .map_err(|e| format!("Failed to list recordings: {e}"))?;
-        let matching = recs.iter().find(|r| r.id == recording_id);
-        match matching {
-            Some(rec) => rec
-                .source_paths
-                .iter()
-                .filter(|p| !p.is_empty())
-                .cloned()
-                .collect(),
-            None => return Err("Recording not found in catalog.".to_string()),
-        }
+            .context("Failed to list recordings")?;
+        recs.iter()
+            .find(|r| r.id == recording_id)
+            .ok_or_else(|| CommandError::rejected("Recording not found in catalog."))?
+            .source_paths
+            .iter()
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect()
     };
 
     if paths.is_empty() {
-        return Err("No local sources found for this recording.".to_string());
+        return Err(CommandError::rejected(
+            "No local sources found for this recording.",
+        ));
     }
 
-    rescan_path_list(&app, &state, paths).await?;
-    Ok(())
+    rescan_path_list(&app, &state, paths).await
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub async fn rescan_all_sources(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let paths: Vec<String> = {
         let mut conn = state
             .db
             .acquire("command.rescan_all_sources".to_string())
             .await
-            .map_err(|e| e.to_string())?;
-        sqlx::query_scalar(
-            "SELECT DISTINCT s.file_path
+            .context("Failed to acquire connection")?;
+        sqlx::query_scalar!(
+            r#"SELECT DISTINCT s.file_path AS "file_path!"
              FROM source s
              WHERE s.source_type = 'local_file'
                AND s.file_path IS NOT NULL
-             ORDER BY s.file_path",
+             ORDER BY s.file_path"#
         )
         .fetch_all(&mut *conn)
         .await
-        .map_err(|e| e.to_string())?
+        .context("Failed to list local sources")?
     };
 
     if paths.is_empty() {
-        return Err("No local sources found in the library.".to_string());
+        return Err(CommandError::rejected(
+            "No local sources found in the library.",
+        ));
     }
 
-    rescan_path_list(&app, &state, paths).await?;
-    Ok(())
+    rescan_path_list(&app, &state, paths).await
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(path = %path))]
 pub async fn set_music_root(
     state: tauri::State<'_, AppState>,
     path: String,
-) -> Result<AppConfig, String> {
+) -> Result<AppConfig, CommandError> {
     let root = path.trim();
     if root.is_empty() {
-        return Err("Music root cannot be empty.".to_string());
+        return Err(CommandError::rejected("Music root cannot be empty."));
     }
     let p = std::path::Path::new(root);
     if !p.is_dir() {
-        return Err(format!("Not a directory: {}", p.display()));
+        return Err(CommandError::rejected(format!(
+            "Not a directory: {}",
+            p.display()
+        )));
     }
-    set_config_value(&state.db, "music_root", root)
-        .await
-        .map_err(|e| e.to_string())?;
+    set_config_value(&state.db, "music_root", root).await?;
     state.importer.spawn_scan(
         state.db.clone(),
         root.to_string(),
         state.acoustid_api_key.clone(),
     );
-    load_app_config(&state.db).await.map_err(|e| e.to_string())
+    Ok(load_app_config(&state.db)
+        .await
+        .context("Failed to reload app config")?)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(queue_history_limit = update.queue_history_limit))]
 pub async fn update_queue_settings(
     state: tauri::State<'_, AppState>,
     update: QueueSettingsUpdate,
-) -> Result<AppConfig, String> {
+) -> Result<AppConfig, CommandError> {
     let limit = update.queue_history_limit.clamp(1, 100);
-    set_config_value(&state.db, "queue_history_limit", &limit.to_string())
+    set_config_value(&state.db, "queue_history_limit", &limit.to_string()).await?;
+    Ok(load_app_config(&state.db)
         .await
-        .map_err(|e| e.to_string())?;
-    load_app_config(&state.db).await.map_err(|e| e.to_string())
+        .context("Failed to reload app config")?)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(count = commands.len()))]
 pub async fn save_external_commands(
     state: tauri::State<'_, AppState>,
     commands: Vec<ExternalCommand>,
-) -> Result<AppConfig, String> {
-    let json = serde_json::to_string(&commands).map_err(|e| e.to_string())?;
-    set_config_value(&state.db, "external_commands", &json)
+) -> Result<AppConfig, CommandError> {
+    let json = serde_json::to_string(&commands).context("Failed to serialize external commands")?;
+    set_config_value(&state.db, "external_commands", &json).await?;
+    Ok(load_app_config(&state.db)
         .await
-        .map_err(|e| e.to_string())?;
-    load_app_config(&state.db).await.map_err(|e| e.to_string())
+        .context("Failed to reload app config")?)
 }
 
 #[tauri::command]
-pub fn spawn_external_command(template: String, file_path: String) -> Result<(), String> {
-    let mut parts: Vec<String> = shell_words(&template)
+#[tracing::instrument(skip_all, fields(template = %template, file_path = %file_path))]
+pub fn spawn_external_command(template: String, file_path: String) -> Result<(), CommandError> {
+    let parts: Vec<String> = shell_words(&template)
         .into_iter()
         .map(|w| w.replace("%%", &file_path))
         .collect();
-    if parts.is_empty() {
-        return Err("Empty command".to_string());
-    }
-    let program = parts.remove(0);
-    std::process::Command::new(&program)
-        .args(&parts)
+    let Some((program, args)) = parts.split_first() else {
+        return Err(CommandError::rejected("Empty command"));
+    };
+    std::process::Command::new(program)
+        .args(args)
         .spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {}", program, e))?;
+        .with_context(|| format!("Failed to spawn '{program}' with args {args:?}"))?;
     Ok(())
 }
 
@@ -476,10 +509,14 @@ fn shell_words(s: &str) -> Vec<String> {
 }
 
 #[tauri::command]
+#[tracing::instrument(
+    skip_all,
+    fields(source_id = %input.source_id, duration_played_ms = ?input.duration_played_ms)
+)]
 pub async fn record_play_history(
     state: tauri::State<'_, AppState>,
     input: PlayHistoryInput,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let mut conn = state
         .db
         .acquire(format!(
@@ -487,248 +524,300 @@ pub async fn record_play_history(
             input.source_id
         ))
         .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query(
+        .context("Failed to acquire connection")?;
+    sqlx::query!(
         "INSERT INTO play_history (source_id, duration_played_ms)
          VALUES (?, ?)",
+        input.source_id,
+        input.duration_played_ms,
     )
-    .bind(input.source_id)
-    .bind(input.duration_played_ms)
     .execute(&mut *conn)
     .await
-    .map_err(|e| e.to_string())?;
+    .context("Failed to insert play history")?;
 
     reload_catalog(&state).await;
     Ok(())
 }
 
+/// The result sent to the frontend when the rated source belongs to no known recording.
+fn no_rating_update() -> RecordingRatingUpdateResult {
+    RecordingRatingUpdateResult {
+        recording: EntityRatingUpdate {
+            id: String::new(),
+            rating: None,
+        },
+        release_groups: Vec::new(),
+        artists: Vec::new(),
+        affected_recordings: Vec::new(),
+    }
+}
+
+/// Ratings of every artist in `artist_ids` that still exists. A failed lookup
+/// is logged and skipped so one bad entity does not hide the others.
+async fn artist_rating_updates(
+    catalog: &Catalog,
+    artist_ids: &[String],
+) -> Vec<EntityRatingUpdate> {
+    let mut updates = Vec::new();
+    for artist_id in artist_ids {
+        match catalog.get_artist_detail(artist_id).await {
+            Ok(Some(detail)) => updates.push(EntityRatingUpdate {
+                id: artist_id.clone(),
+                rating: detail.rating,
+            }),
+            Ok(None) => {}
+            Err(e) => tracing::error!(%artist_id, "Failed to load artist detail: {e:#}"),
+        }
+    }
+    updates
+}
+
+/// Ratings of every release group in `release_group_ids` that still exists.
+/// A failed lookup is logged and skipped, as in [`artist_rating_updates`].
+async fn release_group_rating_updates(
+    catalog: &Catalog,
+    release_group_ids: &[&str],
+) -> Vec<EntityRatingUpdate> {
+    let mut updates = Vec::new();
+    for &release_group_id in release_group_ids {
+        match catalog.get_release_group_detail(release_group_id).await {
+            Ok(Some(detail)) => updates.push(EntityRatingUpdate {
+                id: release_group_id.to_string(),
+                rating: detail.rating,
+            }),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(%release_group_id, "Failed to load release group detail: {e:#}")
+            }
+        }
+    }
+    updates
+}
+
+/// Everything the frontend needs to refresh after `rec` was re-rated: the
+/// recording, its artists and release groups, and the recordings whose
+/// predicted rating depends on them.
+async fn rating_update_for(
+    catalog: &Catalog,
+    recs: &[RecordingRow],
+    rec: &RecordingRow,
+) -> Result<RecordingRatingUpdateResult, CommandError> {
+    let Some(rec_detail) = catalog
+        .get_recording_detail(&rec.id)
+        .await
+        .with_context(|| format!("Failed to load recording {}", rec.id))?
+    else {
+        return Ok(no_rating_update());
+    };
+
+    let rg_ids: Vec<&str> = {
+        let mut seen = std::collections::HashSet::new();
+        rec_detail
+            .releases
+            .iter()
+            .map(|r| r.release_group_id.as_str())
+            .filter(|id| seen.insert(*id))
+            .collect()
+    };
+    let artist_ids: Vec<String> = rec_detail
+        .artists
+        .iter()
+        .map(|a| a.artist_id.clone())
+        .collect();
+
+    // Recordings that share an artist or release group with the rated
+    // recording, so the frontend can refresh their predicted-rating stars.
+    let artist_set: std::collections::HashSet<&str> =
+        rec.artist_ids.iter().map(String::as_str).collect();
+    let rg_id_set: std::collections::HashSet<&str> = rg_ids.iter().copied().collect();
+    let affected_recordings = recs
+        .iter()
+        .filter(|sibling| sibling.id != rec.id)
+        .filter(|sibling| {
+            sibling
+                .artist_ids
+                .iter()
+                .any(|aid| artist_set.contains(aid.as_str()))
+                || sibling
+                    .releases
+                    .iter()
+                    .any(|r| rg_id_set.contains(r.release_group_id.as_str()))
+        })
+        .map(|sibling| EntityRatingUpdate {
+            id: sibling.id.clone(),
+            rating: sibling.predicted_rating,
+        })
+        .collect();
+
+    Ok(RecordingRatingUpdateResult {
+        recording: EntityRatingUpdate {
+            id: rec.id.clone(),
+            rating: rec_detail.rating,
+        },
+        release_groups: release_group_rating_updates(catalog, &rg_ids).await,
+        artists: artist_rating_updates(catalog, &artist_ids).await,
+        affected_recordings,
+    })
+}
+
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %request.source_id, stars = ?request.stars))]
 pub async fn set_source_rating(
     state: tauri::State<'_, AppState>,
     request: SourceRatingUpdateRequest,
-) -> Result<RecordingRatingUpdateResult, String> {
+) -> Result<RecordingRatingUpdateResult, CommandError> {
     validate_rating(request.stars)?;
 
-    let mut conn = state
-        .db
-        .acquire(format!(
-            "command.set_source_rating source_id={}",
-            request.source_id
-        ))
-        .await
-        .map_err(|e| e.to_string())?;
+    {
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.set_source_rating source_id={}",
+                request.source_id
+            ))
+            .await
+            .context("Failed to acquire connection")?;
 
-    if let Some(stars) = request.stars {
-        sqlx::query(
-            "INSERT INTO source_rating (source_id, stars, updated_at)
-             VALUES (?, ?, datetime('now'))
-             ON CONFLICT(source_id) DO UPDATE SET
-                stars = excluded.stars,
-                updated_at = datetime('now')",
-        )
-        .bind(&request.source_id)
-        .bind(stars)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?;
-    } else {
-        sqlx::query("DELETE FROM source_rating WHERE source_id = ?")
-            .bind(&request.source_id)
+        match request.stars {
+            Some(stars) => sqlx::query!(
+                "INSERT INTO source_rating (source_id, stars, updated_at)
+                 VALUES (?, ?, datetime('now'))
+                 ON CONFLICT(source_id) DO UPDATE SET
+                    stars = excluded.stars,
+                    updated_at = datetime('now')",
+                request.source_id,
+                stars,
+            )
             .execute(&mut *conn)
             .await
-            .map_err(|e| e.to_string())?;
+            .context("Failed to save rating")?,
+            None => sqlx::query!(
+                "DELETE FROM source_rating WHERE source_id = ?",
+                request.source_id
+            )
+            .execute(&mut *conn)
+            .await
+            .context("Failed to clear rating")?,
+        };
     }
 
-    // Look up the source's file path to find the recording in the catalog.
-    let source_path: Option<String> =
-        sqlx::query_scalar("SELECT file_path FROM source WHERE id = ?")
-            .bind(&request.source_id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| e.to_string())?
-            .flatten();
-
-    drop(conn);
     reload_catalog(&state).await;
 
     // Find which recording this source belongs to via the in-memory catalog.
     let catalog = state.catalog.read().await;
-    let recs = catalog.list_recordings().await.map_err(|e| e.to_string())?;
-    let rec = source_path.as_ref().and_then(|path| {
-        recs.iter()
-            .find(|r| r.source_paths.iter().any(|p| p == path))
-    });
-
-    let mut recording = crate::models::EntityRatingUpdate {
-        id: String::new(),
-        rating: None,
-    };
-    let mut artists: Vec<crate::models::EntityRatingUpdate> = Vec::new();
-    let mut release_groups: Vec<crate::models::EntityRatingUpdate> = Vec::new();
-    let mut affected_recordings: Vec<crate::models::EntityRatingUpdate> = Vec::new();
-
-    if let Some(rec) = rec {
-        let rec_detail = catalog
-            .get_recording_detail(&rec.id)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let Some(rec_detail) = rec_detail {
-            recording = crate::models::EntityRatingUpdate {
-                id: rec.id.clone(),
-                rating: rec_detail.rating,
-            };
-            let rg_ids: Vec<String> = {
-                let mut seen = std::collections::HashSet::new();
-                rec_detail
-                    .releases
-                    .iter()
-                    .filter(|r| seen.insert(r.release_group_id.clone()))
-                    .map(|r| r.release_group_id.clone())
-                    .collect()
-            };
-            for a in &rec_detail.artists {
-                if let Ok(Some(detail)) = catalog.get_artist_detail(&a.artist_id).await {
-                    artists.push(crate::models::EntityRatingUpdate {
-                        id: a.artist_id.clone(),
-                        rating: detail.rating,
-                    });
-                }
-            }
-            for rg_id in &rg_ids {
-                if let Ok(Some(detail)) = catalog.get_release_group_detail(rg_id).await {
-                    release_groups.push(crate::models::EntityRatingUpdate {
-                        id: rg_id.clone(),
-                        rating: detail.rating,
-                    });
-                }
-            }
-
-            // Collect predicted ratings for all recordings that share an artist
-            // or release group with the rated recording, so the frontend can
-            // refresh their predicted-rating stars.
-            let artist_set: std::collections::HashSet<&str> =
-                rec.artist_ids.iter().map(|s| s.as_str()).collect();
-            let rg_id_set: std::collections::HashSet<&str> =
-                rg_ids.iter().map(|s| s.as_str()).collect();
-
-            for sibling in &recs {
-                if sibling.id == rec.id {
-                    continue;
-                }
-                let shares_artist = sibling
-                    .artist_ids
-                    .iter()
-                    .any(|aid| artist_set.contains(aid.as_str()));
-                let shares_album = sibling
-                    .releases
-                    .iter()
-                    .any(|r| rg_id_set.contains(r.release_group_id.as_str()));
-                if shares_artist || shares_album {
-                    affected_recordings.push(crate::models::EntityRatingUpdate {
-                        id: sibling.id.clone(),
-                        rating: sibling.predicted_rating,
-                    });
-                }
-            }
-        }
+    let recs = catalog
+        .list_recordings()
+        .await
+        .context("Failed to list recordings")?;
+    match catalog
+        .recording_id_for_source(&request.source_id)
+        .and_then(|id| recs.iter().find(|r| r.id == id))
+    {
+        Some(rec) => rating_update_for(&catalog, &recs, rec).await,
+        None => Ok(no_rating_update()),
     }
-    drop(catalog);
-
-    Ok(RecordingRatingUpdateResult {
-        recording,
-        release_groups,
-        artists,
-        affected_recordings,
-    })
 }
 
 // ── Library queries ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_player_state(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+#[tracing::instrument(skip_all)]
+pub fn get_player_state(state: tauri::State<'_, AppState>) -> Result<PlayerState, CommandError> {
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
-pub fn get_log_file_path(state: tauri::State<'_, AppState>) -> Result<String, String> {
+#[tracing::instrument(skip_all)]
+pub fn get_log_file_path(state: tauri::State<'_, AppState>) -> Result<String, CommandError> {
     Ok(state.log_file_path.clone())
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub fn get_db_pool_debug_snapshot(
     state: tauri::State<'_, AppState>,
-) -> Result<DbPoolDebugSnapshot, String> {
+) -> Result<DbPoolDebugSnapshot, CommandError> {
     Ok(state.db.snapshot())
 }
 
 #[tauri::command]
-pub async fn get_file_issues(state: tauri::State<'_, AppState>) -> Result<Vec<FileIssue>, String> {
-    let mut issues = state.file_issues.all();
-    let catalog = state.catalog.read().await;
-    issues.extend(catalog.file_issues());
-    drop(catalog);
-
-    let mut conn = state
-        .db
-        .acquire("command.get_file_issues")
+#[tracing::instrument(skip_all)]
+pub async fn get_file_issues(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<FileIssue>, CommandError> {
+    let manual_rows = {
+        let mut conn = state
+            .db
+            .acquire("command.get_file_issues")
+            .await
+            .context("Failed to acquire connection")?;
+        sqlx::query!(
+            r#"SELECT s.file_path, s.id AS "source_id!", i.note
+             FROM source_file_issue i JOIN source s ON s.id = i.source_id"#
+        )
+        .fetch_all(&mut *conn)
         .await
-        .map_err(|e| e.to_string())?;
-    let manual_issues = sqlx::query(
-        "SELECT s.file_path, s.id AS source_id, s.recording_id, i.note
-         FROM source_file_issue i JOIN source s ON s.id = i.source_id",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?
-    .into_iter()
-    .filter_map(|row| {
-        row.get::<Option<String>, _>("file_path")
-            .map(|file_path| FileIssue {
-                file_path,
-                kind: FileIssueKind::Manual,
-                message: row.get("note"),
-                source_id: Some(row.get("source_id")),
-                recording_id: Some(row.get("recording_id")),
-                frame_id: None,
-                field_name: None,
-                lofty_value: None,
-                corrected_value: None,
-                backup_path: None,
-            })
+        .context("Failed to load manual file issues")?
+    };
+
+    let catalog = state.catalog.read().await;
+    // Recordings are derived in memory, so resolve each source's recording via the catalog.
+    let manual_issues = manual_rows.into_iter().filter_map(|row| {
+        let file_path = row.file_path?;
+        let source_id = row.source_id;
+        Some(FileIssue {
+            file_path,
+            kind: FileIssueKind::Manual,
+            message: row.note,
+            recording_id: catalog.recording_id_for_source(&source_id),
+            source_id: Some(source_id),
+            frame_id: None,
+            field_name: None,
+            lofty_value: None,
+            corrected_value: None,
+            backup_path: None,
+        })
     });
-    issues.extend(manual_issues);
-    Ok(issues)
+    Ok(state
+        .file_issues
+        .all()
+        .into_iter()
+        .chain(catalog.file_issues())
+        .chain(manual_issues)
+        .collect())
 }
 
 /// Store the single user-authored issue note for a local source file.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(file_path = %file_path))]
 pub async fn set_source_file_issue(
     state: tauri::State<'_, AppState>,
     file_path: String,
     note: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let note = note.trim();
     if note.is_empty() {
-        return Err("A file issue note cannot be empty".to_string());
+        return Err(CommandError::rejected("A file issue note cannot be empty"));
     }
     let mut conn = state
         .db
         .acquire("command.set_source_file_issue")
         .await
-        .map_err(|e| e.to_string())?;
-    let result = sqlx::query(
+        .context("Failed to acquire connection")?;
+    let result = sqlx::query!(
         "INSERT INTO source_file_issue (source_id, note, updated_at)
          SELECT id, ?, datetime('now') FROM source WHERE file_path = ?
          ON CONFLICT(source_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at",
+        note,
+        file_path,
     )
-    .bind(note)
-    .bind(&file_path)
     .execute(&mut *conn)
     .await
-    .map_err(|e| e.to_string())?;
+    .context("Failed to save file issue note")?;
     if result.rows_affected() == 0 {
-        return Err(format!("Local source not found: {file_path}"));
+        return Err(CommandError::rejected(format!(
+            "Local source not found: {file_path}"
+        )));
     }
     Ok(())
 }
@@ -736,22 +825,23 @@ pub async fn set_source_file_issue(
 /// Remove the user-authored issue note for a local source file. Detected issues
 /// remain in the session log and are deliberately not affected.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(file_path = %file_path))]
 pub async fn clear_source_file_issue(
     state: tauri::State<'_, AppState>,
     file_path: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let mut conn = state
         .db
         .acquire("command.clear_source_file_issue")
         .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query(
+        .context("Failed to acquire connection")?;
+    sqlx::query!(
         "DELETE FROM source_file_issue WHERE source_id = (SELECT id FROM source WHERE file_path = ?)",
+        file_path,
     )
-    .bind(file_path)
     .execute(&mut *conn)
     .await
-    .map_err(|e| e.to_string())?;
+    .context("Failed to clear file issue note")?;
     Ok(())
 }
 
@@ -762,21 +852,22 @@ pub async fn clear_source_file_issue(
 /// without this check the command would be an arbitrary-file-delete
 /// primitive for anything the app process can write to.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(backup_path = %backup_path))]
 pub async fn delete_backup_file(
     state: tauri::State<'_, AppState>,
     backup_path: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let is_tracked = state.file_issues.all().iter().any(|issue| {
         issue.kind == FileIssueKind::BackupFileExists
             && issue.backup_path.as_deref() == Some(backup_path.as_str())
     });
     if !is_tracked {
-        return Err("Not a tracked backup file".to_string());
+        return Err(CommandError::rejected("Not a tracked backup file"));
     }
 
     let p = std::path::Path::new(&backup_path);
     if p.exists() {
-        std::fs::remove_file(p).map_err(|e| format!("Failed to delete backup file: {e}"))?;
+        std::fs::remove_file(p).context("Failed to delete backup file")?;
     }
     // Remove the corresponding issue from the log.
     state.file_issues.retain(|issue| {
@@ -788,39 +879,40 @@ pub async fn delete_backup_file(
 
 /// Write (upsert) a single ID3v2 text frame in a file's tag section.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(file_path = %file_path, frame_id = %frame_id))]
 pub async fn write_tag_frame(
     _app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_path: String,
     frame_id: String,
     new_value: String,
-) -> Result<crate::library::tag_writer::TagWriteResult, String> {
+) -> Result<crate::library::tag_writer::TagWriteResult, CommandError> {
     let path_buf = std::path::Path::new(&file_path).to_path_buf();
     let fid = frame_id.clone();
-    let nv = new_value.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::library::tag_writer::write_single_frame(&path_buf, &fid, &nv)
+        crate::library::tag_writer::write_single_frame(&path_buf, &fid, &new_value)
     })
     .await
-    .map_err(|e| format!("Tag write task panicked: {e}"))?
-    .map_err(|e| format!("Failed to write tag: {e}"))?;
+    .context("Tag write task panicked")?
+    .context("Failed to write tag")?;
 
     // Re-read metadata and update the DB via rescan.
     rescan_and_reload(&state, std::path::Path::new(&file_path))
         .await
-        .map_err(|e| format!("Failed to re-scan after tag edit: {e}"))?;
+        .context("Failed to re-scan after tag edit")?;
     Ok(result)
 }
 
 /// Delete all frames matching `frame_id` from a file's tag section.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(file_path = %file_path, frame_id = %frame_id))]
 pub async fn delete_tag_frame(
     _app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_path: String,
     frame_id: String,
-) -> Result<crate::library::tag_writer::TagWriteResult, String> {
+) -> Result<crate::library::tag_writer::TagWriteResult, CommandError> {
     let path_buf = std::path::Path::new(&file_path).to_path_buf();
     let fid = frame_id.clone();
 
@@ -828,12 +920,12 @@ pub async fn delete_tag_frame(
         crate::library::tag_writer::delete_frame(&path_buf, &fid)
     })
     .await
-    .map_err(|e| format!("Tag delete task panicked: {e}"))?
-    .map_err(|e| format!("Failed to delete tag frame: {e}"))?;
+    .context("Tag delete task panicked")?
+    .context("Failed to delete tag frame")?;
 
     rescan_and_reload(&state, std::path::Path::new(&file_path))
         .await
-        .map_err(|e| format!("Failed to re-scan after tag delete: {e}"))?;
+        .context("Failed to re-scan after tag delete")?;
     Ok(result)
 }
 
@@ -841,31 +933,30 @@ pub async fn delete_tag_frame(
 /// album structure (release-group / release / medium / track) so the recording
 /// becomes visible in the library.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %source_id))]
 pub async fn fix_orphan_source(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     source_id: String,
-) -> Result<(), String> {
-    let pool = state.db.raw_pool();
-    let file_path: Option<String> = sqlx::query_scalar("SELECT file_path FROM source WHERE id = ?")
-        .bind(&source_id)
-        .fetch_optional(pool)
+) -> Result<(), CommandError> {
+    let file_path = sqlx::query_scalar!("SELECT file_path FROM source WHERE id = ?", source_id)
+        .fetch_optional(state.db.raw_pool())
         .await
-        .map_err(|e| format!("Failed to look up source: {e}"))?
-        .flatten();
-
-    let file_path = file_path.ok_or_else(|| format!("Source {source_id} not found"))?;
+        .context("Failed to look up source")?
+        .flatten()
+        .ok_or_else(|| CommandError::rejected(format!("Source {source_id} not found")))?;
     let source_path = std::path::Path::new(&file_path);
     if !source_path.is_file() {
-        return Err(format!("Source file is missing: {}", source_path.display()));
+        return Err(CommandError::rejected(format!(
+            "Source file is missing: {}",
+            source_path.display()
+        )));
     }
 
-    state
-        .pending_jobs
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.pending_jobs.fetch_add(1, Ordering::Relaxed);
     emit_job_update(&app, &state, "rescan");
 
-    do_rescan_source(
+    let rescan = do_rescan_source(
         &state.db,
         source_path,
         state.acoustid_api_key.as_deref(),
@@ -874,17 +965,11 @@ pub async fn fix_orphan_source(
     )
     .await
     .map(|_| ())
-    .map_err(|e| {
-        format!(
-            "Failed to fix orphan source {}:\n{e:#}",
-            source_path.display()
-        )
-    })?;
+    .with_context(|| format!("Failed to fix orphan source {}", source_path.display()));
 
-    state
-        .pending_jobs
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
     emit_job_update(&app, &state, "rescan");
+    rescan?;
 
     reload_catalog(&state).await;
     Ok(())
@@ -893,27 +978,33 @@ pub async fn fix_orphan_source(
 /// Enumerate conflicting frames across all consecutive ID3v2 tags in a file,
 /// so the frontend can ask the user to pick a value for each before writing.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(file_path = %file_path))]
 pub async fn preview_duplicate_merge(
     file_path: String,
-) -> Result<Vec<crate::library::tag_writer::MergeConflict>, String> {
+) -> Result<Vec<crate::library::tag_writer::MergeConflict>, CommandError> {
     let path_buf = std::path::Path::new(&file_path).to_path_buf();
-    tokio::task::spawn_blocking(move || crate::library::tag_writer::preview_merge(&path_buf))
-        .await
-        .map_err(|e| format!("Merge preview task panicked: {e}"))?
-        .map_err(|e| format!("Failed to preview merge: {e}"))
+    Ok(
+        tokio::task::spawn_blocking(move || crate::library::tag_writer::preview_merge(&path_buf))
+            .await
+            .context("Merge preview task panicked")?
+            .context("Failed to preview merge")?,
+    )
 }
 
 /// Merge all consecutive ID3v2 tags into one, applying the user's choices for
 /// each conflicting frame, then re-scan the source and reload the catalog.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(file_path = %file_path))]
 pub async fn apply_duplicate_merge(
     state: tauri::State<'_, AppState>,
     file_path: String,
     decisions: Vec<crate::library::tag_writer::MergeDecision>,
-) -> Result<crate::library::tag_writer::TagWriteResult, String> {
+) -> Result<crate::library::tag_writer::TagWriteResult, CommandError> {
     let path_buf = std::path::Path::new(&file_path).to_path_buf();
     if !path_buf.is_file() {
-        return Err(format!("Source file is missing: {}", file_path));
+        return Err(CommandError::rejected(format!(
+            "Source file is missing: {file_path}"
+        )));
     }
 
     let write_path = path_buf.clone();
@@ -921,8 +1012,8 @@ pub async fn apply_duplicate_merge(
         crate::library::tag_writer::apply_merge(&write_path, &decisions)
     })
     .await
-    .map_err(|e| format!("Tag merge task panicked: {e}"))?
-    .map_err(|e| format!("Failed to merge tags: {e}"))?;
+    .context("Tag merge task panicked")?
+    .context("Failed to merge tags")?;
 
     // The merge has already succeeded on disk: the file now carries a single
     // tag, so any duplicate-frame conflicts it once had are gone. Clear them
@@ -944,7 +1035,7 @@ pub async fn apply_duplicate_merge(
     .await
     {
         tracing::warn!(
-            error = %e,
+            error = %format!("{e:#}"),
             path = %file_path,
             "Re-scan after tag merge failed; merge already applied"
         );
@@ -955,12 +1046,14 @@ pub async fn apply_duplicate_merge(
 }
 
 #[tauri::command]
-pub fn debug_id3_text_frame(request: Id3FrameDebugRequest) -> Result<Id3FrameDebugInfo, String> {
-    crate::library::scanner::debug_id3_text_frame(
+#[tracing::instrument(skip_all, fields(path = %request.path, frame_id = %request.frame_id))]
+pub fn debug_id3_text_frame(
+    request: Id3FrameDebugRequest,
+) -> Result<Id3FrameDebugInfo, CommandError> {
+    Ok(crate::library::scanner::debug_id3_text_frame(
         std::path::Path::new(&request.path),
         &request.frame_id,
-    )
-    .map_err(|e| e.to_string())
+    )?)
 }
 
 /// Compute a linear gain factor from ReplayGain track gain (preferred) or
@@ -986,11 +1079,12 @@ fn compute_normalization_gain(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %request.source_id))]
 pub async fn play(
     state: tauri::State<'_, AppState>,
     request: PlayRequest,
-) -> Result<PlayerState, String> {
-    tracing::info!(source_id = %request.source_id, "Play command received");
+) -> Result<PlayerState, CommandError> {
+    tracing::info!("Play command received");
     let mut conn = state
         .db
         .acquire(format!(
@@ -998,11 +1092,11 @@ pub async fn play(
             request.source_id
         ))
         .await
-        .map_err(|e| e.to_string())?;
-    let row = sqlx::query(
-        "SELECT
-            s.id                  AS source_id,
-            s.file_path           AS file_path,
+        .context("Failed to acquire connection")?;
+    let row = sqlx::query!(
+        r#"SELECT
+            s.id                  AS "source_id!",
+            s.file_path           AS "file_path!",
             s.raw_tags_json,
             s.fingerprint,
             s.replay_gain_track_db,
@@ -1010,18 +1104,18 @@ pub async fn play(
          FROM source s
          WHERE s.id = ?
            AND s.source_type = 'local_file'
-           AND s.file_path IS NOT NULL",
+           AND s.file_path IS NOT NULL"#,
+        request.source_id,
     )
-    .bind(&request.source_id)
     .fetch_optional(&mut *conn)
     .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "Playable local source not found.".to_string())?;
+    .context("Failed to resolve source")?
+    .ok_or_else(|| CommandError::rejected("Playable local source not found."))?;
 
-    let mut source_id: String = row.get("source_id");
-    let mut file_path: String = row.get("file_path");
-    let raw_tags_json: Option<String> = row.get("raw_tags_json");
-    let fingerprint: Option<String> = row.get("fingerprint");
+    let mut source_id = row.source_id;
+    let mut file_path = row.file_path;
+    let raw_tags_json = row.raw_tags_json;
+    let fingerprint = row.fingerprint;
 
     let tags: Vec<(String, String)> = raw_tags_json
         .as_deref()
@@ -1035,8 +1129,8 @@ pub async fn play(
         .iter()
         .find(|(k, _)| k == "TPE1")
         .map(|(_, v)| v.clone());
-    let replay_gain_track_db: Option<f64> = row.get("replay_gain_track_db");
-    let lufs: Option<f64> = row.get("lufs");
+    let replay_gain_track_db = row.replay_gain_track_db;
+    let lufs = row.lufs;
 
     // Compute the linear normalization gain and source label.
     let (mut normalization_gain, mut normalization_source) =
@@ -1053,36 +1147,24 @@ pub async fn play(
 
         // Try fingerprint-based fallback first, then MBID-based if no fingerprint.
         let mut alt = if fingerprint.is_some() {
-            let alts = sqlx::query(
-                "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs
+            let alts = sqlx::query!(
+                r#"SELECT s.id AS "id!", s.file_path AS "file_path!", s.replay_gain_track_db, s.lufs
                  FROM source s
                  WHERE s.fingerprint = (SELECT fingerprint FROM source WHERE id = ?)
                    AND s.id != ?
                    AND s.source_type = 'local_file'
                    AND s.file_path IS NOT NULL
-                 ORDER BY s.file_path",
+                 ORDER BY s.file_path"#,
+                source_id,
+                source_id,
             )
-            .bind(&source_id)
-            .bind(&source_id)
             .fetch_all(&mut *conn)
             .await
-            .map_err(|e| e.to_string())?;
+            .context("Failed to find alternative sources by fingerprint")?;
 
-            let mut found: Option<(String, String, Option<f64>, Option<f64>)> = None;
-            for alt in &alts {
-                let alt_id: String = alt.get("id");
-                let alt_path: String = alt.get("file_path");
-                if std::path::Path::new(&alt_path).exists() {
-                    found = Some((
-                        alt_id,
-                        alt_path,
-                        alt.get("replay_gain_track_db"),
-                        alt.get("lufs"),
-                    ));
-                    break;
-                }
-            }
-            found
+            alts.into_iter()
+                .find(|alt| std::path::Path::new(&alt.file_path).exists())
+                .map(|alt| (alt.id, alt.file_path, alt.replay_gain_track_db, alt.lufs))
         } else {
             None
         };
@@ -1094,21 +1176,21 @@ pub async fn play(
                 .find(|(k, _)| k == "UFID:http://musicbrainz.org")
                 .map(|(_, v)| v.clone());
             if let Some(mbid) = mbid {
-                let alts = sqlx::query(
-                    "SELECT s.id, s.file_path, s.replay_gain_track_db, s.lufs, s.raw_tags_json
+                let alts = sqlx::query!(
+                    r#"SELECT s.id AS "id!", s.file_path AS "file_path!", s.replay_gain_track_db, s.lufs, s.raw_tags_json
                      FROM source s
                      WHERE s.id != ?
                        AND s.source_type = 'local_file'
                        AND s.file_path IS NOT NULL
-                     ORDER BY s.file_path",
+                     ORDER BY s.file_path"#,
+                    source_id,
                 )
-                .bind(&source_id)
                 .fetch_all(&mut *conn)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context("Failed to find alternative sources by MBID")?;
 
                 for alt_row in alts {
-                    let alt_raw_tags: Option<String> = alt_row.get("raw_tags_json");
+                    let alt_raw_tags = alt_row.raw_tags_json;
                     let has_mbid = alt_raw_tags
                         .as_deref()
                         .and_then(|j| serde_json::from_str::<Vec<(String, String)>>(j).ok())
@@ -1117,18 +1199,14 @@ pub async fn play(
                                 .any(|(k, v)| k == "UFID:http://musicbrainz.org" && v == &mbid)
                         })
                         .unwrap_or(false);
-                    if has_mbid {
-                        let alt_id: String = alt_row.get("id");
-                        let alt_path: String = alt_row.get("file_path");
-                        if std::path::Path::new(&alt_path).exists() {
-                            alt = Some((
-                                alt_id,
-                                alt_path,
-                                alt_row.get("replay_gain_track_db"),
-                                alt_row.get("lufs"),
-                            ));
-                            break;
-                        }
+                    if has_mbid && std::path::Path::new(&alt_row.file_path).exists() {
+                        alt = Some((
+                            alt_row.id,
+                            alt_row.file_path,
+                            alt_row.replay_gain_track_db,
+                            alt_row.lufs,
+                        ));
+                        break;
                     }
                 }
             }
@@ -1136,11 +1214,10 @@ pub async fn play(
 
         if let Some((alt_id, alt_path, alt_rg, alt_lufs)) = alt {
             // Remove the stale source row silently.
-            sqlx::query("DELETE FROM source WHERE id = ?")
-                .bind(&source_id)
+            sqlx::query!("DELETE FROM source WHERE id = ?", source_id)
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| e.to_string())?;
+                .context("Failed to remove missing source")?;
             tracing::info!(
                 removed_source_id = %source_id,
                 removed_path = %file_path,
@@ -1154,10 +1231,9 @@ pub async fn play(
             normalization_gain = alt_gain;
             normalization_source = alt_src;
         } else {
-            return Err(format!(
-                "File not found and no working alternative source exists: {}",
-                file_path
-            ));
+            return Err(CommandError::rejected(format!(
+                "File not found and no working alternative source exists: {file_path}"
+            )));
         }
     }
 
@@ -1168,17 +1244,16 @@ pub async fn play(
     );
 
     let duration_ms: Option<i64> =
-        sqlx::query_scalar("SELECT duration_ms FROM source WHERE id = ?")
-            .bind(&source_id)
+        sqlx::query_scalar!("SELECT duration_ms FROM source WHERE id = ?", source_id)
             .fetch_one(&mut *conn)
             .await
-            .map_err(|e| e.to_string())?;
+            .context("Failed to load source duration")?;
 
     state
         .player
         .play(EnginePlayRequest {
-            source_id,
-            file_path,
+            source_id: source_id.clone(),
+            file_path: file_path.clone(),
             duration_ms: duration_ms
                 .and_then(|d| u64::try_from(d).ok())
                 .filter(|&d| d > 0),
@@ -1187,152 +1262,137 @@ pub async fn play(
             normalization_gain,
             normalization_source: normalization_source.to_string(),
         })
-        .map_err(|e| e.to_string())?;
+        .with_context(|| format!("Failed to start playback of {file_path}"))?;
 
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(enabled = enabled))]
 pub fn set_normalization_enabled(
     state: tauri::State<'_, AppState>,
     enabled: bool,
-) -> Result<PlayerState, String> {
-    tracing::info!(enabled, "Set normalization enabled command received");
-    state
-        .player
-        .set_normalization_enabled(enabled)
-        .map_err(|e| e.to_string())?;
+) -> Result<PlayerState, CommandError> {
+    tracing::info!("Set normalization enabled command received");
+    state.player.set_normalization_enabled(enabled)?;
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
-pub fn pause(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+#[tracing::instrument(skip_all)]
+pub fn pause(state: tauri::State<'_, AppState>) -> Result<PlayerState, CommandError> {
     tracing::info!("Pause command received");
-    state.player.pause().map_err(|e| e.to_string())?;
+    state.player.pause()?;
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
-pub fn resume(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+#[tracing::instrument(skip_all)]
+pub fn resume(state: tauri::State<'_, AppState>) -> Result<PlayerState, CommandError> {
     tracing::info!("Resume command received");
-    state.player.resume().map_err(|e| e.to_string())?;
+    state.player.resume()?;
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(position_ms = request.position_ms))]
 pub fn seek(
     state: tauri::State<'_, AppState>,
     request: SeekRequest,
-) -> Result<PlayerState, String> {
-    tracing::info!(position_ms = request.position_ms, "Seek command received");
-    state
-        .player
-        .seek(request.position_ms)
-        .map_err(|e| e.to_string())?;
+) -> Result<PlayerState, CommandError> {
+    tracing::info!("Seek command received");
+    state.player.seek(request.position_ms)?;
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(volume = request.volume))]
 pub fn set_volume(
     state: tauri::State<'_, AppState>,
     request: VolumeRequest,
-) -> Result<PlayerState, String> {
-    tracing::info!(volume = request.volume, "Set volume command received");
-    state
-        .player
-        .set_volume(request.volume)
-        .map_err(|e| e.to_string())?;
+) -> Result<PlayerState, CommandError> {
+    tracing::info!("Set volume command received");
+    state.player.set_volume(request.volume)?;
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
-pub fn stop(state: tauri::State<'_, AppState>) -> Result<PlayerState, String> {
+#[tracing::instrument(skip_all)]
+pub fn stop(state: tauri::State<'_, AppState>) -> Result<PlayerState, CommandError> {
     tracing::info!("Stop command received");
-    state.player.stop().map_err(|e| e.to_string())?;
+    state.player.stop()?;
     Ok(state.player.snapshot())
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub async fn get_library_summary(
     state: tauri::State<'_, AppState>,
-) -> Result<LibrarySummary, String> {
-    state
-        .catalog
-        .read()
-        .await
-        .get_library_summary()
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<LibrarySummary, CommandError> {
+    Ok(state.catalog.read().await.get_library_summary().await?)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(limit = ?limit, offset = ?offset))]
 pub async fn list_recordings(
     state: tauri::State<'_, AppState>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<Vec<RecordingRow>, String> {
+) -> Result<Vec<RecordingRow>, CommandError> {
     let limit = limit.unwrap_or(200) as usize;
     let offset = offset.unwrap_or(0) as usize;
-    let all = state
-        .catalog
-        .read()
-        .await
-        .list_recordings()
-        .await
-        .map_err(|e| e.to_string())?;
+    let all = state.catalog.read().await.list_recordings().await?;
     Ok(all.into_iter().skip(offset).take(limit).collect())
 }
 
 #[tauri::command]
-pub async fn list_artists(state: tauri::State<'_, AppState>) -> Result<Vec<ArtistRow>, String> {
-    state
-        .catalog
-        .read()
-        .await
-        .list_artists()
-        .await
-        .map_err(|e| e.to_string())
+#[tracing::instrument(skip_all)]
+pub async fn list_artists(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ArtistRow>, CommandError> {
+    Ok(state.catalog.read().await.list_artists().await?)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(artist_id = ?artist_id, search = ?search))]
 pub async fn list_release_groups(
     state: tauri::State<'_, AppState>,
     artist_id: Option<String>,
     search: Option<String>,
-) -> Result<Vec<ReleaseGroupRow>, String> {
+) -> Result<Vec<ReleaseGroupRow>, CommandError> {
     let search = search.as_deref().map(str::trim).filter(|v| !v.is_empty());
-    state
+    Ok(state
         .catalog
         .read()
         .await
         .list_release_groups(artist_id.as_deref(), search)
-        .await
-        .map_err(|e| e.to_string())
+        .await?)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %source_id))]
 pub async fn get_waveform(
     state: tauri::State<'_, AppState>,
     source_id: String,
-) -> Result<Vec<f32>, String> {
-    let mut conn = state
-        .db
-        .acquire(format!("command.get_waveform source_id={source_id}"))
+) -> Result<Vec<f32>, CommandError> {
+    let path = {
+        let mut conn = state
+            .db
+            .acquire(format!("command.get_waveform source_id={source_id}"))
+            .await
+            .context("Failed to acquire connection")?;
+        sqlx::query_scalar!(
+            "SELECT file_path FROM source
+             WHERE id = ? AND source_type = 'local_file' AND file_path IS NOT NULL",
+            source_id,
+        )
+        .fetch_optional(&mut *conn)
         .await
-        .map_err(|e| e.to_string())?;
-    let file_path: Option<String> = sqlx::query_scalar(
-        "SELECT file_path FROM source
-         WHERE id = ? AND source_type = 'local_file' AND file_path IS NOT NULL",
-    )
-    .bind(&source_id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?
-    .flatten();
-
-    let Some(path) = file_path else {
-        return Err("No file found for this recording".to_string());
+        .context("Failed to look up source file")?
+        .flatten()
+        .ok_or_else(|| CommandError::rejected("No file found for this recording"))?
     };
+    let waveform_error = format!("Failed to compute waveform for {path}");
 
     let data = tokio::task::spawn_blocking(move || {
         crate::waveform::compute_waveform(
@@ -1341,267 +1401,302 @@ pub async fn get_waveform(
         )
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    .context("Waveform task panicked")?
+    .context(waveform_error)?;
 
     Ok(data)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %source_id))]
 pub async fn get_cover_art(
     state: tauri::State<'_, AppState>,
     source_id: String,
-) -> Result<Option<String>, String> {
-    let mut conn = state
-        .db
-        .acquire(format!("command.get_cover_art source_id={source_id}"))
+) -> Result<Option<String>, CommandError> {
+    let file_path = {
+        let mut conn = state
+            .db
+            .acquire(format!("command.get_cover_art source_id={source_id}"))
+            .await
+            .context("Failed to acquire connection")?;
+        sqlx::query_scalar!(
+            "SELECT file_path FROM source
+             WHERE id = ? AND source_type = 'local_file' AND file_path IS NOT NULL",
+            source_id,
+        )
+        .fetch_optional(&mut *conn)
         .await
-        .map_err(|e| e.to_string())?;
-    let file_path: Option<String> = sqlx::query_scalar(
-        "SELECT file_path FROM source
-         WHERE id = ? AND source_type = 'local_file' AND file_path IS NOT NULL",
-    )
-    .bind(&source_id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(|e| e.to_string())?
-    .flatten();
+        .context("Failed to look up source file")?
+        .flatten()
+    };
 
     let Some(path) = file_path else {
         return Ok(None);
     };
 
-    crate::library::scanner::extract_cover_art(std::path::Path::new(&path))
-        .map_err(|e| e.to_string())
+    Ok(
+        crate::library::scanner::extract_cover_art(std::path::Path::new(&path))
+            .with_context(|| format!("Failed to extract cover art from {path}"))?,
+    )
 }
 
 #[tauri::command]
-pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    state
-        .catalog
-        .read()
-        .await
-        .list_all_tags()
-        .await
-        .map_err(|e| e.to_string())
+#[tracing::instrument(skip_all)]
+pub async fn list_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, CommandError> {
+    Ok(state.catalog.read().await.list_all_tags().await?)
 }
 
 // ── Smart playlists ───────────────────────────────────────────────────────────
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(query = %query))]
 pub async fn evaluate_smart_playlist(
     state: tauri::State<'_, AppState>,
     query: String,
-) -> Result<SmartPlaylistResult, String> {
-    state
+) -> Result<SmartPlaylistResult, CommandError> {
+    // The query is user input: a syntax error is a rejection, not a failure.
+    // Parse up front so only genuine execution failures reach `Failed`.
+    query::parse(&query).map_err(|e| CommandError::rejected(format!("{e:#}")))?;
+    Ok(state
         .catalog
         .read()
         .await
         .evaluate_smart_playlist(&query)
-        .await
-        .map_err(|e| e.to_string())
+        .await?)
 }
 
 #[tauri::command]
-pub async fn list_playlists(state: tauri::State<'_, AppState>) -> Result<Vec<PlaylistRow>, String> {
+#[tracing::instrument(skip_all)]
+pub async fn list_playlists(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PlaylistRow>, CommandError> {
     let mut conn = state
         .db
         .acquire("command.list_playlists")
         .await
-        .map_err(|e| e.to_string())?;
-    let rows = sqlx::query("SELECT id, name, kind, query FROM playlist ORDER BY name")
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| PlaylistRow {
-            id: row.get("id"),
-            name: row.get("name"),
-            kind: row.get("kind"),
-            query: row.get("query"),
-        })
-        .collect())
+        .context("Failed to acquire connection")?;
+    Ok(sqlx::query_as!(
+        PlaylistRow,
+        r#"SELECT id AS "id!", name, kind, query FROM playlist ORDER BY name"#
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("Failed to list playlists")?)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(name = %request.name, query = %request.query))]
 pub async fn save_smart_playlist(
     state: tauri::State<'_, AppState>,
     request: SaveSmartPlaylistRequest,
-) -> Result<PlaylistRow, String> {
+) -> Result<PlaylistRow, CommandError> {
     // Validate the query parses before saving
-    query::parse(&request.query).map_err(|e| format!("Invalid query: {e}"))?;
+    query::parse(&request.query)
+        .map_err(|e| CommandError::rejected(format!("Invalid query: {e:#}")))?;
 
     let name = request.name.trim();
     if name.is_empty() {
-        return Err("Playlist name cannot be empty.".to_string());
+        return Err(CommandError::rejected("Playlist name cannot be empty."));
     }
 
     let mut conn = state
         .db
         .acquire(format!("command.save_smart_playlist name={name}"))
         .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query(
+        .context("Failed to acquire connection")?;
+    sqlx::query!(
         "INSERT INTO playlist (name, kind, query)
          VALUES (?, 'smart', ?)
          ON CONFLICT(name) DO UPDATE SET query = excluded.query",
+        name,
+        request.query,
     )
-    .bind(name)
-    .bind(&request.query)
     .execute(&mut *conn)
     .await
-    .map_err(|e| e.to_string())?;
+    .context("Failed to save playlist")?;
 
-    let row = sqlx::query("SELECT id, name, kind, query FROM playlist WHERE name = ?")
-        .bind(name)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(PlaylistRow {
-        id: row.get("id"),
-        name: row.get("name"),
-        kind: row.get("kind"),
-        query: row.get("query"),
-    })
+    Ok(sqlx::query_as!(
+        PlaylistRow,
+        r#"SELECT id AS "id!", name, kind, query FROM playlist WHERE name = ?"#,
+        name
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("Failed to reload saved playlist")?)
 }
 
 #[tauri::command]
-pub async fn delete_playlist(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
+#[tracing::instrument(skip_all, fields(id = id))]
+pub async fn delete_playlist(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<(), CommandError> {
     let mut conn = state
         .db
         .acquire(format!("command.delete_playlist id={id}"))
         .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query("DELETE FROM playlist WHERE id = ?")
-        .bind(id)
+        .context("Failed to acquire connection")?;
+    sqlx::query!("DELETE FROM playlist WHERE id = ?", id)
         .execute(&mut *conn)
         .await
-        .map_err(|e| e.to_string())?;
+        .context("Failed to delete playlist")?;
     Ok(())
 }
 
 // ── Last.fm scrobbling ─────────────────────────────────────────────────────────
 
+const LASTFM_NOT_CONFIGURED: &str =
+    "Last.fm not configured. Enter your API key and shared secret in Settings.";
+const LASTFM_NOT_LOGGED_IN: &str = "Not logged in to Last.fm. Connect in Settings.";
+
+/// Load the Last.fm API credentials; `None` means they have not been entered
+/// yet, which is a normal state rather than an error.
 pub(crate) async fn load_lastfm_config(
     db: &crate::db::DbPool,
-) -> Result<crate::lastfm::LastFmConfig, String> {
+) -> anyhow::Result<Option<crate::lastfm::LastFmConfig>> {
     let mut conn = db
         .acquire("lastfm.load_config")
         .await
-        .map_err(|e| format!("DB error loading Last.fm config: {e}"))?;
+        .context("DB error loading Last.fm config")?;
 
     let api_key: Option<String> =
-        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_api_key'")
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'lastfm_api_key'")
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| format!("DB query error for lastfm_api_key: {e}"))?;
+            .context("DB query error for lastfm_api_key")?;
 
     let shared_secret: Option<String> =
-        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_shared_secret'")
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'lastfm_shared_secret'")
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| format!("DB query error for lastfm_shared_secret: {e}"))?;
+            .context("DB query error for lastfm_shared_secret")?;
 
     match (api_key, shared_secret) {
         (Some(api_key), Some(shared_secret)) => {
             tracing::debug!("Loaded Last.fm config from app_config");
-            Ok(crate::lastfm::LastFmConfig {
+            Ok(Some(crate::lastfm::LastFmConfig {
                 api_key,
                 shared_secret,
-            })
+            }))
         }
-        _ => {
-            tracing::warn!(
-                "Last.fm not configured — missing api_key or shared_secret in app_config"
-            );
-            Err(
-                "Last.fm not configured. Enter your API key and shared secret in Settings."
-                    .to_string(),
-            )
-        }
+        _ => Ok(None),
     }
 }
 
+/// Config for a user-invoked command; "not configured" is a rejection.
+async fn require_lastfm_config(
+    db: &crate::db::DbPool,
+) -> Result<crate::lastfm::LastFmConfig, CommandError> {
+    load_lastfm_config(db)
+        .await?
+        .ok_or_else(|| CommandError::rejected(LASTFM_NOT_CONFIGURED))
+}
+
+/// Config and session key for a user-invoked command.
+async fn require_lastfm_session(
+    db: &crate::db::DbPool,
+) -> Result<(crate::lastfm::LastFmConfig, String), CommandError> {
+    let config = require_lastfm_config(db).await?;
+    let session_key = load_lastfm_session_key(db)
+        .await?
+        .ok_or_else(|| CommandError::rejected(LASTFM_NOT_LOGGED_IN))?;
+    Ok((config, session_key))
+}
+
+/// Config and session key for background use; `None` when Last.fm is not set
+/// up (config missing or not logged in), which is a normal state.
+pub(crate) async fn load_lastfm_credentials(
+    db: &crate::db::DbPool,
+) -> anyhow::Result<Option<(crate::lastfm::LastFmConfig, String)>> {
+    let Some(config) = load_lastfm_config(db).await? else {
+        return Ok(None);
+    };
+    Ok(load_lastfm_session_key(db)
+        .await?
+        .map(|session_key| (config, session_key)))
+}
+
 /// Save the Last.fm API key and shared secret to app_config.
+///
+/// Credentials are secrets: they are deliberately not span fields.
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub async fn save_lastfm_credentials(
     state: tauri::State<'_, AppState>,
     api_key: String,
     shared_secret: String,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     tracing::info!("Saving Last.fm credentials");
     if api_key.trim().is_empty() || shared_secret.trim().is_empty() {
-        tracing::warn!("Attempted to save empty Last.fm credentials");
-        return Err("API key and shared secret must not be empty.".to_string());
+        return Err(CommandError::rejected(
+            "API key and shared secret must not be empty.",
+        ));
     }
 
     let mut conn = state
         .db
         .acquire("lastfm.save_credentials")
         .await
-        .map_err(|e| format!("DB error saving Last.fm credentials: {e}"))?;
+        .context("DB error saving Last.fm credentials")?;
 
-    let mut tx = conn
-        .begin()
-        .await
-        .map_err(|e| format!("Failed to start transaction: {e}"))?;
+    let mut tx = conn.begin().await.context("Failed to start transaction")?;
 
-    sqlx::query(
+    let api_key = api_key.trim();
+    sqlx::query!(
         "INSERT INTO app_config (key, value) VALUES ('lastfm_api_key', ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        api_key,
     )
-    .bind(api_key.trim())
     .execute(&mut *tx)
     .await
-    .map_err(|e| format!("Failed to save lastfm_api_key: {e}"))?;
+    .context("Failed to save lastfm_api_key")?;
 
-    sqlx::query(
+    let shared_secret = shared_secret.trim();
+    sqlx::query!(
         "INSERT INTO app_config (key, value) VALUES ('lastfm_shared_secret', ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        shared_secret,
     )
-    .bind(shared_secret.trim())
     .execute(&mut *tx)
     .await
-    .map_err(|e| format!("Failed to save lastfm_shared_secret: {e}"))?;
+    .context("Failed to save lastfm_shared_secret")?;
 
-    tx.commit()
-        .await
-        .map_err(|e| format!("Failed to commit transaction: {e}"))?;
+    tx.commit().await.context("Failed to commit transaction")?;
     tracing::info!("Last.fm credentials saved successfully");
     Ok(())
 }
 
 /// Returns the current Last.fm integration status.
 #[tauri::command]
-pub async fn get_lastfm_status(state: tauri::State<'_, AppState>) -> Result<LastFmStatus, String> {
+#[tracing::instrument(skip_all)]
+pub async fn get_lastfm_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<LastFmStatus, CommandError> {
     tracing::debug!("get_lastfm_status called");
     let mut conn = state
         .db
         .acquire("lastfm.get_status")
         .await
-        .map_err(|e| format!("DB error getting Last.fm status: {e}"))?;
+        .context("DB error getting Last.fm status")?;
 
     let api_key: Option<String> =
-        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_api_key'")
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'lastfm_api_key'")
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| format!("DB query error for lastfm_api_key: {e}"))?;
+            .context("DB query error for lastfm_api_key")?;
     let configured = api_key.is_some();
 
     let session_key: Option<String> =
-        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_session_key'")
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'lastfm_session_key'")
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| format!("DB query error for lastfm_session_key: {e}"))?;
+            .context("DB query error for lastfm_session_key")?;
 
     let username: Option<String> =
-        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_username'")
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'lastfm_username'")
             .fetch_optional(&mut *conn)
             .await
-            .map_err(|e| format!("DB query error for lastfm_username: {e}"))?;
+            .context("DB query error for lastfm_username")?;
 
     tracing::debug!(
         configured,
@@ -1618,17 +1713,25 @@ pub async fn get_lastfm_status(state: tauri::State<'_, AppState>) -> Result<Last
 /// Generate a Last.fm auth token and return the URL the user must visit to authorize the app.
 /// Stores the token in `state.lastfm_auth_token` for the subsequent `lastfm_complete_auth` call.
 #[tauri::command]
+#[tracing::instrument(skip_all)]
 pub async fn lastfm_get_auth_url(
     state: tauri::State<'_, AppState>,
-) -> Result<LastFmAuthUrl, String> {
+) -> Result<LastFmAuthUrl, CommandError> {
     tracing::info!("lastfm_get_auth_url called");
-    let config = load_lastfm_config(&state.db).await?;
+    let config = require_lastfm_config(&state.db).await?;
 
-    let token = crate::lastfm::get_token(&config).await?;
+    let token = crate::lastfm::get_token(&config)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("Failed to request Last.fm auth token")?;
     tracing::info!(token_prefix = %token.chars().take(8).collect::<String>(), "Obtained Last.fm auth token");
 
     // Store the token in memory for the completion step
-    *state.lastfm_auth_token.lock().map_err(|e| e.to_string())? = Some(token.clone());
+    *state
+        .lastfm_auth_token
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Failed to lock auth token mutex: {e}"))? =
+        Some(token.clone());
 
     let url = format!(
         "https://www.last.fm/api/auth/?api_key={}&token={}",
@@ -1641,61 +1744,57 @@ pub async fn lastfm_get_auth_url(
 /// Complete the Last.fm authentication by exchanging the previously-obtained token for a session key.
 /// Persists the session key and username to app_config.
 #[tauri::command]
-pub async fn lastfm_complete_auth(state: tauri::State<'_, AppState>) -> Result<String, String> {
+#[tracing::instrument(skip_all)]
+pub async fn lastfm_complete_auth(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, CommandError> {
     tracing::info!("lastfm_complete_auth called");
-    let config = load_lastfm_config(&state.db).await?;
+    let config = require_lastfm_config(&state.db).await?;
 
     let token = state
         .lastfm_auth_token
         .lock()
-        .map_err(|e| {
-            tracing::error!("Failed to lock lastfm_auth_token mutex: {e}");
-            e.to_string()
-        })?
+        .map_err(|e| anyhow::anyhow!("Failed to lock auth token mutex: {e}"))?
         .take()
         .ok_or_else(|| {
-            tracing::warn!(
-                "No pending auth token found — lastfm_get_auth_url must be called first"
-            );
-            "No pending auth request. Call lastfm_get_auth_url first.".to_string()
+            CommandError::rejected("No pending auth request. Call lastfm_get_auth_url first.")
         })?;
 
     tracing::info!(token_prefix = %token.chars().take(8).collect::<String>(), "Exchanging token for session");
-    let (session_key, username) = crate::lastfm::get_session(&config, &token).await?;
+    let (session_key, username) = crate::lastfm::get_session(&config, &token)
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("Failed to exchange token for Last.fm session")?;
     tracing::info!(%username, "Session obtained, persisting to app_config");
 
     let mut conn = state
         .db
         .acquire("lastfm.complete_auth")
         .await
-        .map_err(|e| format!("DB error on complete_auth: {e}"))?;
+        .context("DB error on complete_auth")?;
 
-    let mut tx = conn
-        .begin()
-        .await
-        .map_err(|e| format!("Failed to start transaction: {e}"))?;
+    let mut tx = conn.begin().await.context("Failed to start transaction")?;
 
-    sqlx::query(
+    // The session key is a secret: keep it out of the log context.
+    sqlx::query!(
         "INSERT INTO app_config (key, value) VALUES ('lastfm_session_key', ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        session_key,
     )
-    .bind(&session_key)
     .execute(&mut *tx)
     .await
-    .map_err(|e| format!("Failed to save session_key: {e}"))?;
+    .context("Failed to save session_key")?;
 
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO app_config (key, value) VALUES ('lastfm_username', ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        username,
     )
-    .bind(&username)
     .execute(&mut *tx)
     .await
-    .map_err(|e| format!("Failed to save username: {e}"))?;
+    .with_context(|| format!("Failed to save username {username}"))?;
 
-    tx.commit()
-        .await
-        .map_err(|e| format!("Failed to commit transaction: {e}"))?;
+    tx.commit().await.context("Failed to commit transaction")?;
 
     tracing::info!(%username, "Last.fm auth complete — user is now logged in");
     Ok(username)
@@ -1703,18 +1802,19 @@ pub async fn lastfm_complete_auth(state: tauri::State<'_, AppState>) -> Result<S
 
 /// Disconnect from Last.fm by removing the stored session key and username.
 #[tauri::command]
-pub async fn lastfm_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[tracing::instrument(skip_all)]
+pub async fn lastfm_disconnect(state: tauri::State<'_, AppState>) -> Result<(), CommandError> {
     tracing::info!("lastfm_disconnect called");
     let mut conn = state
         .db
         .acquire("lastfm.disconnect")
         .await
-        .map_err(|e| format!("DB error disconnecting: {e}"))?;
+        .context("DB error disconnecting")?;
 
-    sqlx::query("DELETE FROM app_config WHERE key IN ('lastfm_session_key', 'lastfm_username')")
+    sqlx::query!("DELETE FROM app_config WHERE key IN ('lastfm_session_key', 'lastfm_username')")
         .execute(&mut *conn)
         .await
-        .map_err(|e| format!("Failed to remove session data: {e}"))?;
+        .context("Failed to remove session data")?;
 
     tracing::info!("Last.fm session cleared");
     Ok(())
@@ -1722,87 +1822,97 @@ pub async fn lastfm_disconnect(state: tauri::State<'_, AppState>) -> Result<(), 
 
 /// Love (heart) a track on Last.fm.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(artist = %request.artist, track = %request.track))]
 pub async fn lastfm_love_track(
     state: tauri::State<'_, AppState>,
     request: LastFmLoveTrackRequest,
-) -> Result<(), String> {
-    tracing::info!(artist = %request.artist, track = %request.track, "lastfm_love_track called");
-    let config = load_lastfm_config(&state.db).await?;
-    let session_key = load_lastfm_session_key(&state.db).await?;
+) -> Result<(), CommandError> {
+    tracing::info!("lastfm_love_track called");
+    let (config, session_key) = require_lastfm_session(&state.db).await?;
 
-    let result =
-        crate::lastfm::love_track(&config, &session_key, &request.artist, &request.track).await;
-    if let Err(ref e) = result {
-        tracing::warn!("Love track failed: {e}");
-    }
-    result
+    Ok(
+        crate::lastfm::love_track(&config, &session_key, &request.artist, &request.track)
+            .await
+            .map_err(anyhow::Error::msg)?,
+    )
 }
 
 /// Unlove a track on Last.fm.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(artist = %request.artist, track = %request.track))]
 pub async fn lastfm_unlove_track(
     state: tauri::State<'_, AppState>,
     request: LastFmLoveTrackRequest,
-) -> Result<(), String> {
-    tracing::info!(artist = %request.artist, track = %request.track, "lastfm_unlove_track called");
-    let config = load_lastfm_config(&state.db).await?;
-    let session_key = load_lastfm_session_key(&state.db).await?;
+) -> Result<(), CommandError> {
+    tracing::info!("lastfm_unlove_track called");
+    let (config, session_key) = require_lastfm_session(&state.db).await?;
 
-    let result =
-        crate::lastfm::unlove_track(&config, &session_key, &request.artist, &request.track).await;
-    if let Err(ref e) = result {
-        tracing::warn!("Unlove track failed: {e}");
-    }
-    result
+    Ok(
+        crate::lastfm::unlove_track(&config, &session_key, &request.artist, &request.track)
+            .await
+            .map_err(anyhow::Error::msg)?,
+    )
 }
 
 /// Check whether the current user has loved a track on Last.fm.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(artist = %request.artist, track = %request.track))]
 pub async fn lastfm_get_track_loved(
     state: tauri::State<'_, AppState>,
     request: LastFmGetTrackLovedRequest,
-) -> Result<bool, String> {
-    tracing::info!(artist = %request.artist, track = %request.track, "lastfm_get_track_loved called");
-    let config = load_lastfm_config(&state.db).await?;
-    let session_key = load_lastfm_session_key(&state.db).await?;
-    crate::lastfm::get_track_loved(&config, &session_key, &request.artist, &request.track).await
+) -> Result<bool, CommandError> {
+    tracing::info!("lastfm_get_track_loved called");
+    let (config, session_key) = require_lastfm_session(&state.db).await?;
+    Ok(
+        crate::lastfm::get_track_loved(&config, &session_key, &request.artist, &request.track)
+            .await
+            .map_err(anyhow::Error::msg)?,
+    )
 }
 
 /// Update the "now playing" status on Last.fm for the currently playing track.
 #[tauri::command]
+#[tracing::instrument(
+    skip_all,
+    fields(artist = %request.artist, track = %request.track, album = ?request.album)
+)]
 pub async fn lastfm_now_playing(
     state: tauri::State<'_, AppState>,
     request: LastFmNowPlayingRequest,
-) -> Result<(), String> {
-    tracing::info!(artist = %request.artist, track = %request.track, album = ?request.album, "lastfm_now_playing called");
-    let config = load_lastfm_config(&state.db).await?;
-    let session_key = load_lastfm_session_key(&state.db).await?;
+) -> Result<(), CommandError> {
+    tracing::info!("lastfm_now_playing called");
+    let (config, session_key) = require_lastfm_session(&state.db).await?;
 
-    let result = crate::lastfm::now_playing(
+    Ok(crate::lastfm::now_playing(
         &config,
         &session_key,
         &request.artist,
         &request.track,
         request.album.as_deref(),
     )
-    .await;
-    if let Err(ref e) = result {
-        tracing::warn!("Now playing update failed: {e}");
-    }
-    result
+    .await
+    .map_err(anyhow::Error::msg)?)
 }
 
 /// Scrobble a track to Last.fm. `timestamp` is the UNIX second when the track started playing.
 #[tauri::command]
+#[tracing::instrument(
+    skip_all,
+    fields(
+        artist = %request.artist,
+        track = %request.track,
+        album = ?request.album,
+        timestamp = %request.timestamp
+    )
+)]
 pub async fn lastfm_scrobble(
     state: tauri::State<'_, AppState>,
     request: LastFmScrobbleRequest,
-) -> Result<(), String> {
-    tracing::info!(artist = %request.artist, track = %request.track, timestamp = %request.timestamp, "lastfm_scrobble called");
-    let config = load_lastfm_config(&state.db).await?;
-    let session_key = load_lastfm_session_key(&state.db).await?;
+) -> Result<(), CommandError> {
+    tracing::info!("lastfm_scrobble called");
+    let (config, session_key) = require_lastfm_session(&state.db).await?;
 
-    let result = crate::lastfm::scrobble(
+    Ok(crate::lastfm::scrobble(
         &config,
         &session_key,
         &request.artist,
@@ -1810,45 +1920,38 @@ pub async fn lastfm_scrobble(
         request.album.as_deref(),
         request.timestamp,
     )
-    .await;
-    if let Err(ref e) = result {
-        tracing::warn!("Scrobble failed: {e}");
-    }
-    result
+    .await
+    .map_err(anyhow::Error::msg)?)
 }
 
-pub(crate) async fn load_lastfm_session_key(db: &crate::db::DbPool) -> Result<String, String> {
+pub(crate) async fn load_lastfm_session_key(
+    db: &crate::db::DbPool,
+) -> anyhow::Result<Option<String>> {
     let mut conn = db
         .acquire("lastfm.load_session_key")
         .await
-        .map_err(|e| format!("DB error loading session key: {e}"))?;
-    sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'lastfm_session_key'")
+        .context("DB error loading session key")?;
+    sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'lastfm_session_key'")
         .fetch_optional(&mut *conn)
         .await
-        .map_err(|e| format!("DB query error for session key: {e}"))?
-        .ok_or_else(|| {
-            tracing::warn!("No Last.fm session key in app_config");
-            "Not logged in to Last.fm. Connect in Settings.".to_string()
-        })
+        .context("DB query error for session key")
 }
 
-fn validate_rating(stars: Option<i64>) -> Result<(), String> {
-    if let Some(stars) = stars {
-        if !(1..=5).contains(&stars) {
-            return Err("Rating must be between 1 and 5.".to_string());
+fn validate_rating(stars: Option<i64>) -> Result<(), CommandError> {
+    match stars {
+        Some(stars) if !(1..=5).contains(&stars) => {
+            Err(CommandError::rejected("Rating must be between 1 and 5."))
         }
+        _ => Ok(()),
     }
-
-    Ok(())
 }
 
 pub async fn load_music_root(db: &crate::db::DbPool) -> anyhow::Result<Option<String>> {
     let mut conn = db.acquire("config.load_music_root").await?;
-    Ok(
-        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'music_root'")
-            .fetch_optional(&mut *conn)
-            .await?,
-    )
+    sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'music_root'")
+        .fetch_optional(&mut *conn)
+        .await
+        .context("Failed to read music_root from app_config")
 }
 
 async fn load_app_config(db: &crate::db::DbPool) -> anyhow::Result<AppConfig> {
@@ -1856,18 +1959,19 @@ async fn load_app_config(db: &crate::db::DbPool) -> anyhow::Result<AppConfig> {
     let mut conn = db
         .acquire("config.load_app_config.queue_history_limit")
         .await?;
-    let queue_history_limit = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM app_config WHERE key = 'queue_history_limit'",
-    )
-    .fetch_optional(&mut *conn)
-    .await?
-    .and_then(|value| value.parse::<i64>().ok())
-    .unwrap_or(5);
+    let queue_history_limit =
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'queue_history_limit'")
+            .fetch_optional(&mut *conn)
+            .await
+            .context("Failed to read queue_history_limit from app_config")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(5);
 
     let external_commands_json: Option<String> =
-        sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'external_commands'")
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'external_commands'")
             .fetch_optional(&mut *conn)
-            .await?;
+            .await
+            .context("Failed to read external_commands from app_config")?;
     let external_commands = external_commands_json
         .and_then(|json| serde_json::from_str::<Vec<ExternalCommand>>(&json).ok())
         .unwrap_or_default();
@@ -1881,144 +1985,175 @@ async fn load_app_config(db: &crate::db::DbPool) -> anyhow::Result<AppConfig> {
 
 async fn set_config_value(db: &crate::db::DbPool, key: &str, value: &str) -> anyhow::Result<()> {
     let mut conn = db.acquire(format!("config.set key={key}")).await?;
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO app_config (key, value)
          VALUES (?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        key,
+        value,
     )
-    .bind(key)
-    .bind(value)
     .execute(&mut *conn)
-    .await?;
+    .await
+    .with_context(|| format!("Failed to write app_config key={key}"))?;
 
     Ok(())
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(id = %id))]
 pub async fn get_artist_detail(
     state: tauri::State<'_, AppState>,
     id: String,
-) -> Result<ArtistDetail, String> {
+) -> Result<ArtistDetail, CommandError> {
     state
         .catalog
         .read()
         .await
         .get_artist_detail(&id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Artist {id} not found"))
+        .await?
+        .ok_or_else(|| CommandError::rejected(format!("Artist {id} not found")))
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(id = %id))]
 pub async fn get_release_group_detail(
     state: tauri::State<'_, AppState>,
     id: String,
-) -> Result<ReleaseGroupDetail, String> {
+) -> Result<ReleaseGroupDetail, CommandError> {
     state
         .catalog
         .read()
         .await
         .get_release_group_detail(&id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Release group {id} not found"))
+        .await?
+        .ok_or_else(|| CommandError::rejected(format!("Release group {id} not found")))
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(id = %id))]
 pub async fn get_recording_detail(
     state: tauri::State<'_, AppState>,
     id: String,
-) -> Result<RecordingDetail, String> {
+) -> Result<RecordingDetail, CommandError> {
     state
         .catalog
         .read()
         .await
         .get_recording_detail(&id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Recording {id} not found"))
+        .await?
+        .ok_or_else(|| CommandError::rejected(format!("Recording {id} not found")))
 }
 
 // ── Artist fix commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(artist_id = %artist_id))]
 pub async fn check_artist_compound(
     state: tauri::State<'_, AppState>,
     artist_id: String,
-) -> Result<CompoundArtistCheck, String> {
-    crate::library::artist_fixes::check_artist_compound(&state.catalog, &artist_id).await
+) -> Result<CompoundArtistCheck, CommandError> {
+    Ok(
+        crate::library::artist_fixes::check_artist_compound(&state.catalog, &artist_id)
+            .await
+            .map_err(anyhow::Error::msg)?,
+    )
+}
+
+/// Drop the MusicBrainz recording-ID frame from a `raw_tags_json` value so the
+/// catalog stops grouping the source with its former siblings.
+///
+/// Fails if the JSON is not a list of `[frame_id, value]` pairs.
+fn strip_mbid_ufid(raw_tags_json: &str) -> serde_json::Result<String> {
+    let tags = serde_json::from_str::<Vec<(String, String)>>(raw_tags_json)?
+        .into_iter()
+        .filter(|(frame_id, _)| frame_id != "UFID:http://musicbrainz.org")
+        .collect::<Vec<_>>();
+    serde_json::to_string(&tags)
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(source_ids_to_move = ?source_ids_to_move))]
 pub async fn split_recording(
     state: tauri::State<'_, AppState>,
     _recording_id: String,
     source_ids_to_move: Vec<String>,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     if source_ids_to_move.is_empty() {
-        return Err("No sources selected to move".to_string());
+        return Err(CommandError::rejected("No sources selected to move"));
     }
-
-    let _permit = state
-        .write_serializer
-        .acquire()
-        .await
-        .map_err(|e| format!("Failed to acquire write lock for split: {e}"))?;
 
     // Remove the MBID from each moved source's raw_tags_json so the catalog
     // will group them independently on the next load.
     {
+        let _permit = state
+            .write_serializer
+            .acquire()
+            .await
+            .context("Failed to acquire write lock for split")?;
         let mut conn = state
             .db
             .acquire("command.split_recording")
             .await
-            .map_err(|e| e.to_string())?;
-        let mut tx = conn.begin().await.map_err(|e| e.to_string())?;
+            .context("Failed to acquire connection")?;
+        let mut tx = conn.begin().await.context("Failed to begin transaction")?;
 
         for sid in &source_ids_to_move {
-            let raw_json: Option<String> =
-                sqlx::query_scalar("SELECT raw_tags_json FROM source WHERE id = ?")
-                    .bind(sid)
+            let raw_json =
+                sqlx::query_scalar!("SELECT raw_tags_json FROM source WHERE id = ?", sid)
                     .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| e.to_string())?
+                    .with_context(|| format!("Failed to read raw_tags_json of source {sid}"))?
                     .flatten();
 
-            if let Some(json) = raw_json {
-                if let Ok(mut tags) = serde_json::from_str::<Vec<(String, String)>>(&json) {
-                    tags.retain(|(k, _)| k != "UFID:http://musicbrainz.org");
-                    let new_json = serde_json::to_string(&tags).unwrap_or(json);
-                    sqlx::query("UPDATE source SET raw_tags_json = ? WHERE id = ?")
-                        .bind(&new_json)
-                        .bind(sid)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| e.to_string())?;
+            let Some(raw_json) = raw_json else { continue };
+            let new_json = match strip_mbid_ufid(&raw_json) {
+                Ok(json) => json,
+                Err(error) => {
+                    let file_path =
+                        sqlx::query_scalar!("SELECT file_path FROM source WHERE id = ?", sid)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .unwrap_or_else(|lookup_error| {
+                                tracing::warn!(source_id = %sid, "Could not look up file path for malformed source: {lookup_error:#}");
+                                None
+                            })
+                            .flatten()
+                            .unwrap_or_else(|| "unknown path".to_string());
+                    return Err(anyhow::Error::new(error)
+                        .context(format!(
+                            "Malformed raw_tags_json for source {sid} ({file_path}); nothing was split"
+                        ))
+                        .into());
                 }
-            }
+            };
+            sqlx::query!(
+                "UPDATE source SET raw_tags_json = ? WHERE id = ?",
+                new_json,
+                sid,
+            )
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("Failed to update raw_tags_json of source {sid}"))?;
         }
 
-        tx.commit().await.map_err(|e| e.to_string())?;
+        tx.commit().await.context("Failed to commit transaction")?;
     }
 
-    drop(_permit);
     reload_catalog(&state).await;
 
-    // Return the recording ID that the catalog assigns to one of the moved sources.
-    let catalog = state.catalog.read().await;
-    let recs = catalog.list_recordings().await.map_err(|e| e.to_string())?;
-    drop(catalog);
-
-    if let Some(first_sid) = source_ids_to_move.first() {
-        for rec in &recs {
-            if rec.primary_source_id.as_deref() == Some(first_sid) {
-                return Ok(rec.id.clone());
-            }
-        }
-    }
-
-    // Fallback: return a placeholder; the frontend will refresh from the catalog.
-    Ok(uuid::Uuid::new_v4().to_string())
+    // Return the recording ID that the catalog assigned to the first moved source.
+    let first_sid = source_ids_to_move
+        .first()
+        .context("No sources selected to move")?;
+    let recording_id = state
+        .catalog
+        .read()
+        .await
+        .recording_id_for_source(first_sid)
+        .with_context(|| {
+            format!("Split succeeded but source {first_sid} is not in any recording after reload")
+        })?;
+    Ok(recording_id)
 }
 
 #[cfg(test)]
@@ -2087,5 +2222,26 @@ mod tests {
         let (gain, source) = compute_normalization_gain(Some(0.0), None);
         assert!((gain - 1.0).abs() < f32::EPSILON);
         assert_eq!(source, "ReplayGain");
+    }
+
+    #[test]
+    fn strip_mbid_ufid_removes_only_the_musicbrainz_frame() {
+        let stripped = strip_mbid_ufid(
+            r#"[["TIT2","Song"],["UFID:http://musicbrainz.org","abc"],["TPE1","Band"]]"#,
+        )
+        .unwrap();
+        let tags: Vec<(String, String)> = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(
+            tags,
+            vec![
+                ("TIT2".to_string(), "Song".to_string()),
+                ("TPE1".to_string(), "Band".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn strip_mbid_ufid_rejects_malformed_json() {
+        assert!(strip_mbid_ufid("not json").is_err());
     }
 }

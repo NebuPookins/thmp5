@@ -1,5 +1,5 @@
 use crate::models::{DbPoolDebugSnapshot, DbPoolLeaseInfo, DbPoolWaiterInfo};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::{
     pool::PoolConnection,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -74,8 +74,12 @@ pub async fn init_pool(db_path: &Path) -> Result<DbPool> {
         .max_connections(pool_connection_count())
         .acquire_timeout(Duration::from_secs(30))
         .connect_with(opts)
-        .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+        .await
+        .with_context(|| format!("Failed to open SQLite database at {}", db_path.display()))?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .with_context(|| format!("Failed to run migrations on {}", db_path.display()))?;
 
     Ok(DbPool {
         pool,
@@ -135,9 +139,13 @@ impl TrackedConnection {
     /// Call this before starting any write transaction that may contend with others.
     pub async fn set_busy_timeout(&mut self, timeout: Duration) -> Result<()> {
         let ms = timeout.as_millis() as u64;
-        sqlx::query(&format!("PRAGMA busy_timeout = {ms}"))
+        // PRAGMA arguments cannot be bound parameters, so this stays a runtime
+        // query rather than a `query!` macro. `ms` is a u64, so it is injection-safe.
+        let sql = format!("PRAGMA busy_timeout = {ms}");
+        sqlx::query(&sql)
             .execute(&mut *self.conn)
-            .await?;
+            .await
+            .with_context(|| format!("Failed to run `{sql}`"))?;
         Ok(())
     }
 }
