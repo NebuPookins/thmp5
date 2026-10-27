@@ -8,6 +8,7 @@ mod importer;
 mod lastfm;
 mod library;
 mod logging;
+mod memory_diagnostics;
 mod models;
 pub mod query;
 mod sleep_inhibitor;
@@ -61,6 +62,7 @@ pub fn run() {
 
             tracing::info!("Database path: {}", db_path.display());
             tracing::info!("Log path: {}", log_path.display());
+            memory_diagnostics::log_environment(&db_path);
 
             let pool = tauri::async_runtime::block_on(db::init_pool(&db_path))
                 .map_err(|e| format!("Failed to initialize database: {e}"))?;
@@ -203,10 +205,12 @@ pub fn run() {
             let player =
                 AudioEngineHandle::new(app.handle().clone(), file_issues.clone(), Some(lastfm_tx))
                     .map_err(|e| format!("Failed to initialize audio engine: {e}"))?;
-            let mem_catalog =
-                tauri::async_runtime::block_on(storage::memory::MemoryCatalog::load_from_db(&pool))
-                    .map_err(|e| format!("Failed to build in-memory catalog: {e}"))?;
-            let catalog = Arc::new(RwLock::new(storage::Catalog::Memory(Box::new(mem_catalog))));
+            memory_diagnostics::log_snapshot("before_catalog_load");
+            let catalog = tauri::async_runtime::block_on(storage::load(&pool))
+                .map_err(|e| format!("Failed to build in-memory catalog: {e}"))?;
+            let catalog = Arc::new(RwLock::new(catalog));
+            memory_diagnostics::log_snapshot("after_catalog_load");
+            memory_diagnostics::spawn_periodic_logging(Arc::clone(&catalog), file_issues.clone());
             let importer = ImportManager::new(
                 file_issues.clone(),
                 write_serializer.clone(),

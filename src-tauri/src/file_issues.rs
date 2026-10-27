@@ -173,6 +173,14 @@ impl FileIssueLog {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.issues.lock().map(|issues| issues.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn all(&self) -> Vec<FileIssue> {
         self.issues
             .lock()
