@@ -1,12 +1,16 @@
 pub mod memory;
 
+use crate::db::DbPool;
 use crate::file_issues::FileIssue;
 use crate::models::{
     ArtistDetail, ArtistRow, LibrarySummary, RecordingDetail, RecordingRow, ReleaseGroupDetail,
     ReleaseGroupRow, SmartPlaylistResult,
 };
 use anyhow::Result;
+use std::fmt;
 use std::future::Future;
+use std::time::Instant;
+use tokio::sync::RwLock;
 
 pub trait CatalogReader: Send + Sync {
     fn list_recordings(&self) -> impl Future<Output = Result<Vec<RecordingRow>>> + Send;
@@ -36,6 +40,30 @@ pub trait CatalogReader: Send + Sync {
     ) -> impl Future<Output = Result<Option<RecordingDetail>>> + Send;
 }
 
+/// Entity counts of a loaded catalog, logged by the memory diagnostics.
+#[derive(Debug)]
+pub struct CatalogStats {
+    pub summary: LibrarySummary,
+    pub playlists: usize,
+    /// Issues derived from source tags (e.g. duplicate frames).
+    pub file_issues: usize,
+}
+
+impl fmt::Display for CatalogStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "sources={} recordings={} artists={} release_groups={} playlists={} tag_file_issues={}",
+            self.summary.source_count,
+            self.summary.recording_count,
+            self.summary.artist_count,
+            self.summary.release_group_count,
+            self.playlists,
+            self.file_issues
+        )
+    }
+}
+
 pub enum Catalog {
     Memory(Box<memory::MemoryCatalog>),
 }
@@ -53,6 +81,12 @@ impl Catalog {
         }
     }
 
+    pub fn stats(&self) -> CatalogStats {
+        match self {
+            Catalog::Memory(c) => c.stats(),
+        }
+    }
+
     pub fn file_issues(&self) -> Vec<FileIssue> {
         match self {
             Catalog::Memory(c) => c.file_issues().to_vec(),
@@ -64,6 +98,24 @@ impl Catalog {
             Catalog::Memory(c) => c.recording_id_for_source(source_id),
         }
     }
+}
+
+/// Builds the in-memory catalog from the database, logging its size and
+/// build time for memory diagnostics.
+pub async fn load(db: &DbPool) -> Result<Catalog> {
+    let started = Instant::now();
+    let mem = memory::MemoryCatalog::load_from_db(db).await?;
+    crate::memory_diagnostics::record_catalog_load(&mem.stats(), started.elapsed());
+    Ok(Catalog::Memory(Box::new(mem)))
+}
+
+/// Rebuilds the catalog, swaps it into `catalog`, then logs a memory snapshot
+/// in the background.
+pub async fn reload(db: &DbPool, catalog: &RwLock<Catalog>) -> Result<()> {
+    let fresh = load(db).await?;
+    *catalog.write().await = fresh;
+    tokio::task::spawn_blocking(|| crate::memory_diagnostics::log_snapshot("catalog_reload"));
+    Ok(())
 }
 
 impl CatalogReader for Catalog {

@@ -42,13 +42,8 @@ fn emit_job_update(app: &tauri::AppHandle, state: &AppState, job_type: &str) {
 /// Rebuild the in-memory catalog from the current database state.
 /// Called after any write that changes source or user data.
 async fn reload_catalog(state: &AppState) {
-    match crate::storage::memory::MemoryCatalog::load_from_db(&state.db).await {
-        Ok(mem) => {
-            *state.catalog.write().await = crate::storage::Catalog::Memory(Box::new(mem));
-        }
-        Err(e) => {
-            tracing::error!("Failed to reload memory catalog: {e:#}");
-        }
+    if let Err(e) = crate::storage::reload(&state.db, &state.catalog).await {
+        tracing::error!("Failed to reload memory catalog: {e:#}");
     }
 }
 

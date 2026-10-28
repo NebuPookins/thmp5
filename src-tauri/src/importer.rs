@@ -87,14 +87,9 @@ impl ImportManager {
                     );
                 }
             }
-            match crate::storage::memory::MemoryCatalog::load_from_db(&db).await {
-                Ok(mem) => {
-                    *catalog.write().await = crate::storage::Catalog::Memory(Box::new(mem));
-                    println!("[importer] catalog reloaded after scan");
-                }
-                Err(e) => {
-                    tracing::error!(root = %root_path, "Catalog reload after scan failed: {e:#}");
-                }
+            match crate::storage::reload(&db, &catalog).await {
+                Ok(()) => println!("[importer] catalog reloaded after scan"),
+                Err(e) => eprintln!("[importer] catalog reload failed: {e:#}"),
             }
         });
     }

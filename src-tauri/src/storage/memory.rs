@@ -224,6 +224,23 @@ impl MemoryCatalog {
             .map(|&idx| self.recordings[idx].id.clone())
     }
 
+    fn summary(&self) -> LibrarySummary {
+        LibrarySummary {
+            recording_count: self.recordings.len() as i64,
+            artist_count: self.artists.len() as i64,
+            release_group_count: self.release_groups.len() as i64,
+            source_count: self.source_count,
+        }
+    }
+
+    pub fn stats(&self) -> super::CatalogStats {
+        super::CatalogStats {
+            summary: self.summary(),
+            playlists: self.playlists.len(),
+            file_issues: self.file_issues.len(),
+        }
+    }
+
     pub async fn load_from_db(db: &DbPool) -> Result<Self> {
         let mut conn = db.acquire("memory_catalog.load").await?;
 
@@ -1461,12 +1478,7 @@ impl super::CatalogReader for MemoryCatalog {
     }
 
     async fn get_library_summary(&self) -> Result<LibrarySummary> {
-        Ok(LibrarySummary {
-            recording_count: self.recordings.len() as i64,
-            artist_count: self.artists.len() as i64,
-            release_group_count: self.release_groups.len() as i64,
-            source_count: self.source_count,
-        })
+        Ok(self.summary())
     }
 
     async fn list_all_tags(&self) -> Result<Vec<String>> {
