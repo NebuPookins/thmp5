@@ -740,44 +740,70 @@ pub fn get_db_pool_debug_snapshot(
 pub async fn get_file_issues(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<FileIssue>, CommandError> {
-    let manual_rows = {
+    let (manual_rows, corrupt_rows) = {
         let mut conn = state
             .db
             .acquire("command.get_file_issues")
             .await
             .context("Failed to acquire connection")?;
-        sqlx::query!(
+        let manual = sqlx::query!(
             r#"SELECT s.file_path, s.id AS "source_id!", i.note
              FROM source_file_issue i JOIN source s ON s.id = i.source_id"#
         )
         .fetch_all(&mut *conn)
         .await
-        .context("Failed to load manual file issues")?
+        .context("Failed to load manual file issues")?;
+        let corrupt = sqlx::query!(
+            r#"SELECT file_path, id AS "source_id!", corruption AS "corruption!"
+             FROM source WHERE corruption IS NOT NULL"#
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .context("Failed to load corrupt audio issues")?;
+        (manual, corrupt)
     };
 
     let catalog = state.catalog.read().await;
     // Recordings are derived in memory, so resolve each source's recording via the catalog.
-    let manual_issues = manual_rows.into_iter().filter_map(|row| {
-        let file_path = row.file_path?;
-        let source_id = row.source_id;
-        Some(FileIssue {
+    let source_issue = |kind: FileIssueKind,
+                        file_path: Option<String>,
+                        source_id: String,
+                        message: String| {
+        let Some(file_path) = file_path else {
+            tracing::warn!(%source_id, ?kind, "Dropping file issue for a source with no file path");
+            return None;
+        };
+        let recording_id = catalog.recording_id_for_source(&source_id);
+        Some(FileIssue::for_source(
+            kind,
             file_path,
-            kind: FileIssueKind::Manual,
-            message: row.note,
-            recording_id: catalog.recording_id_for_source(&source_id),
-            source_id: Some(source_id),
-            frame_id: None,
-            field_name: None,
-            lofty_value: None,
-            corrected_value: None,
-            backup_path: None,
-        })
+            source_id,
+            recording_id,
+            message,
+        ))
+    };
+    let corrupt_issues = corrupt_rows.into_iter().filter_map(|row| {
+        source_issue(
+            FileIssueKind::CorruptAudio,
+            row.file_path,
+            row.source_id,
+            row.corruption,
+        )
+    });
+    let manual_issues = manual_rows.into_iter().filter_map(|row| {
+        source_issue(
+            FileIssueKind::Manual,
+            row.file_path,
+            row.source_id,
+            row.note,
+        )
     });
     Ok(state
         .file_issues
         .all()
         .into_iter()
         .chain(catalog.file_issues())
+        .chain(corrupt_issues)
         .chain(manual_issues)
         .collect())
 }

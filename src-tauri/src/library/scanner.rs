@@ -1,4 +1,4 @@
-use crate::audio_probe::{duration_correction, measure_duration_ms};
+use crate::audio_probe::{duration_correction, scan_audio};
 use crate::models::{
     DuplicateFrameInfo, Id3FrameDebugInfo, MetadataReadResult, TagProperty, TaglibHelperResponse,
     TrackMetadata,
@@ -705,6 +705,7 @@ fn try_taglib_helper(path: &Path, primary_error: &str) -> Result<Option<Metadata
             all_tags: response.all_tags,
             duplicate_frames,
             duration_correction: None,
+            integrity: None,
         }));
     }
 
@@ -909,6 +910,7 @@ pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
             all_tags: Vec::new(),
             duplicate_frames,
             duration_correction: None,
+            integrity: None,
         },
         Err(error) => {
             let primary_error = format!("{error:#}");
@@ -943,13 +945,18 @@ pub fn read_metadata(path: &Path) -> Result<MetadataReadResult> {
     Ok(result)
 }
 
-/// Replace a header-derived duration with the one measured from the file's packets when they
-/// disagree (Xing/VBRI frame counts and bitrate estimates can be wrong). Costs a full demux of
-/// the file, so call it only where the duration is stored.
-pub fn verify_duration(path: &Path, result: &mut MetadataReadResult) {
-    match measure_duration_ms(path) {
-        Ok(measured_ms) => {
-            if let Some(c) = duration_correction(result.meta.duration_ms, measured_ms) {
+/// Scan the whole audio stream once: replace a header-derived duration with the one measured
+/// from the file's packets when they disagree (Xing/VBRI frame counts and bitrate estimates can
+/// be wrong), and record whether the stream decodes cleanly. Costs a full decode of the file, so
+/// call it only where the result is stored.
+pub fn verify_audio(path: &Path, result: &mut MetadataReadResult) {
+    match scan_audio(path) {
+        Ok(scan) => {
+            result.integrity = Some(scan.integrity);
+            let correction = scan
+                .duration_ms
+                .and_then(|measured_ms| duration_correction(result.meta.duration_ms, measured_ms));
+            if let Some(c) = correction {
                 tracing::warn!(
                     path = %path.display(),
                     header_ms = c.header_ms,
@@ -961,7 +968,7 @@ pub fn verify_duration(path: &Path, result: &mut MetadataReadResult) {
             }
         }
         Err(e) => {
-            tracing::debug!(path = %path.display(), "Could not measure duration: {e:#}");
+            tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "Could not scan audio; duration and integrity left unverified");
         }
     }
 }

@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::num::NonZeroU32;
 use std::path::Path;
-use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_OPUS};
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::codecs::CodecParameters;
+use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, Track, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
@@ -340,44 +342,222 @@ pub(crate) fn probe_with_fallbacks(path: &Path) -> Result<Box<dyn FormatReader>>
 /// treated as agreement (encoder delay/padding and rounding account for tens of milliseconds).
 const DURATION_TOLERANCE_MS: u64 = 1_000;
 
-/// Measure the real duration of the default audio track by summing the duration of every
-/// packet actually present in the container, rather than trusting header fields (Xing/VBRI
-/// frame counts, bitrate-based estimates) that can be wrong or missing.
+/// Frames the decoder rejected: how many, and where the first one sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BadFrames {
+    pub count: NonZeroU32,
+    pub first_ms: u64,
+}
+
+/// What is wrong with a stream. There is no "nothing wrong" value: a `Damage` always
+/// describes at least one problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Damage {
+    /// The container delivered every packet but some failed to decode.
+    Frames(BadFrames),
+    /// Reading the container failed part-way, so the rest of the file is unreachable.
+    /// `frames` holds any decode failures found before that point.
+    StreamError {
+        at_ms: u64,
+        frames: Option<BadFrames>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamIntegrity {
+    Clean,
+    Damaged(Damage),
+    /// The audio could not be decoded here (e.g. Opus, which symphonia lacks), so nothing
+    /// can be said about its integrity.
+    NotChecked,
+}
+
+impl StreamIntegrity {
+    /// Human-readable description of the corruption, `None` when none is known.
+    pub(crate) fn description(&self) -> Option<String> {
+        match self {
+            Self::Clean | Self::NotChecked => None,
+            Self::Damaged(damage) => Some(damage.description()),
+        }
+    }
+}
+
+impl Damage {
+    fn description(&self) -> String {
+        let frames_text = |f: &BadFrames| {
+            format!(
+                "{} frame{} failed to decode; first at {}",
+                f.count,
+                if f.count.get() == 1 { "" } else { "s" },
+                format_position(f.first_ms)
+            )
+        };
+        match self {
+            Self::Frames(f) => frames_text(f),
+            Self::StreamError {
+                at_ms,
+                frames: None,
+            } => format!("stream ends with an error at {}", format_position(*at_ms)),
+            Self::StreamError {
+                at_ms,
+                frames: Some(f),
+            } => format!(
+                "{}; stream ends with an error at {}",
+                frames_text(f),
+                format_position(*at_ms)
+            ),
+        }
+    }
+}
+
+/// `m:ss`, or `h:mm:ss` from one hour up.
+fn format_position(ms: u64) -> String {
+    let secs = ms / 1_000;
+    let (h, m, s) = (secs / 3_600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Result of one pass over every packet of a file's default audio track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AudioScan {
+    /// Sum of packet block durations; `None` when demuxing failed part-way (the sum would be
+    /// incomplete, so callers keep the header duration).
+    pub duration_ms: Option<u64>,
+    pub integrity: StreamIntegrity,
+}
+
+fn duration_to_ms(time_base: symphonia::core::units::TimeBase, d: Duration) -> Option<u64> {
+    u64::try_from(time_base.calc_duration(d)?.as_millis()).ok()
+}
+
+/// Demux and decode every packet of the default audio track of `path`.
 ///
-/// Demuxes only — no audio is decoded — so it is cheap relative to a full decode.
-pub(crate) fn measure_duration_ms(path: &Path) -> Result<u64> {
+/// The duration is the sum of the duration of every packet actually present in the container,
+/// rather than a header field (Xing/VBRI frame counts, bitrate estimates) that can be wrong or
+/// missing. The integrity verdict counts packets the decoder rejects and notes when the
+/// container stops yielding packets before the end of the file. A rejected final packet is not
+/// counted: truncated last frames are common and harmless.
+///
+/// CPU-bound; call from `spawn_blocking`.
+pub(crate) fn scan_audio(path: &Path) -> Result<AudioScan> {
     let mut format = probe_with_fallbacks(path)?;
-    let (track, _) =
+    let (track, params) =
         default_audio_track(format.as_ref()).context("No default audio track found")?;
     let track_id = track.id;
     let time_base = track.time_base.context("Track has no time base")?;
 
+    let mut decoder = if params.codec == CODEC_ID_OPUS {
+        tracing::debug!(path = %path.display(), "Opus is not decodable by symphonia; skipping integrity check");
+        None
+    } else {
+        make_audio_decoder(params)
+            .inspect_err(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "No decoder available; skipping integrity check")
+            })
+            .ok()
+    };
+
+    let position_ms = |total: Duration| duration_to_ms(time_base, total).unwrap_or(0);
     let mut total = Duration::ZERO;
-    loop {
-        match format.next_packet() {
-            // Every frame the decoder emits for the packet, including encoder delay/padding:
-            // `dur` alone omits trimmed frames and some readers misreport trimmed mid-stream
-            // frames as padding (e.g. Ogg files with irregular granule positions).
+    let mut bad_at_ms: Vec<u64> = Vec::new();
+    let mut last_packet_failed = false;
+
+    // `Some(position)` when reading the container failed before the end of the file.
+    // Readers return `ResetRequired` at a track-parameter boundary (e.g. chained Ogg); that is
+    // not damage. Only a reader that keeps returning it without yielding a packet is stuck.
+    const MAX_CONSECUTIVE_RESETS: u32 = 8;
+    let mut consecutive_resets = 0u32;
+    let stream_error_ms: Option<u64> = loop {
+        let next = format.next_packet();
+        if !matches!(next, Err(SymphoniaError::ResetRequired)) {
+            consecutive_resets = 0;
+        }
+        match next {
+            Err(SymphoniaError::ResetRequired) if consecutive_resets < MAX_CONSECUTIVE_RESETS => {
+                consecutive_resets += 1;
+                tracing::debug!(path = %path.display(), position_ms = position_ms(total), "Stream reset; resetting decoder");
+                if let Some(d) = decoder.as_mut() {
+                    d.reset();
+                }
+            }
             Ok(Some(packet)) if packet.track_id == track_id => {
-                total = total.saturating_add(packet.block_dur())
+                last_packet_failed = match decoder.as_mut() {
+                    None => false,
+                    Some(d) => match d.decode(&packet) {
+                        Ok(_) => false,
+                        Err(SymphoniaError::ResetRequired) => {
+                            d.reset();
+                            false
+                        }
+                        Err(e) => {
+                            let at_ms = position_ms(total);
+                            tracing::warn!(
+                                path = %path.display(),
+                                position_ms = at_ms,
+                                error = %e,
+                                "Audio frame failed to decode"
+                            );
+                            bad_at_ms.push(at_ms);
+                            true
+                        }
+                    },
+                };
+                // Every frame the decoder emits for the packet, including encoder
+                // delay/padding: `dur` alone omits trimmed frames and some readers misreport
+                // trimmed mid-stream frames as padding (e.g. Ogg files with irregular granule
+                // positions).
+                total = total.saturating_add(packet.block_dur());
             }
             Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(symphonia::core::errors::Error::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break
+            Ok(None) => break None,
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break None
             }
-            // Any other error means the sum is incomplete; report failure rather than a
-            // partial duration so callers keep the header value.
-            Err(e) => return Err(anyhow::Error::new(e).context("Failed while measuring duration")),
+            // Any other error means the rest of the file is unreachable and the sum incomplete.
+            Err(e) => {
+                let at_ms = position_ms(total);
+                tracing::warn!(
+                    path = %path.display(),
+                    position_ms = at_ms,
+                    error = %e,
+                    "Audio stream ended with a read error"
+                );
+                break Some(at_ms);
+            }
+        }
+    };
+    // A truncated final frame is common and harmless; only forgive it when the stream really
+    // ended there (after a read error, the "last" packet was not the end of the file).
+    if last_packet_failed && stream_error_ms.is_none() {
+        if let Some(ms) = bad_at_ms.pop() {
+            tracing::debug!(path = %path.display(), position_ms = ms, "Ignoring decode failure on the final packet");
         }
     }
+    let bad = NonZeroU32::new(u32::try_from(bad_at_ms.len()).unwrap_or(u32::MAX))
+        .zip(bad_at_ms.first())
+        .map(|(count, &first_ms)| BadFrames { count, first_ms });
 
-    let time = time_base
-        .calc_duration(total)
-        .context("Measured duration overflows")?;
-    u64::try_from(time.as_millis()).context("Measured duration is negative")
+    let integrity = match (decoder.is_some(), stream_error_ms, bad) {
+        (_, Some(at_ms), frames) => StreamIntegrity::Damaged(Damage::StreamError { at_ms, frames }),
+        (false, None, _) => StreamIntegrity::NotChecked,
+        (true, None, Some(frames)) => StreamIntegrity::Damaged(Damage::Frames(frames)),
+        (true, None, None) => StreamIntegrity::Clean,
+    };
+    let duration_ms = match stream_error_ms {
+        None => Some(
+            duration_to_ms(time_base, total)
+                .context("Measured duration overflows or is negative")?,
+        ),
+        Some(_) => None,
+    };
+    Ok(AudioScan {
+        duration_ms,
+        integrity,
+    })
 }
 
 /// Decide which duration to trust. Returns the measured value when it disagrees with the
@@ -445,5 +625,96 @@ mod aac_core_tests {
     #[test]
     fn truncated_config_is_rejected() {
         assert_eq!(aac_core_config(&[0x2B, 0x8A]), None);
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tone-2s.mp3");
+
+    fn damaged_by_overwriting_middle(dir: &Path) -> std::path::PathBuf {
+        let mut bytes = std::fs::read(FIXTURE).unwrap();
+        let mid = bytes.len() / 2;
+        // Deterministic noise with no frame sync words.
+        bytes[mid..mid + 1_500]
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, b)| *b = (i as u8).wrapping_mul(37) & 0x7F);
+        let path = dir.join("damaged.mp3");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn clean_file_scans_clean_with_its_real_duration() {
+        let scan = scan_audio(Path::new(FIXTURE)).unwrap();
+        assert_eq!(scan.integrity, StreamIntegrity::Clean);
+        let ms = scan.duration_ms.unwrap();
+        assert!((1_900..=2_200).contains(&ms), "duration was {ms} ms");
+    }
+
+    #[test]
+    fn overwritten_middle_is_reported_damaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = damaged_by_overwriting_middle(dir.path());
+        let scan = scan_audio(&path).unwrap();
+        assert!(
+            matches!(scan.integrity, StreamIntegrity::Damaged(_)),
+            "expected damage, got {:?}",
+            scan.integrity
+        );
+        assert!(scan.integrity.description().is_some());
+    }
+
+    #[test]
+    fn clean_and_unchecked_have_no_description() {
+        assert_eq!(StreamIntegrity::Clean.description(), None);
+        assert_eq!(StreamIntegrity::NotChecked.description(), None);
+    }
+
+    #[test]
+    fn describes_bad_frames_with_count_and_position() {
+        let frames = BadFrames {
+            count: NonZeroU32::new(3).unwrap(),
+            first_ms: 362_000,
+        };
+        assert_eq!(
+            StreamIntegrity::Damaged(Damage::Frames(frames)).description(),
+            Some("3 frames failed to decode; first at 6:02".into())
+        );
+        let one = BadFrames {
+            count: NonZeroU32::MIN,
+            first_ms: 5_000,
+        };
+        assert_eq!(
+            Damage::Frames(one).description(),
+            "1 frame failed to decode; first at 0:05"
+        );
+    }
+
+    #[test]
+    fn describes_stream_errors_with_and_without_bad_frames() {
+        assert_eq!(
+            Damage::StreamError {
+                at_ms: 250_000,
+                frames: None
+            }
+            .description(),
+            "stream ends with an error at 4:10"
+        );
+        let frames = BadFrames {
+            count: NonZeroU32::new(2).unwrap(),
+            first_ms: 3_723_000,
+        };
+        assert_eq!(
+            Damage::StreamError {
+                at_ms: 3_800_000,
+                frames: Some(frames)
+            }
+            .description(),
+            "2 frames failed to decode; first at 1:02:03; stream ends with an error at 1:03:20"
+        );
     }
 }

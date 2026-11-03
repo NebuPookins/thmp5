@@ -167,7 +167,7 @@ type TrackEndedEvent = {
 
 type FileIssue = {
   file_path: string;
-  kind: "manual" | "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch";
+  kind: "manual" | "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch" | "corrupt_audio";
   message: string;
   source_id?: string;
   recording_id?: string;
@@ -186,6 +186,7 @@ const fileIssueLabel = (kind: FileIssue["kind"]): string => ({
   duplicate_frame: "Duplicate tag",
   backup_file_exists: "Backup file",
   duration_mismatch: "Duration mismatch",
+  corrupt_audio: "Corrupt audio",
 }[kind]);
 
 function FileIssueIndicator({ paths, issuesByPath }: {
@@ -826,6 +827,7 @@ function App() {
   const canGoForward = navState ? navState.index < navState.stack.length - 1 : false;
   const [pendingJobs, setPendingJobs] = useState(0);
   const [currentJobType, setCurrentJobType] = useState("");
+  const [integrityProgress, setIntegrityProgress] = useState<{done: number; total: number; damaged: number} | null>(null);
   const releaseGroupSearchInFlightRef = useRef(false);
   const releaseGroupPruneInFlightRef = useRef(false);
   const queuedReleaseGroupSearchRef = useRef<{ artistId: string | null; search: string } | null>(null);
@@ -1490,6 +1492,19 @@ function App() {
           }
         }
       });
+      let lastDamaged = 0;
+      const unlistenIntegrity = await listen<{done: number; total: number; damaged: number}>("integrity-progress", (event) => {
+        if (!isMounted) return;
+        const progress = event.payload;
+        setIntegrityProgress(progress.done < progress.total ? progress : null);
+        // Surface newly found corrupt files without waiting for the issues tab to be opened.
+        if (progress.damaged !== lastDamaged) {
+          lastDamaged = progress.damaged;
+          invoke<FileIssue[]>("get_file_issues").then(setFileIssues, (e) => {
+            console.error("Failed to refresh file issues after integrity check", e);
+          });
+        }
+      });
       const unlistenLoved = await listen<LastFmLovedStatusEvent>("lastfm-loved-status", (event) => {
         if (isMounted && event.payload.source_id === playerSourceIdRef.current) {
           setCurrentTrackLoved(event.payload.loved);
@@ -1503,6 +1518,7 @@ function App() {
         unlistenError();
         unlistenJobUpdate();
         unlistenLoved();
+        unlistenIntegrity();
       };
     }
 
@@ -4040,7 +4056,7 @@ function App() {
       )}
 
       <footer className="status-bar">
-        <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running || pendingJobs > 0 ? "status-bar-indicator-active" : ""}`} />
+        <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running || pendingJobs > 0 || integrityProgress ? "status-bar-indicator-active" : ""}`} />
         <span>Scanned {bootstrap?.import_progress.scanned ?? 0}</span>
         <span className="status-bar-sep">·</span>
         <span>Imported {bootstrap?.import_progress.imported ?? 0}</span>
@@ -4068,6 +4084,12 @@ function App() {
           <>
             <span className="status-bar-sep">·</span>
             <span>{currentJobType === "delete" ? "Deleting" : "Processing"} {pendingJobs} job{pendingJobs !== 1 ? "s" : ""}</span>
+          </>
+        ) : null}
+        {integrityProgress ? (
+          <>
+            <span className="status-bar-sep">·</span>
+            <span>Checking audio integrity {integrityProgress.done}/{integrityProgress.total}</span>
           </>
         ) : null}
         {fileIssues.length > 0 ? (

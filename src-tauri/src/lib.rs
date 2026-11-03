@@ -253,6 +253,7 @@ pub fn run() {
             }
 
             app.manage(state);
+            spawn_integrity_backfill(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -323,4 +324,47 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running thmp5");
+}
+
+/// Delay before the integrity backfill starts, so startup and the initial library scan are
+/// not slowed down by it.
+const INTEGRITY_BACKFILL_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Check the audio of library files that predate the integrity check, one at a time at idle
+/// priority, reporting progress with `integrity-progress` events. Deliberately separate from the
+/// `pending_jobs` queue: this run can take hours, and the frontend reloads library data only
+/// when that queue drains.
+fn spawn_integrity_backfill(app: tauri::AppHandle) {
+    use library::integrity_backfill::{run_backfill, BackfillProgress};
+    use std::sync::Mutex;
+    use tauri::Emitter;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(INTEGRITY_BACKFILL_DELAY).await;
+        let state = app.state::<AppState>();
+        let last = Mutex::new(None::<BackfillProgress>);
+        let emit = |progress: BackfillProgress| {
+            if let Err(e) = app.emit("integrity-progress", progress) {
+                tracing::warn!(?progress, "Failed to emit integrity-progress: {e}");
+            }
+        };
+        let result = run_backfill(&state.db, &state.write_serializer, |progress| {
+            if let Ok(mut l) = last.lock() {
+                *l = Some(progress);
+            }
+            emit(progress);
+        })
+        .await;
+        if let Err(e) = result {
+            tracing::error!("Integrity backfill aborted: {e:#}");
+            // Tell the frontend the run is over so it stops showing progress.
+            let finished = last
+                .lock()
+                .ok()
+                .and_then(|l| *l)
+                .map(|p| BackfillProgress { done: p.total, ..p });
+            if let Some(p) = finished {
+                emit(p);
+            }
+        }
+    });
 }

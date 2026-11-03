@@ -11,6 +11,8 @@ pub enum FileIssueKind {
     DuplicateFrame,
     BackupFileExists,
     DurationMismatch,
+    /// The audio stream has frames the decoder rejects, or ends with an error.
+    CorruptAudio,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -39,6 +41,30 @@ pub struct FileIssue {
     /// For BackupFileExists issues: path to the `.thmp5bak` file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
+}
+
+impl FileIssue {
+    /// An issue attached to a stored source row (no frame/backup details).
+    pub fn for_source(
+        kind: FileIssueKind,
+        file_path: String,
+        source_id: String,
+        recording_id: Option<String>,
+        message: String,
+    ) -> Self {
+        Self {
+            file_path,
+            kind,
+            message,
+            source_id: Some(source_id),
+            recording_id,
+            frame_id: None,
+            field_name: None,
+            lofty_value: None,
+            corrected_value: None,
+            backup_path: None,
+        }
+    }
 }
 
 /// Shared, in-memory log of files that have encountered problems.

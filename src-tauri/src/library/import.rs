@@ -1,4 +1,5 @@
-use super::scanner::{build_raw_tags_json, is_audio_file, read_metadata, verify_duration};
+use super::scanner::{build_raw_tags_json, is_audio_file, read_metadata, verify_audio};
+use crate::audio_probe::StreamIntegrity;
 use crate::db::DbPool;
 use crate::file_issues::{FileIssueKind, FileIssueLog};
 use crate::fingerprint::{self, AcoustIdMatch};
@@ -14,12 +15,18 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 /// Set the calling thread's I/O priority to idle class (Linux only).
-fn set_io_priority_idle() {
+pub(super) fn set_io_priority_idle() {
     #[cfg(target_os = "linux")]
     unsafe {
         // ioprio_set(IOPRIO_WHO_PROCESS=1, pid=0 (self), IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE=3, 0))
         libc::syscall(libc::SYS_ioprio_set, 1i64, 0i64, (3i64 << 13) | 0i64);
     }
+}
+
+/// Split a scan verdict into the `(checked, corruption)` pair stored in `source`: `checked` is
+/// false when the scan did not run to completion, in which case the stored columns are left alone.
+pub(crate) fn integrity_columns(integrity: Option<StreamIntegrity>) -> (bool, Option<String>) {
+    (integrity.is_some(), integrity.and_then(|i| i.description()))
 }
 
 pub(crate) struct PreparedImport {
@@ -34,6 +41,8 @@ pub(crate) struct PreparedImport {
     fp: Option<fingerprint::FingerprintResult>,
     acoustid_match: Option<AcoustIdMatch>,
     raw_tags_json: String,
+    /// Verdict of the full-stream scan; `None` when it did not complete.
+    integrity: Option<StreamIntegrity>,
 }
 
 pub async fn import_paths(
@@ -131,6 +140,7 @@ pub async fn rescan_source(
         duplicate_frames: Vec<DuplicateFrameInfo>,
         duration_correction: Option<DurationCorrection>,
         raw_tags_json: String,
+        integrity: Option<StreamIntegrity>,
     }
 
     let p = path.to_path_buf();
@@ -139,7 +149,7 @@ pub async fn rescan_source(
         set_io_priority_idle();
         let hash = file_sha256(&p).context("Failed to hash file")?;
         let mut metadata_read = read_metadata(&p).context("Failed to read metadata")?;
-        verify_duration(&p, &mut metadata_read);
+        verify_audio(&p, &mut metadata_read);
         let fp = match fingerprint::generate_fingerprint(&p) {
             Ok(fp) => Some(fp),
             Err(e) => {
@@ -160,6 +170,7 @@ pub async fn rescan_source(
             duplicate_frames: metadata_read.duplicate_frames,
             duration_correction: metadata_read.duration_correction,
             raw_tags_json,
+            integrity: metadata_read.integrity,
         })
     })
     .await;
@@ -210,6 +221,7 @@ pub async fn rescan_source(
 
     let duration_ms = blocking.meta.duration_ms as i64;
     let track_total = blocking.meta.track_total.map(|v| v as i64);
+    let (scan_ran, corruption) = integrity_columns(blocking.integrity);
     sqlx::query!(
         "UPDATE source
          SET file_hash = ?,
@@ -224,6 +236,8 @@ pub async fn rescan_source(
              replay_gain_album_db = ?,
              replay_gain_album_peak = ?,
              raw_tags_json = ?,
+             corruption = CASE WHEN ? THEN ? ELSE corruption END,
+             integrity_checked_at = CASE WHEN ? THEN datetime('now') ELSE integrity_checked_at END,
              last_verified = datetime('now')
          WHERE id = ?",
         blocking.hash,
@@ -238,6 +252,9 @@ pub async fn rescan_source(
         blocking.meta.replay_gain_album_db,
         blocking.meta.replay_gain_album_peak,
         blocking.raw_tags_json,
+        scan_ran,
+        corruption,
+        scan_ran,
         source_id,
     )
     .execute(&mut *tx)
@@ -383,6 +400,7 @@ pub(crate) async fn prepare_import(
         warnings: Vec<String>,
         fp: Option<fingerprint::FingerprintResult>,
         raw_tags_json: String,
+        integrity: Option<StreamIntegrity>,
     }
 
     let p = path.to_path_buf();
@@ -400,7 +418,7 @@ pub(crate) async fn prepare_import(
 
         // Metadata and raw_tags_json: always needed (see early-return above).
         let mut metadata_read = read_metadata(&p).context("Failed to read metadata")?;
-        verify_duration(&p, &mut metadata_read);
+        verify_audio(&p, &mut metadata_read);
         let raw_tags_json = build_raw_tags_json(&p, &metadata_read.meta, &metadata_read.all_tags);
 
         // Fingerprint: only when needed (file changed or no existing fingerprint).
@@ -422,6 +440,7 @@ pub(crate) async fn prepare_import(
             warnings: metadata_read.warning.into_iter().collect(),
             fp,
             raw_tags_json,
+            integrity: metadata_read.integrity,
         })
     })
     .await;
@@ -432,12 +451,13 @@ pub(crate) async fn prepare_import(
         Err(e) => anyhow::bail!("Blocking import task panicked: {e}"),
     };
 
-    let (hash, meta, warnings, fp, raw_tags_json) = (
+    let (hash, meta, warnings, fp, raw_tags_json, integrity) = (
         blocking.hash,
         blocking.meta,
         blocking.warnings,
         blocking.fp,
         blocking.raw_tags_json,
+        blocking.integrity,
     );
 
     let acoustid_match: Option<AcoustIdMatch> = match (acoustid_key, fp.as_ref()) {
@@ -463,6 +483,7 @@ pub(crate) async fn prepare_import(
         fp,
         acoustid_match,
         raw_tags_json,
+        integrity,
     }))
 }
 
@@ -483,7 +504,9 @@ pub(crate) async fn store_prepared_import(
         fp,
         acoustid_match: _,
         raw_tags_json,
+        integrity,
     } = prepared;
+    let (scan_ran, corruption) = integrity_columns(integrity);
 
     // Fallback: extract MusicBrainz Recording ID from raw_tags_json if the
     // scanner (Lofty/TagLib) didn't populate it. The raw ID3 scanner always
@@ -544,8 +567,9 @@ pub(crate) async fn store_prepared_import(
             fingerprint, file_size, file_mtime_ms, track_total,
             replay_gain_track_db, replay_gain_track_peak,
             replay_gain_album_db, replay_gain_album_peak,
-            raw_tags_json
-         ) VALUES (?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            raw_tags_json, corruption, integrity_checked_at
+         ) VALUES (?, 'local_file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            CASE WHEN ? THEN datetime('now') END)
          ON CONFLICT(file_path) DO UPDATE SET
             file_hash = excluded.file_hash,
             format = excluded.format,
@@ -558,7 +582,10 @@ pub(crate) async fn store_prepared_import(
             replay_gain_track_peak = excluded.replay_gain_track_peak,
             replay_gain_album_db = excluded.replay_gain_album_db,
             replay_gain_album_peak = excluded.replay_gain_album_peak,
-            raw_tags_json = excluded.raw_tags_json",
+            raw_tags_json = excluded.raw_tags_json,
+            corruption = CASE WHEN excluded.integrity_checked_at IS NOT NULL
+                THEN excluded.corruption ELSE source.corruption END,
+            integrity_checked_at = COALESCE(excluded.integrity_checked_at, source.integrity_checked_at)",
         source_id,
         path_str,
         hash,
@@ -573,6 +600,8 @@ pub(crate) async fn store_prepared_import(
         meta.replay_gain_album_db,
         meta.replay_gain_album_peak,
         raw_tags_json,
+        corruption,
+        scan_ran,
     )
     .execute(&mut *tx)
     .await
@@ -712,6 +741,7 @@ mod tests {
                 recording_mbid: recording_mbid.map(|s| s.to_string()),
             }),
             raw_tags_json: "[]".into(),
+            integrity: None,
         }
     }
 

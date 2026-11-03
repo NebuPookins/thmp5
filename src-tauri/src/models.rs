@@ -311,6 +311,10 @@ pub struct MetadataReadResult {
     pub duplicate_frames: Vec<DuplicateFrameInfo>,
     /// Set when `meta.duration_ms` was overwritten because the header value was wrong.
     pub duration_correction: Option<DurationCorrection>,
+    /// Verdict of decoding the whole stream. `None` when the scan did not run to completion
+    /// (not attempted, or it failed); `Some(NotChecked)` when it ran but the codec can't be
+    /// decoded here.
+    pub integrity: Option<crate::audio_probe::StreamIntegrity>,
 }
 
 #[derive(Debug, Deserialize)]

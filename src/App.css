@@ -2147,6 +2147,11 @@ thead th {
   transform: translateX(18px);
 }
 
+.issue-kind-corrupt_audio {
+  background: rgba(222, 72, 72, 0.18);
+  color: #ec7676;
+}
+
 .issue-kind-duration_mismatch {
   background: rgba(222, 170, 72, 0.18);
   color: #e0b25c;
