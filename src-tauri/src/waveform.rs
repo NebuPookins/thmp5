@@ -115,7 +115,7 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
                 continue;
             }
             Err(e) => {
-                tracing::debug!("Waveform decode stopped: {e}");
+                tracing::warn!(path = %path.display(), error = %e, "Waveform read stopped early");
                 break;
             }
         };
@@ -128,7 +128,7 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
             Ok(d) => d,
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => {
-                tracing::debug!("Waveform decode error: {e}");
+                tracing::warn!(path = %path.display(), error = %e, "Waveform decode stopped early");
                 break;
             }
         };
@@ -152,17 +152,6 @@ pub fn compute_waveform(path: &Path, resolution: usize) -> Result<Vec<f32>> {
                 slice_n_samples = 0;
                 slice_frame_count = 0;
             }
-        }
-
-        // Safety valve: stop if we have many more slices than resolution
-        // (e.g. an hours-long file).  resolution * 10 is plenty of headroom.
-        if slices.len() > resolution * 10 {
-            tracing::debug!(
-                "Stopping early (slices={}), trimming to first {}",
-                slices.len(),
-                resolution
-            );
-            break;
         }
     }
 
@@ -216,7 +205,7 @@ fn compute_waveform_opus(
                 break;
             }
             Err(e) => {
-                tracing::debug!("Opus waveform decode stopped: {e}");
+                tracing::warn!(error = %e, "Opus waveform read stopped early");
                 break;
             }
         };
@@ -246,10 +235,6 @@ fn compute_waveform_opus(
                 slice_frame_count = 0;
             }
         }
-
-        if slices.len() > resolution * 10 {
-            break;
-        }
     }
 
     if slice_frame_count > 0 && slice_n_samples > 0 {
@@ -264,46 +249,74 @@ fn compute_waveform_opus(
     Ok(peaks)
 }
 
-/// Downsample `data` to `target_len` by taking the max value in each bucket.
+/// Resample `data` to exactly `target_len` points, each the max of its
+/// proportional slice of `data`, so point `i` always covers the same fraction
+/// of the track's timeline. Inputs shorter than `target_len` are stretched
+/// (values repeat), not padded. The result is normalized to `[0.0, 1.0]`.
 fn downsample_max(data: &[f32], target_len: usize) -> Vec<f32> {
-    if data.is_empty() || target_len == 0 {
+    if data.is_empty() {
         return vec![0.0f32; target_len];
     }
-    if data.len() <= target_len {
-        let mut result = data.to_vec();
-        result.resize(target_len, 0.0);
-        normalize_peaks(&mut result);
-        return result;
-    }
-
-    let mut result = vec![0.0f32; target_len];
-    let base = data.len() / target_len;
-    let extra = data.len() % target_len;
-
-    let mut src_idx = 0;
-    for dst_idx in 0..target_len {
-        let count = if dst_idx < extra { base + 1 } else { base };
-        let mut max_val = 0.0f32;
-        for _ in 0..count {
-            let v = data[src_idx];
-            if v > max_val {
-                max_val = v;
-            }
-            src_idx += 1;
-        }
-        result[dst_idx] = max_val;
-    }
-
-    normalize_peaks(&mut result);
-    result
+    let len = data.len();
+    let peaks: Vec<f32> = (0..target_len)
+        .map(|i| {
+            let start = i * len / target_len;
+            let end = ((i + 1) * len / target_len).max(start + 1);
+            data[start..end].iter().copied().fold(0.0f32, f32::max)
+        })
+        .collect();
+    normalize_peaks(peaks)
 }
 
-/// In-place normalize to [0.0, 1.0].
-fn normalize_peaks(peaks: &mut [f32]) {
-    let max = peaks.iter().cloned().fold(0.0f32, f32::max);
+/// Normalize to `[0.0, 1.0]` by dividing by the maximum (all-zero input stays zero).
+fn normalize_peaks(peaks: Vec<f32>) -> Vec<f32> {
+    let max = peaks.iter().copied().fold(0.0f32, f32::max);
     if max > 0.0 {
-        for p in peaks.iter_mut() {
-            *p /= max;
-        }
+        peaks.into_iter().map(|p| p / max).collect()
+    } else {
+        peaks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::downsample_max;
+
+    #[test]
+    fn output_has_requested_length() {
+        assert_eq!(downsample_max(&[0.5; 22_800], 500).len(), 500);
+        assert_eq!(downsample_max(&[0.5; 7], 500).len(), 500);
+        assert_eq!(downsample_max(&[], 500).len(), 500);
+    }
+
+    #[test]
+    fn silent_region_lands_at_proportional_position() {
+        // 10_000 slices: loud, then silent for the middle 40%, then loud again.
+        let data: Vec<f32> = (0..10_000)
+            .map(|i| {
+                if (4_000..8_000).contains(&i) {
+                    0.0
+                } else {
+                    0.8
+                }
+            })
+            .collect();
+        let peaks = downsample_max(&data, 100);
+        assert!(peaks[..40].iter().all(|&p| p == 1.0));
+        assert!(peaks[40..80].iter().all(|&p| p == 0.0));
+        assert!(peaks[80..].iter().all(|&p| p == 1.0));
+    }
+
+    #[test]
+    fn short_input_is_stretched_across_full_width() {
+        let peaks = downsample_max(&[0.2, 0.4], 10);
+        assert!(peaks[..5].iter().all(|&p| p == 0.5));
+        assert!(peaks[5..].iter().all(|&p| p == 1.0));
+    }
+
+    #[test]
+    fn bucket_takes_max_and_result_is_normalized() {
+        let peaks = downsample_max(&[0.1, 0.4, 0.2, 0.2], 2);
+        assert_eq!(peaks, vec![1.0, 0.5]);
     }
 }
