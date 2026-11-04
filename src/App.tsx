@@ -217,7 +217,7 @@ type LastFmLovedStatusEvent = {
 
 type ContextMenuState =
   | { kind: "recording"; x: number; y: number; path: string; recording: RecordingRow }
-  | { kind: "source"; x: number; y: number; path: string }
+  | { kind: "source"; x: number; y: number; path: string; recording_id: string | null }
   | { kind: "artist"; x: number; y: number; artist_id: string; artist_name: string }
   | { kind: "release_group"; x: number; y: number; release_group_id: string; title: string };
 
@@ -1939,15 +1939,35 @@ function App() {
     setContextMenu({ kind: "recording", x: e.clientX, y: e.clientY, path: path ?? "", recording });
   }
 
-  function openEntitySourceContextMenu(e: React.MouseEvent, filePath: string) {
+  function openEntitySourceContextMenu(e: React.MouseEvent, filePath: string, recordingId: string | null = null) {
     e.preventDefault();
-    setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: filePath });
+    setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: filePath, recording_id: recordingId });
   }
 
   function openQueueSourceContextMenu(e: React.MouseEvent, item: QueueItem) {
     const path = item.source.file_path;
-    if (path) openEntitySourceContextMenu(e, path);
+    if (path) openEntitySourceContextMenu(e, path, item.id);
     else openRecordingContextMenu(e, item);
+  }
+
+  function recordingDetailsMenuItems(recordingId: string) {
+    return (
+      <>
+        <li>
+          <button
+            className="ctx-menu-item"
+            type="button"
+            onClick={() => {
+              dispatchNav({ type: "navigate", nav: { type: "recording", id: recordingId } });
+              setContextMenu(null);
+            }}
+          >
+            View details
+          </button>
+        </li>
+        <li className="ctx-menu-divider" />
+      </>
+    );
   }
 
   function manualFileIssue(path: string): string | null {
@@ -2942,9 +2962,8 @@ function App() {
                                         title={p}
                                         className="source-path"
                                         onContextMenu={(e) => {
-                                          e.preventDefault();
                                           e.stopPropagation();
-                                          setContextMenu({ kind: "source", x: e.clientX, y: e.clientY, path: p });
+                                          openEntitySourceContextMenu(e, p, recording.id);
                                         }}
                                       >
                                         <FileIssueIndicator paths={[p]} issuesByPath={issuesByPath} />
@@ -3827,19 +3846,7 @@ function App() {
           >
             {contextMenu.kind === "recording" && (
               <>
-                <li>
-                  <button
-                    className="ctx-menu-item"
-                    type="button"
-                    onClick={() => {
-                      dispatchNav({ type: "navigate", nav: { type: "recording", id: contextMenu.recording.id } });
-                      setContextMenu(null);
-                    }}
-                  >
-                    View details
-                  </button>
-                </li>
-                <li className="ctx-menu-divider" />
+                {recordingDetailsMenuItems(contextMenu.recording.id)}
                 {contextMenu.recording.source_paths.length === 1 ? (
                   <li>
                     <button
@@ -3903,6 +3910,7 @@ function App() {
             )}
             {contextMenu.kind === "source" && (
               <>
+                {contextMenu.recording_id !== null && recordingDetailsMenuItems(contextMenu.recording_id)}
                 <li>
                   <button
                     className="ctx-menu-item"
