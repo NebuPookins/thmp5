@@ -7,7 +7,7 @@ import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import { pickNextTrack, pinPrimarySource, pinSource, type QueueItem, type RecordingRow } from "./autoDj";
 import { applySourceRating, applySourceRatingToItem } from "./sourceRating";
 import { describeLastPlayed } from "./lastPlayed";
-import { loveToggleAction } from "./lastfmLove";
+import { NO_TRACKS, applyTrackEdits, buildTrackSet, hasTrack, loveToggleAction, sameTrack, withTrack, type LovedTrack, type TrackEdit } from "./lastfmLove";
 import { calculatePomodoroBatch, parsePomodoroDuration, formatPomodoroDuration, DEFAULT_TARGET_MS } from "./pomodoro";
 import {
   type QueueEntry,
@@ -192,7 +192,8 @@ type LastFmStatus = {
 };
 
 type LastFmLovedStatusEvent = {
-  loved: boolean;
+  /** null when the lookup failed: unknown, not "not loved". */
+  loved: boolean | null;
   source_id: string;
   artist: string;
   track: string;
@@ -434,6 +435,48 @@ function compareRecordings(a: RecordingRow, b: RecordingRow, col: SortColumn, as
   }
   return asc ? delta : -delta;
 }
+
+/** The track a love/unlove request applies to. Artist is required: Last.fm cannot love an artist-less track. */
+type LoveTarget = { artist: string; title: string };
+
+/** The user's Last.fm loved list: not fetched yet, failed to fetch, or loaded. */
+type LovedList =
+  | { status: "loading" }
+  | { status: "failed"; message: string }
+  | { status: "loaded"; keys: ReadonlySet<string> };
+
+/** The love target for a track, or null when it has no artist or title. */
+function toLoveTarget(track: QueueItem): LoveTarget | null {
+  return track.artist_credit_name && track.title
+    ? { artist: track.artist_credit_name, title: track.title }
+    : null;
+}
+
+type QueueLovedHeartProps = {
+  artist: string | null;
+  title: string;
+  /** False until the loved list has loaded: a hollow heart must mean "not loved", not "unknown". */
+  enabled: boolean;
+  loved: boolean;
+  pending: boolean;
+  onToggle: (track: LoveTarget, currentlyLoved: boolean) => void;
+};
+
+/** Last.fm love toggle for queue rows; renders nothing when the track cannot be loved. */
+const QueueLovedHeart = memo(function QueueLovedHeart({ artist, title, enabled, loved, pending, onToggle }: QueueLovedHeartProps) {
+  if (!enabled || !artist || !title) return null;
+  const label = loved ? "Unlove on Last.fm" : "Love on Last.fm";
+  return (
+    <button
+      className={"love-btn queue-love-btn" + (loved ? " love-btn-loved" : "")}
+      disabled={pending}
+      onClick={() => onToggle({ artist, title }, loved)}
+      title={label}
+      aria-label={label}
+      type="button"
+    >{loved ? "♥" : "♡"}</button>
+  );
+});
 
 type RatingStarsProps = {
   value: number | null;
@@ -770,7 +813,24 @@ function App() {
   const [lastfmSharedSecretInput, setLastfmSharedSecretInput] = useState("");
   const [isSavingLastfmCredentials, setIsSavingLastfmCredentials] = useState(false);
   const [currentTrackLoved, setCurrentTrackLoved] = useState(false);
-  const [isLoveActionPending, setIsLoveActionPending] = useState(false);
+  const [lovedList, setLovedList] = useState<LovedList>({ status: "loading" });
+  const lovedKeys = lovedList.status === "loaded" ? lovedList.keys : null;
+  // Edits made while the list isn't loaded, replayed onto it when it arrives; null once loaded.
+  const pendingLoveEditsRef = useRef<readonly TrackEdit[] | null>([]);
+  const loveLoadInFlightRef = useRef(false);
+  const loveLoadGenerationRef = useRef(0);
+  /** The one route for every change to the loved list. */
+  const applyLoveEdit = useCallback((artist: string, title: string, loved: boolean) => {
+    setLovedList((prev) => {
+      if (prev.status !== "loaded") return prev;
+      const keys = withTrack(prev.keys, artist, title, loved);
+      return keys === prev.keys ? prev : { status: "loaded", keys };
+    });
+    const recorded = pendingLoveEditsRef.current;
+    if (recorded) pendingLoveEditsRef.current = [...recorded, { artist, title, loved }];
+  }, []);
+  // Tracks with a love/unlove request in flight; their buttons are disabled.
+  const [lovePending, setLovePending] = useState<ReadonlySet<string>>(NO_TRACKS);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [artistFix, artistFixDispatch] = useReducer(artistFixReducer, { phase: "closed" });
   const nextArtistFixRequestId = useRequestId();
@@ -1509,8 +1569,19 @@ function App() {
         }
       });
       const unlistenLoved = await listen<LastFmLovedStatusEvent>("lastfm-loved-status", (event) => {
-        if (isMounted && event.payload.source_id === playerSourceIdRef.current) {
-          setCurrentTrackLoved(event.payload.loved);
+        const { loved, source_id, artist, track } = event.payload;
+        const current = currentTrackRef.current;
+        // currentTrack is set before play(), while the player's source_id lags; require both to agree so a stale lookup is dropped.
+        if (!isMounted || loved === null || source_id !== playerSourceIdRef.current || current?.source.id !== source_id) return;
+        setCurrentTrackLoved(loved);
+        if (loved) {
+          // Add under the catalog names the queue rows look up.
+          const target = toLoveTarget(current);
+          if (target) applyLoveEdit(target.artist, target.title, true);
+        } else {
+          // Remove the names actually looked up (raw tags). If they differ from
+          // the catalog's, this says nothing about the catalog-named entry.
+          applyLoveEdit(artist, track, false);
         }
       });
 
@@ -1595,6 +1666,37 @@ function App() {
       () => setWaveformData(null),
     );
   }, [playerState.source_id]);
+
+  // Load the loved-tracks list once logged in; while it isn't loaded, each track change retries.
+  const isLovedListLoaded = lovedList.status === "loaded";
+  useEffect(() => {
+    if (!lastfmStatus?.logged_in) {
+      // Logout: ignore any in-flight result and forget everything fetched or recorded.
+      loveLoadGenerationRef.current += 1;
+      loveLoadInFlightRef.current = false;
+      pendingLoveEditsRef.current = [];
+      setLovedList({ status: "loading" });
+      return;
+    }
+    if (isLovedListLoaded || loveLoadInFlightRef.current) return;
+    loveLoadInFlightRef.current = true;
+    const generation = loveLoadGenerationRef.current;
+    invoke<LovedTrack[]>("lastfm_get_loved_tracks").then(
+      (tracks) => {
+        if (generation !== loveLoadGenerationRef.current) return;
+        loveLoadInFlightRef.current = false;
+        const edits = pendingLoveEditsRef.current ?? [];
+        pendingLoveEditsRef.current = null;
+        setLovedList({ status: "loaded", keys: applyTrackEdits(buildTrackSet(tracks), edits) });
+      },
+      (e) => {
+        if (generation !== loveLoadGenerationRef.current) return;
+        loveLoadInFlightRef.current = false;
+        console.error("Failed to load Last.fm loved tracks; queue hearts are hidden until a retry succeeds", e);
+        setLovedList({ status: "failed", message: e instanceof Error ? e.message : String(e) });
+      },
+    );
+  }, [lastfmStatus?.logged_in, isLovedListLoaded, playerState.source_id]);
 
   // Reset loved status on track change; backend emits lastfm-loved-status with the actual value.
   useEffect(() => {
@@ -1689,6 +1791,9 @@ function App() {
   // Keep refs in sync so stale-closure callbacks (e.g. player-track-ended listener)
   // always see the latest value.
   currentTrackRef.current = currentTrack;
+  const playerLoveTarget = currentTrack ? toLoveTarget(currentTrack) : null;
+  // Single effective loved state for the player's heart and the now-playing row, so they can't disagree.
+  const nowPlayingLoved = currentTrack !== null && (currentTrackLoved || hasTrack(lovedKeys, currentTrack.artist_credit_name, currentTrack.title));
   playerSourceIdRef.current = playerState.source_id;
 
   async function completeCurrentTrack(positionMs?: number) {
@@ -2142,31 +2247,40 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function handleLoveTrack() {
-    if (!currentTrack?.artist_credit_name || !currentTrack?.title || !lastfmStatus?.logged_in) return;
-    if (isLoveActionPending) return;
-    const requestedTrackId = currentTrack.id;
-    const { command, nextLoved } = loveToggleAction(currentTrackLoved);
-    setIsLoveActionPending(true);
+  /** Love or unlove `track` on Last.fm. Safe to call for any row; see LoveTarget. */
+  const toggleLove = useCallback(async (track: LoveTarget, currentlyLoved: boolean) => {
+    const { command, nextLoved } = loveToggleAction(currentlyLoved);
+    const setPending = (pending: boolean) =>
+      setLovePending((prev) => withTrack(prev, track.artist, track.title, pending));
+    setPending(true);
     try {
-      await invoke(command, {
-        request: {
-          artist: currentTrack.artist_credit_name,
-          track: currentTrack.title,
-        },
-      });
-      // Only apply the result if playback hasn't since moved to a different
-      // track — an in-flight love/unlove call must not clobber the loved
-      // state of whatever track is now playing.
-      if (currentTrackRef.current?.id === requestedTrackId) {
+      await invoke(command, { request: { artist: track.artist, track: track.title } });
+      // Keyed to the requested track, so it applies even if playback moved on.
+      applyLoveEdit(track.artist, track.title, nextLoved);
+      // Update the player's heart if the playing track has the same name, even as a different recording.
+      const current = currentTrackRef.current;
+      if (current && sameTrack(current.artist_credit_name, current.title, track.artist, track.title)) {
         setCurrentTrackLoved(nextLoved);
       }
     } catch (e) {
+      console.error(`Last.fm ${command} failed`, { artist: track.artist, title: track.title, command }, e);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setIsLoveActionPending(false);
+      setPending(false);
     }
-  }
+  }, [applyLoveEdit]);
+
+  /** Love toggle for a queue row; passes primitives only so the memoized heart skips re-renders. */
+  const renderQueueHeart = (track: QueueItem, loved = hasTrack(lovedKeys, track.artist_credit_name, track.title)) => (
+    <QueueLovedHeart
+      artist={track.artist_credit_name}
+      title={track.title}
+      enabled={lovedKeys !== null}
+      loved={loved}
+      pending={hasTrack(lovePending, track.artist_credit_name, track.title)}
+      onToggle={toggleLove}
+    />
+  );
 
   async function handleSaveLastfmCredentials() {
     if (isSavingLastfmCredentials) return;
@@ -2495,12 +2609,12 @@ function App() {
               />
               {lastfmStatus?.logged_in ? (
                 <button
-                  className={"love-btn" + (currentTrackLoved ? " love-btn-loved" : "")}
-                  disabled={isLoveActionPending}
-                  onClick={() => { void handleLoveTrack(); }}
-                  title={currentTrackLoved ? "Unlove on Last.fm" : "Love on Last.fm"}
+                  className={"love-btn" + (nowPlayingLoved ? " love-btn-loved" : "")}
+                  disabled={!playerLoveTarget || hasTrack(lovePending, currentTrack.artist_credit_name, currentTrack.title)}
+                  onClick={() => { if (playerLoveTarget) void toggleLove(playerLoveTarget, nowPlayingLoved); }}
+                  title={nowPlayingLoved ? "Unlove on Last.fm" : "Love on Last.fm"}
                   type="button"
-                >{currentTrackLoved ? "♥" : "♡"}</button>
+                >{nowPlayingLoved ? "♥" : "♡"}</button>
               ) : null}
               </span>
             ) : null}
@@ -3097,6 +3211,9 @@ function App() {
                         : "")
                     : "Nothing playing"}
                 </p>
+                {lovedList.status === "failed" ? (
+                  <p className="queue-lastfm-note" title={lovedList.message}>Last.fm hearts unavailable</p>
+                ) : null}
               </div>
               <div className="queue-header-actions">
                 {POMODORO_PRESETS.map((preset) => {
@@ -3165,6 +3282,7 @@ function App() {
                           value={item.source.rating !== null ? item.source.rating : item.predicted_rating}
                           isPredicted={item.source.rating === null}
                         />
+                        {renderQueueHeart(item)}
                       </div>
                       <div className="queue-last-played">{describeLastPlayed(item.last_played, new Date())}</div>
                     </li>
@@ -3184,6 +3302,7 @@ function App() {
                           value={currentTrack.source.rating !== null ? currentTrack.source.rating : currentTrack.predicted_rating}
                           isPredicted={currentTrack.source.rating === null}
                         />
+                        {renderQueueHeart(currentTrack, nowPlayingLoved)}
                       </div>
                       <div className="queue-last-played">{describeLastPlayed(currentTrack.last_played, new Date())}</div>
                     </li>
@@ -3252,6 +3371,7 @@ function App() {
                           value={item.source.rating !== null ? item.source.rating : item.predicted_rating}
                           isPredicted={item.source.rating === null}
                         />
+                        {renderQueueHeart(item)}
                       </div>
                       <div className="queue-last-played">{describeLastPlayed(item.last_played, new Date())}</div>
                     </li>

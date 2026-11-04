@@ -113,36 +113,31 @@ pub fn run() {
                                 tracing::warn!(artist, track, "Last.fm: now-playing update failed: {e}");
                             }
                             // Query loved status and push to frontend so the heart button updates.
-                            match lastfm::get_track_loved(&config, &session_key, &artist, &track)
-                                .await
-                            {
-                                Ok(loved) => {
-                                    let _ = lastfm_app_handle.emit(
-                                        "lastfm-loved-status",
-                                        LastFmLovedStatusEvent {
-                                            loved,
-                                            source_id: source_id.clone(),
-                                            artist: artist.clone(),
-                                            track: track.clone(),
-                                        },
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        artist,
-                                        track,
-                                        "Last.fm: loved status query failed: {e}"
-                                    );
-                                    let _ = lastfm_app_handle.emit(
-                                        "lastfm-loved-status",
-                                        LastFmLovedStatusEvent {
-                                            loved: false,
-                                            source_id: source_id.clone(),
-                                            artist: artist.clone(),
-                                            track: track.clone(),
-                                        },
-                                    );
-                                }
+                            let loved =
+                                lastfm::get_track_loved(&config, &session_key, &artist, &track)
+                                    .await
+                                    .inspect_err(|e| {
+                                        tracing::warn!(
+                                            artist,
+                                            track,
+                                            "Last.fm: loved status query failed: {e}"
+                                        );
+                                    })
+                                    .ok();
+                            if let Err(e) = lastfm_app_handle.emit(
+                                "lastfm-loved-status",
+                                LastFmLovedStatusEvent {
+                                    loved,
+                                    source_id: source_id.clone(),
+                                    artist: artist.clone(),
+                                    track: track.clone(),
+                                },
+                            ) {
+                                tracing::warn!(
+                                    artist,
+                                    track,
+                                    "Last.fm: failed to emit loved status: {e}"
+                                );
                             }
                         }
                         audio::LastFmAction::Scrobble {
@@ -319,6 +314,7 @@ pub fn run() {
             commands::lastfm_love_track,
             commands::lastfm_unlove_track,
             commands::lastfm_get_track_loved,
+            commands::lastfm_get_loved_tracks,
             commands::lastfm_now_playing,
             commands::lastfm_scrobble,
         ])

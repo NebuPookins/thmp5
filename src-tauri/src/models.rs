@@ -552,6 +552,13 @@ pub struct LastFmAuthUrl {
     pub url: String,
 }
 
+/// One entry of the user's Last.fm loved-tracks list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LastFmLovedTrack {
+    pub artist: String,
+    pub track: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LastFmLoveTrackRequest {
     pub artist: String,
@@ -587,7 +594,8 @@ pub struct LastFmGetTrackLovedRequest {
 /// MusicBrainz-derived `artist_credit_name`/`title` the frontend displays.
 #[derive(Debug, Clone, Serialize)]
 pub struct LastFmLovedStatusEvent {
-    pub loved: bool,
+    /// `None` when the lookup failed: the status is unknown, not "not loved".
+    pub loved: Option<bool>,
     pub source_id: String,
     pub artist: String,
     pub track: String,

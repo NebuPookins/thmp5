@@ -1,3 +1,4 @@
+use crate::models::LastFmLovedTrack;
 use md5::{Digest, Md5};
 use reqwest::Client;
 use std::sync::OnceLock;
@@ -219,14 +220,25 @@ pub async fn get_track_loved(
         ("track", track),
     ];
     let body = api_call(params, config).await?;
-    let loved = body
-        .get("track")
-        .and_then(|t| t.get("userloved"))
-        .and_then(|v| v.as_str())
-        .map(|s| s == "1")
-        .unwrap_or(false);
+    let loved = parse_user_loved(&body).inspect_err(|e| {
+        warn!(
+            artist,
+            track, "Last.fm: unusable track.getInfo response: {e}"
+        );
+    })?;
     info!(artist, track, loved, "Last.fm: checked track loved status");
     Ok(loved)
+}
+
+/// Read `track.userloved` from a track.getInfo response. Anything other than
+/// "1" or "0" is an error: a missing field means "unknown", not "not loved".
+fn parse_user_loved(body: &serde_json::Value) -> Result<bool, String> {
+    match body.get("track").and_then(|t| t.get("userloved")) {
+        Some(serde_json::Value::String(s)) if s == "1" => Ok(true),
+        Some(serde_json::Value::String(s)) if s == "0" => Ok(false),
+        Some(other) => Err(format!("Unexpected track.userloved value: {other}")),
+        None => Err("track.getInfo response has no track.userloved".to_string()),
+    }
 }
 
 /// Which loved-state change to apply. Pairs the API method name with its log
@@ -302,4 +314,225 @@ pub async fn unlove_track(
 ) -> Result<(), String> {
     info!(artist, track, "Last.fm: unloving track");
     set_track_loved(config, session_key, LovedAction::Unlove, artist, track).await
+}
+
+/// One page of a user's loved tracks, as parsed from `user.getLovedTracks`.
+#[derive(Debug, PartialEq)]
+struct LovedTracksPage {
+    pub tracks: Vec<LastFmLovedTrack>,
+    pub total_pages: u32,
+}
+
+/// `@attr` numbers arrive as JSON strings, but tolerate real numbers too.
+fn json_u32(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        .and_then(|n| u32::try_from(n).ok())
+}
+
+/// Parse a `user.getLovedTracks` response. A response without `lovedtracks` is
+/// an error rather than an empty page, so a malformed reply never silently
+/// yields "no hearts". `track` is an array normally, a bare object when there
+/// is exactly one result, and absent or empty when there are none.
+fn parse_loved_tracks_page(body: &serde_json::Value) -> Result<LovedTracksPage, String> {
+    let loved = body
+        .get("lovedtracks")
+        .filter(|v| v.is_object())
+        .ok_or("Last.fm response missing 'lovedtracks' object")?;
+
+    let entries: Vec<&serde_json::Value> = match loved.get("track") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items.iter().collect(),
+        Some(obj @ serde_json::Value::Object(_)) => vec![obj],
+        // Last.fm sometimes serialises an empty XML element as "".
+        Some(serde_json::Value::String(s)) if s.is_empty() => Vec::new(),
+        Some(other) => return Err(format!("Unexpected 'track' value in loved tracks: {other}")),
+    };
+
+    let tracks = entries
+        .into_iter()
+        .map(|entry| {
+            let track = entry.get("name").and_then(|v| v.as_str());
+            let artist = entry
+                .get("artist")
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str());
+            match (artist, track) {
+                (Some(artist), Some(track)) => Ok(LastFmLovedTrack {
+                    artist: artist.to_string(),
+                    track: track.to_string(),
+                }),
+                _ => Err(format!("Malformed loved track entry: {entry}")),
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // Without @attr (single page responses may omit it), assume one page.
+    let total_pages = loved
+        .get("@attr")
+        .and_then(|a| a.get("totalPages"))
+        .map(|v| json_u32(v).ok_or_else(|| format!("Invalid totalPages in loved tracks: {v}")))
+        .transpose()?
+        .unwrap_or(1);
+
+    Ok(LovedTracksPage {
+        tracks,
+        total_pages,
+    })
+}
+
+/// Fetch and parse one page of `user.getLovedTracks`.
+async fn fetch_loved_tracks_page(
+    config: &LastFmConfig,
+    username: &str,
+    page: u32,
+) -> Result<LovedTracksPage, String> {
+    let page_str = page.to_string();
+    let params = vec![
+        ("method", "user.getLovedTracks"),
+        ("user", username),
+        ("limit", "1000"),
+        ("page", &page_str),
+    ];
+    api_call(params, config)
+        .await
+        .and_then(|body| parse_loved_tracks_page(&body))
+        .inspect_err(|e| warn!(username, page, "Last.fm: loved tracks fetch failed: {e}"))
+}
+
+/// Fetch every loved track of `username` via `user.getLovedTracks`, paging
+/// sequentially. Fails as a whole if any page fails: no partial lists.
+pub async fn get_loved_tracks(
+    config: &LastFmConfig,
+    username: &str,
+) -> Result<Vec<LastFmLovedTrack>, String> {
+    info!(username, "Last.fm: fetching loved tracks");
+    let first = fetch_loved_tracks_page(config, username, 1).await?;
+    let total_pages = first.total_pages;
+    let mut all = first.tracks;
+    for page in 2..=total_pages {
+        all.extend(
+            fetch_loved_tracks_page(config, username, page)
+                .await?
+                .tracks,
+        );
+    }
+    info!(
+        username,
+        count = all.len(),
+        pages = total_pages,
+        "Last.fm: fetched loved tracks"
+    );
+    Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn user_loved_one_is_true_and_zero_is_false() {
+        assert_eq!(
+            parse_user_loved(&json!({"track": {"userloved": "1"}})),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_user_loved(&json!({"track": {"userloved": "0"}})),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn user_loved_missing_or_odd_is_an_error() {
+        for body in [
+            json!({}),
+            json!({"track": {}}),
+            json!({"track": {"userloved": 1}}),
+            json!({"track": {"userloved": true}}),
+            json!({"track": {"userloved": "yes"}}),
+            json!({"track": {"userloved": ""}}),
+        ] {
+            assert!(parse_user_loved(&body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn user_loved_error_names_the_offending_value() {
+        let err = parse_user_loved(&json!({"track": {"userloved": "maybe"}})).unwrap_err();
+        assert!(err.contains("maybe"));
+    }
+
+    #[test]
+    fn parses_multiple_tracks_and_string_attrs() {
+        let body = json!({"lovedtracks": {
+            "track": [
+                {"name": "T1", "artist": {"name": "A1", "url": "x"}},
+                {"name": "T2", "artist": {"name": "A2"}}
+            ],
+            "@attr": {"page": "1", "totalPages": "2", "total": "1001"}
+        }});
+        let page = parse_loved_tracks_page(&body).unwrap();
+        assert_eq!(page.total_pages, 2);
+        assert_eq!(
+            page.tracks,
+            vec![
+                LastFmLovedTrack {
+                    artist: "A1".into(),
+                    track: "T1".into()
+                },
+                LastFmLovedTrack {
+                    artist: "A2".into(),
+                    track: "T2".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_single_track_given_as_object() {
+        let body = json!({"lovedtracks": {
+            "track": {"name": "T", "artist": {"name": "A"}},
+            "@attr": {"page": "1", "totalPages": "1", "total": "1"}
+        }});
+        let page = parse_loved_tracks_page(&body).unwrap();
+        assert_eq!(
+            page.tracks,
+            vec![LastFmLovedTrack {
+                artist: "A".into(),
+                track: "T".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_track_means_no_tracks() {
+        for track in [None, Some(json!([])), Some(json!(""))] {
+            let mut loved = json!({"@attr": {"page": "1", "totalPages": "0", "total": "0"}});
+            if let Some(t) = track {
+                loved["track"] = t;
+            }
+            let page = parse_loved_tracks_page(&json!({ "lovedtracks": loved })).unwrap();
+            assert!(page.tracks.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_lovedtracks_is_an_error() {
+        assert!(parse_loved_tracks_page(&json!({})).is_err());
+        assert!(parse_loved_tracks_page(&json!({"lovedtracks": "oops"})).is_err());
+    }
+
+    #[test]
+    fn entry_without_artist_or_name_is_an_error() {
+        let body = json!({"lovedtracks": {"track": [{"name": "T"}]}});
+        assert!(parse_loved_tracks_page(&body).is_err());
+    }
+
+    #[test]
+    fn invalid_total_pages_is_an_error() {
+        let body = json!({"lovedtracks": {"track": [], "@attr": {"totalPages": "abc"}}});
+        assert!(parse_loved_tracks_page(&body).is_err());
+    }
 }

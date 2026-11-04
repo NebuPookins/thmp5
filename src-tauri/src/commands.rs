@@ -1624,6 +1624,24 @@ async fn require_lastfm_session(
     Ok((config, session_key))
 }
 
+/// Config and username for a user-invoked command that needs no session key.
+async fn require_lastfm_user(
+    db: &crate::db::DbPool,
+) -> Result<(crate::lastfm::LastFmConfig, String), CommandError> {
+    let config = require_lastfm_config(db).await?;
+    let mut conn = db
+        .acquire("lastfm.load_username")
+        .await
+        .context("DB error loading Last.fm username")?;
+    let username =
+        sqlx::query_scalar!("SELECT value FROM app_config WHERE key = 'lastfm_username'")
+            .fetch_optional(&mut *conn)
+            .await
+            .context("DB query error for lastfm_username")?
+            .ok_or_else(|| CommandError::rejected(LASTFM_NOT_LOGGED_IN))?;
+    Ok((config, username))
+}
+
 /// Config and session key for background use; `None` when Last.fm is not set
 /// up (config missing or not logged in), which is a normal state.
 pub(crate) async fn load_lastfm_credentials(
@@ -1889,6 +1907,19 @@ pub async fn lastfm_get_track_loved(
             .await
             .map_err(anyhow::Error::msg)?,
     )
+}
+
+/// Fetch the user's whole Last.fm loved-tracks list.
+#[tauri::command]
+#[tracing::instrument(skip_all)]
+pub async fn lastfm_get_loved_tracks(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::models::LastFmLovedTrack>, CommandError> {
+    tracing::info!("lastfm_get_loved_tracks called");
+    let (config, username) = require_lastfm_user(&state.db).await?;
+    Ok(crate::lastfm::get_loved_tracks(&config, &username)
+        .await
+        .map_err(anyhow::Error::msg)?)
 }
 
 /// Update the "now playing" status on Last.fm for the currently playing track.

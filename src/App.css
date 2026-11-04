@@ -2174,3 +2174,15 @@ thead th {
   font-size: 0.72rem;
   color: #6b819c;
 }
+
+.queue-love-btn {
+  flex: none;
+  font-size: 14px;
+  padding: 0 2px;
+}
+
+.queue-lastfm-note {
+  margin: 0 0 6px;
+  font-size: 0.72rem;
+  color: #8fa5c2;
+}
