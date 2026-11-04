@@ -1,4 +1,4 @@
-import { FormEvent, memo, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { FormEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -26,6 +26,8 @@ import {
   splitModalReducer,
 } from "./modalReducers";
 import { useRequestId } from "./useRequestId";
+import { clampMenuPosition } from "./contextMenuPosition";
+import { FileIssueList, fileIssueLabel, type FileIssue, type FileIssueListActions } from "./FileIssueList";
 import "./App.css";
 
 type LibrarySummary = {
@@ -91,6 +93,8 @@ type AppBootstrap = {
 };
 
 const RECORDINGS_PAGE_SIZE = 5_000;
+// How often the open File Issues panel re-fetches the list.
+const FILE_ISSUES_POLL_MS = 5_000;
 
 type ArtistRow = {
   id: string;
@@ -165,29 +169,8 @@ type TrackEndedEvent = {
   reason: "completed" | "failed";
 };
 
-type FileIssue = {
-  file_path: string;
-  kind: "manual" | "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch" | "corrupt_audio";
-  message: string;
-  source_id?: string;
-  recording_id?: string;
-  frame_id?: string;
-  field_name?: string;
-  lofty_value?: string;
-  corrected_value?: string;
-  backup_path?: string;
-};
-
-const fileIssueLabel = (kind: FileIssue["kind"]): string => ({
-  manual: "File issue",
-  import_error: "Import error",
-  playback_error: "Playback error",
-  orphan_source: "Orphan source",
-  duplicate_frame: "Duplicate tag",
-  backup_file_exists: "Backup file",
-  duration_mismatch: "Duration mismatch",
-  corrupt_audio: "Corrupt audio",
-}[kind]);
+const areIssuesEqual = (a: readonly FileIssue[], b: readonly FileIssue[]): boolean =>
+  a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
 
 function FileIssueIndicator({ paths, issuesByPath }: {
   paths: readonly string[];
@@ -645,14 +628,16 @@ function App() {
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const waveformContainerRef = useRef<HTMLDivElement>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"options" | "issues">("options");
-  const isModalOpenRef = useRef(isModalOpen);
-  isModalOpenRef.current = isModalOpen;
-  const settingsTabRef = useRef(settingsTab);
-  settingsTabRef.current = settingsTab;
+  const [isIssuesPanelOpen, setIsIssuesPanelOpen] = useState(false);
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
   const [pendingFileIssues, setPendingFileIssues] = useState<FileIssue[] | null>(null);
-  const lastMouseMoveTimeRef = useRef<number>(0);
+  // While the pointer is over the panel, background updates are held so rows
+  // don't shift under it; they are applied when the pointer leaves.
+  const isPointerOverIssuesPanelRef = useRef(false);
+  // Bumped when an issue mutation starts and again when it settles, so a poll
+  // that began before a mutation can't overwrite its result with older data.
+  const issueMutationCounterRef = useRef(0);
+  const [issuesRefreshError, setIssuesRefreshError] = useState<string | null>(null);
   const fileIssuesRef = useRef<FileIssue[]>(fileIssues);
   fileIssuesRef.current = fileIssues;
   const pendingFileIssuesRef = useRef<FileIssue[] | null>(pendingFileIssues);
@@ -710,20 +695,18 @@ function App() {
     }));
     mergeDispatch({ type: "submit" });
     void (async () => {
-      try {
-        await invoke("apply_duplicate_merge", { filePath, decisions });
-        // The file was written regardless of what the modal shows now; drop its
-        // resolved duplicate issues unconditionally.
-        setFileIssues(prev => prev.filter(
-          (fi) => !(fi.kind === "duplicate_frame" && fi.file_path === filePath)
-        ));
-        setPendingFileIssues(prev => prev ? prev.filter(
-          (fi) => !(fi.kind === "duplicate_frame" && fi.file_path === filePath)
-        ) : null);
-        mergeDispatch({ type: "submitOk", requestId });
-      } catch (e) {
-        mergeDispatch({ type: "submitErr", requestId, error: e instanceof Error ? e.message : String(e) });
-      }
+      // Failures are shown in the merge modal rather than the global banner.
+      const ok = await runIssueMutation(
+        `apply duplicate merge for ${filePath} (${decisions.length} decisions)`,
+        async () => {
+          await invoke("apply_duplicate_merge", { filePath, decisions });
+          // The file was written regardless of what the modal shows now; drop its
+          // resolved duplicate issues unconditionally.
+          removeFileIssues((fi) => fi.kind === "duplicate_frame" && fi.file_path === filePath);
+        },
+        (message) => mergeDispatch({ type: "submitErr", requestId, error: message }),
+      );
+      if (ok) mergeDispatch({ type: "submitOk", requestId });
     })();
   };
   // Index of the first duplicate_frame issue per file, so the merge button is
@@ -738,6 +721,34 @@ function App() {
     return map;
   }, [fileIssues]);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Runs a write that changes the issue list. Brackets it with counter bumps so
+   * in-flight polls are discarded, and reports failures (log + `onError`)
+   * instead of letting them vanish. Resolves to whether `action` succeeded.
+   */
+  async function runIssueMutation(
+    description: string,
+    action: () => Promise<void>,
+    onError: (message: string) => void = setError,
+  ): Promise<boolean> {
+    issueMutationCounterRef.current += 1;
+    try {
+      await action();
+      return true;
+    } catch (mutationError) {
+      console.error(`File issue operation failed: ${description}`, mutationError);
+      onError(mutationError instanceof Error ? mutationError.message : String(mutationError));
+      return false;
+    } finally {
+      issueMutationCounterRef.current += 1;
+    }
+  }
+
+  function removeFileIssues(shouldRemove: (issue: FileIssue) => boolean) {
+    setFileIssues((prev) => prev.filter((fi) => !shouldRemove(fi)));
+    setPendingFileIssues((prev) => (prev ? prev.filter((fi) => !shouldRemove(fi)) : null));
+  }
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [_allTags, setAllTags] = useState<string[]>([]);
   const [browserLeftTab, setBrowserLeftTab] = useState<"artists" | "albums" | "smartplaylists">("artists");
@@ -1237,8 +1248,37 @@ function App() {
     void loadBootstrap();
   }, []);
 
+  // Background updates are held while the pointer is over the panel;
+  // direct user updates pass forceImmediate = true.
+  const updateFileIssues = useCallback((newIssues: FileIssue[], forceImmediate = false) => {
+    if (areIssuesEqual(newIssues, fileIssuesRef.current)) {
+      setPendingFileIssues(null);
+    } else if (!forceImmediate && isPointerOverIssuesPanelRef.current) {
+      const pending = pendingFileIssuesRef.current;
+      if (pending === null || !areIssuesEqual(newIssues, pending)) setPendingFileIssues(newIssues);
+    } else {
+      setFileIssues(newIssues);
+      setPendingFileIssues(null);
+    }
+  }, []);
+
+  const flushPendingFileIssues = useCallback(() => {
+    const pending = pendingFileIssuesRef.current;
+    if (pending !== null) {
+      setFileIssues(pending);
+      setPendingFileIssues(null);
+    }
+  }, []);
+
+  // `mouseleave` doesn't fire when the panel unmounts, so closing resets the
+  // hover state itself.
+  const closeIssuesPanel = useCallback(() => {
+    isPointerOverIssuesPanelRef.current = false;
+    setIsIssuesPanelOpen(false);
+    flushPendingFileIssues();
+  }, [flushPendingFileIssues]);
+
   // After bootstrap, run the orphan-source check and refresh issue list.
-  // Also re-check any time the issues tab opens.
   useEffect(() => {
     if (!bootstrap) return;
     void (async () => {
@@ -1247,89 +1287,52 @@ function App() {
       } catch { /* best-effort */ }
       try {
         const issues = await invoke<FileIssue[]>("get_file_issues");
-        setFileIssues(issues);
-      } catch { /* best-effort */ }
+        updateFileIssues(issues);
+      } catch (issuesError) {
+        console.error("Failed to load file issues after bootstrap", issuesError);
+      }
     })();
   }, [bootstrap]);
 
-  // Utility to check if two issue lists are structurally equal
-  const areIssuesEqual = (a: FileIssue[], b: FileIssue[]): boolean => {
-    if (a.length !== b.length) return false;
-    return JSON.stringify(a) === JSON.stringify(b);
-  };
-
-  // Update file issues helper: if modal is open and mouse moved recently (< 3s), buffer background update.
-  // Direct user updates pass forceImmediate = true.
-  const updateFileIssues = useCallback((newIssues: FileIssue[], forceImmediate = false) => {
-    if (forceImmediate) {
-      setFileIssues(newIssues);
-      setPendingFileIssues(null);
-      return;
-    }
-
-    const now = Date.now();
-    const isModalActive = isModalOpenRef.current && settingsTabRef.current === "issues";
-    const timeSinceMouseMove = now - lastMouseMoveTimeRef.current;
-
-    if (isModalActive && timeSinceMouseMove < 3000) {
-      if (!areIssuesEqual(newIssues, fileIssuesRef.current)) {
-        setPendingFileIssues(newIssues);
-      } else {
-        setPendingFileIssues(null);
-      }
-    } else {
-      setFileIssues(newIssues);
-      setPendingFileIssues(null);
-    }
-  }, []);
-
-  // Poll/check periodic background issue updates or cooldown flushes
+  // Load the issue list when the panel opens, then keep it fresh while it stays
+  // open. Each fetch is scheduled after the previous one settles, so requests
+  // can't pile up when the DB pool is busy.
   useEffect(() => {
-    const isModalActive = isModalOpen && settingsTab === "issues";
-
-    const interval = setInterval(() => {
-      const now = Date.now();
-      const timeSinceMouseMove = now - lastMouseMoveTimeRef.current;
-
-      // If there are pending issues and 3 seconds passed since mouse movement, apply them
-      if (pendingFileIssuesRef.current !== null && (!isModalActive || timeSinceMouseMove >= 3000)) {
-        setFileIssues(pendingFileIssuesRef.current);
-        setPendingFileIssues(null);
+    if (!isIssuesPanelOpen) return;
+    let isCancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Log only when the failure changes, so a persistent error doesn't flood the console.
+    let lastErrorMessage: string | null = null;
+    const poll = async (forceImmediate: boolean) => {
+      const mutationsAtStart = issueMutationCounterRef.current;
+      try {
+        const fetched = await invoke<FileIssue[]>("get_file_issues");
+        if (isCancelled) return;
+        lastErrorMessage = null;
+        setIssuesRefreshError(null);
+        if (issueMutationCounterRef.current === mutationsAtStart) {
+          updateFileIssues(fetched, forceImmediate);
+        } else {
+          console.debug("Discarded a file issues poll result that raced with a mutation");
+        }
+      } catch (err) {
+        const message = String(err);
+        if (message !== lastErrorMessage) {
+          lastErrorMessage = message;
+          console.error("Failed to refresh the file issues panel", err);
+          await reportPoolTimeout("file issues poll", err);
+        }
+        if (!isCancelled) setIssuesRefreshError(message);
       }
-
-      // Periodically fetch background file issues while modal is active
-      if (isModalActive) {
-        invoke<FileIssue[]>("get_file_issues")
-          .then((fetched) => {
-            const currentMouseMoveTime = lastMouseMoveTimeRef.current;
-            const currentIsModalActive = isModalOpenRef.current && settingsTabRef.current === "issues";
-            if (currentIsModalActive && (Date.now() - currentMouseMoveTime) < 3000) {
-              if (!areIssuesEqual(fetched, fileIssuesRef.current)) {
-                setPendingFileIssues(fetched);
-              } else {
-                setPendingFileIssues(null);
-              }
-            } else {
-              setFileIssues(fetched);
-              setPendingFileIssues(null);
-            }
-          })
-          .catch(() => {});
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [isModalOpen, settingsTab]);
-
-  // Reload the file issue list whenever the issues tab becomes visible.
-  useEffect(() => {
-    if (!isModalOpen || settingsTab !== "issues") return;
-    invoke<FileIssue[]>("get_file_issues")
-      .then((fetched) => {
-        updateFileIssues(fetched, true);
-      })
-      .catch(() => {});
-  }, [isModalOpen, settingsTab, updateFileIssues]);
+      if (!isCancelled) timer = setTimeout(() => { void poll(false); }, FILE_ISSUES_POLL_MS);
+    };
+    void poll(true);
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+      setIssuesRefreshError(null);
+    };
+  }, [isIssuesPanelOpen, updateFileIssues]);
 
   useEffect(() => {
     if (!bootstrap || bootstrap.needs_setup) {
@@ -1497,10 +1500,10 @@ function App() {
         if (!isMounted) return;
         const progress = event.payload;
         setIntegrityProgress(progress.done < progress.total ? progress : null);
-        // Surface newly found corrupt files without waiting for the issues tab to be opened.
+        // Surface newly found corrupt files without waiting for the issues panel to be opened.
         if (progress.damaged !== lastDamaged) {
           lastDamaged = progress.damaged;
-          invoke<FileIssue[]>("get_file_issues").then(setFileIssues, (e) => {
+          invoke<FileIssue[]>("get_file_issues").then((issues) => updateFileIssues(issues), (e) => {
             console.error("Failed to refresh file issues after integrity check", e);
           });
         }
@@ -1860,29 +1863,22 @@ function App() {
   async function handleFileIssue(path: string, existingNote: string | null) {
     const note = window.prompt(existingNote === null ? "Describe the file issue:" : "Edit the file issue:", existingNote ?? "");
     if (note === null) return;
-    try {
+    if (!note.trim() && existingNote === null) return;
+    await runIssueMutation(`${existingNote === null ? "record" : "edit"} file issue for ${path}`, async () => {
       if (note.trim()) {
         await invoke("set_source_file_issue", { filePath: path, note });
-      } else if (existingNote !== null) {
-        await invoke("clear_source_file_issue", { filePath: path });
       } else {
-        return;
+        await invoke("clear_source_file_issue", { filePath: path });
       }
-      const issues = await invoke<FileIssue[]>("get_file_issues");
-      updateFileIssues(issues, true);
-    } catch (issueError) {
-      setError(issueError instanceof Error ? issueError.message : String(issueError));
-    }
+      updateFileIssues(await invoke<FileIssue[]>("get_file_issues"), true);
+    });
   }
 
   async function handleClearFileIssue(path: string) {
-    try {
+    await runIssueMutation(`clear file issue for ${path}`, async () => {
       await invoke("clear_source_file_issue", { filePath: path });
-      const issues = await invoke<FileIssue[]>("get_file_issues");
-      updateFileIssues(issues, true);
-    } catch (issueError) {
-      setError(issueError instanceof Error ? issueError.message : String(issueError));
-    }
+      updateFileIssues(await invoke<FileIssue[]>("get_file_issues"), true);
+    });
   }
 
   async function handleRescanSources(paths: string[]) {
@@ -2302,6 +2298,97 @@ function App() {
       setRatingKeyInFlight((current) => (current === ratingKey ? null : current));
     }
   }
+
+  async function fixOrphan(sourceId: string) {
+    setFixingOrphans((prev) => new Set(prev).add(sourceId));
+    try {
+      await runIssueMutation(`fix orphan source ${sourceId}`, async () => {
+        await invoke("fix_orphan_source", { sourceId });
+        removeFileIssues((fi) => fi.source_id === sourceId);
+      });
+    } finally {
+      setFixingOrphans((prev) => { const n = new Set(prev); n.delete(sourceId); return n; });
+    }
+  }
+
+  async function deleteBackup(backupPath: string) {
+    setDeletingBackups((prev) => new Set(prev).add(backupPath));
+    try {
+      await runIssueMutation(`delete backup file ${backupPath}`, async () => {
+        await invoke("delete_backup_file", { backupPath });
+        removeFileIssues((fi) => fi.backup_path === backupPath);
+      });
+    } finally {
+      setDeletingBackups((prev) => { const n = new Set(prev); n.delete(backupPath); return n; });
+    }
+  }
+
+  function playIssueFile(issue: FileIssue) {
+    const owner = recordings.find(
+      (r) =>
+        (issue.source_id && r.sources.some((src) => src.id === issue.source_id)) ||
+        r.source_paths.includes(issue.file_path)
+    );
+    const ownerSourceId = owner?.sources.find(
+      (src) => src.id === issue.source_id || src.file_path === issue.file_path
+    )?.id ?? null;
+    const targetTrack = owner ? pinSource(owner, ownerSourceId) : null;
+    if (!targetTrack) {
+      setError(`"${issue.file_path}" is not in the library.`);
+      return;
+    }
+
+    if (currentTrack) {
+      setHistory((prev) => [currentTrack, ...prev].slice(0, queueHistoryLimit));
+    }
+    setCurrentTrack(targetTrack);
+    void invoke<PlayerState>("play", {
+      request: { source_id: targetTrack.source.id },
+    }).catch((playError) => {
+      console.error(`Failed to play ${issue.file_path} from the File Issues panel`, playError);
+      setError(playError instanceof Error ? playError.message : String(playError));
+    });
+  }
+
+  // The player position re-renders App about 4x a second, so FileIssueList is
+  // memoized and gets one stable actions object whose methods delegate to the
+  // latest handlers through this ref.
+  const latestIssueActions: FileIssueListActions = {
+    onContextMenu: (e, filePath) => openEntitySourceContextMenu(e, filePath),
+    onClearManual: (filePath) => { void handleClearFileIssue(filePath); },
+    onFixOrphan: (sourceId) => { void fixOrphan(sourceId); },
+    onOpenMerge: openMerge,
+    onPlayFile: playIssueFile,
+    onDeleteBackup: (backupPath) => { void deleteBackup(backupPath); },
+  };
+  const issueActionsRef = useRef(latestIssueActions);
+  issueActionsRef.current = latestIssueActions;
+  const issueActions = useMemo<FileIssueListActions>(() => ({
+    onContextMenu: (e, filePath) => issueActionsRef.current.onContextMenu(e, filePath),
+    onClearManual: (filePath) => issueActionsRef.current.onClearManual(filePath),
+    onFixOrphan: (sourceId) => issueActionsRef.current.onFixOrphan(sourceId),
+    onOpenMerge: (filePath) => issueActionsRef.current.onOpenMerge(filePath),
+    onPlayFile: (issue) => issueActionsRef.current.onPlayFile(issue),
+    onDeleteBackup: (backupPath) => issueActionsRef.current.onDeleteBackup(backupPath),
+  }), []);
+
+  const contextMenuRef = useRef<HTMLUListElement>(null);
+  // Measure before paint and nudge the menu back inside the viewport.
+  useLayoutEffect(() => {
+    const el = contextMenuRef.current;
+    if (!contextMenu || !el) return;
+    const rect = el.getBoundingClientRect();
+    const { left, top } = clampMenuPosition({
+      x: contextMenu.x,
+      y: contextMenu.y,
+      menuWidth: rect.width,
+      menuHeight: rect.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  }, [contextMenu]);
 
   if (isBootstrapping) {
     return <main className="loading-screen">Loading thmp5…</main>;
@@ -3180,31 +3267,12 @@ function App() {
         <div
           className="modal-overlay"
           onClick={() => setIsModalOpen(false)}
-          onMouseMove={() => { lastMouseMoveTimeRef.current = Date.now(); }}
           role="dialog"
           aria-modal="true"
         >
           <div className="modal-card" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <div className="modal-tabs">
-                <button
-                  className={`modal-tab${settingsTab === "options" ? " modal-tab-active" : ""}`}
-                  onClick={() => setSettingsTab("options")}
-                  type="button"
-                >
-                  Options
-                </button>
-                <button
-                  className={`modal-tab${settingsTab === "issues" ? " modal-tab-active" : ""}`}
-                  onClick={() => setSettingsTab("issues")}
-                  type="button"
-                >
-                  File Issues
-                  {fileIssues.length > 0 && (
-                    <span className="modal-tab-badge">{fileIssues.length}</span>
-                  )}
-                </button>
-              </div>
+              <h2>Options</h2>
               <button
                 className="modal-close-btn"
                 onClick={() => setIsModalOpen(false)}
@@ -3212,318 +3280,185 @@ function App() {
               >✕</button>
             </div>
 
-            {settingsTab === "options" ? (
-              <>
-                <div className="modal-section">
-                  <p className="modal-section-label">Library</p>
-                  <div className="settings-row">
-                    <div>
-                      <label className="input-label" htmlFor="modal-music-root">
-                        Music root
-                      </label>
-                      <input
-                        id="modal-music-root"
-                        className="small-input music-root-input"
-                        type="text"
-                        onChange={(event) => setMusicRootInput(event.currentTarget.value)}
-                        value={musicRootInput}
-                        placeholder="/home/user/Music"
-                      />
-                    </div>
-                    <button
-                      className="secondary-button"
-                      disabled={isSavingMusicRoot}
-                      onClick={() => { void saveMusicRoot(); }}
-                      type="button"
-                    >
-                      {isSavingMusicRoot ? "Saving…" : "Save"}
-                    </button>
-                  </div>
-                  <div className="modal-actions">
-                    <button
-                      className="secondary-button"
-                      onClick={handleRescan}
-                      type="button"
-                    >
-                      Scan for new files
-                    </button>
-                    <button
-                      className="secondary-button"
-                      onClick={handleRescanAll}
-                      type="button"
-                    >
-                      Rescan all files
-                    </button>
-                  </div>
+            <div className="modal-section">
+              <p className="modal-section-label">Library</p>
+              <div className="settings-row">
+                <div>
+                  <label className="input-label" htmlFor="modal-music-root">
+                    Music root
+                  </label>
+                  <input
+                    id="modal-music-root"
+                    className="small-input music-root-input"
+                    type="text"
+                    onChange={(event) => setMusicRootInput(event.currentTarget.value)}
+                    value={musicRootInput}
+                    placeholder="/home/user/Music"
+                  />
                 </div>
-
-                <div className="modal-section">
-                  <p className="modal-section-label">Queue</p>
-                  <div className="settings-row">
-                    <div>
-                      <label className="input-label" htmlFor="modal-queue-history-limit">
-                        History limit
-                      </label>
-                      <input
-                        id="modal-queue-history-limit"
-                        className="small-input"
-                        inputMode="numeric"
-                        onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
-                        value={queueHistoryLimitInput}
-                      />
-                    </div>
-                    <button
-                      className="secondary-button"
-                      disabled={isSavingQueueSettings}
-                      onClick={() => { void saveQueueSettings(); }}
-                      type="button"
-                    >
-                      {isSavingQueueSettings ? "Saving…" : "Save"}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="modal-section">
-                  <p className="modal-section-label">Last.fm</p>
-                  {!lastfmStatus?.configured ? (
-                    <>
-                      <p className="lastfm-hint">Enter your Last.fm API credentials (get them at <span className="lastfm-link" onClick={() => { void openUrl("https://www.last.fm/api"); }} role="link" tabIndex={0}>last.fm/api</span>).</p>
-                      <div className="settings-row">
-                        <div>
-                          <label className="input-label" htmlFor="lastfm-api-key">API Key</label>
-                          <input
-                            id="lastfm-api-key"
-                            className="small-input"
-                            type="text"
-                            value={lastfmApiKeyInput}
-                            onChange={(e) => setLastfmApiKeyInput(e.currentTarget.value)}
-                            placeholder="your_api_key"
-                          />
-                        </div>
-                      </div>
-                      <div className="settings-row">
-                        <div>
-                          <label className="input-label" htmlFor="lastfm-shared-secret">Shared Secret</label>
-                          <input
-                            id="lastfm-shared-secret"
-                            className="small-input"
-                            type="text"
-                            value={lastfmSharedSecretInput}
-                            onChange={(e) => setLastfmSharedSecretInput(e.currentTarget.value)}
-                            placeholder="your_shared_secret"
-                          />
-                        </div>
-                      </div>
-                      <div className="settings-row">
-                        <button
-                          className="secondary-button"
-                          disabled={isSavingLastfmCredentials || !lastfmApiKeyInput.trim() || !lastfmSharedSecretInput.trim()}
-                          onClick={() => { void handleSaveLastfmCredentials(); }}
-                          type="button"
-                        >
-                          {isSavingLastfmCredentials ? "Saving…" : "Save Credentials"}
-                        </button>
-                      </div>
-                    </>
-                  ) : lastfmStatus.logged_in ? (
-                    <div className="settings-row">
-                      <span className="lastfm-connected">Connected as <strong>{lastfmStatus.username}</strong></span>
-                      <button className="secondary-button" onClick={() => { void handleLastfmDisconnect(); }} type="button">Disconnect</button>
-                    </div>
-                  ) : (
-                    <div className="settings-row">
-                      <button className="secondary-button" disabled={isLastfmConnecting} onClick={() => { void handleLastfmConnect(); }} type="button">
-                        {isLastfmConnecting ? "Connecting…" : "Connect to Last.fm"}
-                      </button>
-                      {lastfmAuthUrl ? (
-                        <button className="secondary-button" disabled={isLastfmCompleting} onClick={() => { void handleLastfmCompleteAuth(); }} type="button">
-                          {isLastfmCompleting ? "Completing…" : "Complete Login"}
-                        </button>
-                      ) : null}
-                    </div>
-                  )}
-                </div>
-
-                <div className="modal-section">
-                  <p className="modal-section-label">External Commands</p>
-                  <p className="ext-cmd-hint">Use <code>%%</code> as a placeholder for the file path.</p>
-                  {externalCommands.map((cmd, i) => (
-                    <div key={i} className="settings-row ext-cmd-row">
-                      <span className="ext-cmd-name">{cmd.name}</span>
-                      <span className="ext-cmd-template">{cmd.template}</span>
-                      <button
-                        className="secondary-button"
-                        type="button"
-                        onClick={() => {
-                          const updated = externalCommands.filter((_, j) => j !== i);
-                          void saveExternalCommands(updated);
-                        }}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  ))}
-                  <div className="settings-row ext-cmd-row">
-                    <input
-                      className="small-input ext-cmd-name-input"
-                      type="text"
-                      placeholder="Name"
-                      value={newCmdName}
-                      onChange={(e) => setNewCmdName(e.currentTarget.value)}
-                    />
-                    <input
-                      className="small-input ext-cmd-template-input"
-                      type="text"
-                      placeholder="Command (e.g. picard %%)"
-                      value={newCmdTemplate}
-                      onChange={(e) => setNewCmdTemplate(e.currentTarget.value)}
-                    />
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      disabled={!newCmdName.trim() || !newCmdTemplate.trim()}
-                      onClick={() => {
-                        const updated = [...externalCommands, { name: newCmdName.trim(), template: newCmdTemplate.trim() }];
-                        void saveExternalCommands(updated);
-                        setNewCmdName("");
-                        setNewCmdTemplate("");
-                      }}
-                    >
-                      Add
-                    </button>
-                  </div>
-                </div>
-              </>
-            ) : (
-              <div className="modal-section">
-                {pendingFileIssues !== null && (
-                  <div className="pending-updates-badge">
-                    <span>Updates pending (will apply when mouse stops moving)</span>
-                  </div>
-                )}
-                {fileIssues.length === 0 ? (
-                  <p className="issue-empty">No file issues recorded.</p>
-                ) : (
-                  <ol className="issue-list">
-                    {fileIssues.map((issue, i) => {
-                      const isFirstDupForFile =
-                        issue.kind === "duplicate_frame" &&
-                        firstDupIndexByFile.get(issue.file_path) === i;
-                      return (
-                      <li
-                        key={i}
-                        className="issue-item"
-                        onContextMenu={(e) => openEntitySourceContextMenu(e, issue.file_path)}
-                      >
-                        <div className="issue-item-header">
-                          <span className={`issue-kind issue-kind-${issue.kind}`}>
-                            {fileIssueLabel(issue.kind)}
-                          </span>
-                          {issue.kind === "manual" ? (
-                            <button
-                              className="fix-orphan-btn"
-                              type="button"
-                              onClick={() => { void handleClearFileIssue(issue.file_path); }}
-                            >
-                              Clear
-                            </button>
-                          ) : issue.kind === "orphan_source" ? (
-                            <button
-                              className="fix-orphan-btn"
-                              type="button"
-                              disabled={fixingOrphans.has(issue.source_id!)}
-                              onClick={() => {
-                                const sid = issue.source_id!;
-                                setFixingOrphans(prev => new Set(prev).add(sid));
-                                void (async () => {
-                                  await invoke("fix_orphan_source", { sourceId: sid });
-                                  setFileIssues(prev => prev.filter(fi => fi.source_id !== sid));
-                                  setPendingFileIssues(prev => prev ? prev.filter(fi => fi.source_id !== sid) : null);
-                                  setFixingOrphans(prev => { const n = new Set(prev); n.delete(sid); return n; });
-                                })();
-                              }}
-                            >
-                              {fixingOrphans.has(issue.source_id!) ? "Fixing…" : "Fix"}
-                            </button>
-                          ) : issue.kind === "duplicate_frame" ? (
-                            isFirstDupForFile ? (
-                              <button
-                                className="fix-orphan-btn"
-                                type="button"
-                                onClick={() => openMerge(issue.file_path)}
-                              >
-                                Resolve merge…
-                              </button>
-                            ) : null
-                          ) : issue.kind === "backup_file_exists" ? (
-                            <>
-                              <button
-                                className="fix-orphan-btn"
-                                type="button"
-                                title="Play the current file to confirm it's still valid before deleting the backup"
-                                onClick={() => {
-                                  const owner = recordings.find(
-                                    (r) =>
-                                      (issue.source_id && r.sources.some((src) => src.id === issue.source_id)) ||
-                                      r.source_paths.includes(issue.file_path)
-                                  );
-                                  const ownerSourceId = owner?.sources.find(
-                                    (src) => src.id === issue.source_id || src.file_path === issue.file_path
-                                  )?.id ?? null;
-                                  const targetTrack = owner ? pinSource(owner, ownerSourceId) : null;
-                                  if (!targetTrack) {
-                                    setError(`"${issue.file_path}" is not in the library.`);
-                                    return;
-                                  }
-
-                                  if (currentTrack) {
-                                    setHistory((prev) => [currentTrack, ...prev].slice(0, queueHistoryLimit));
-                                  }
-                                  setCurrentTrack(targetTrack);
-                                  void invoke<PlayerState>("play", {
-                                    request: { source_id: targetTrack.source.id },
-                                  }).catch((playError) => {
-                                    setError(playError instanceof Error ? playError.message : String(playError));
-                                  });
-                                }}
-                              >
-                                Play file
-                              </button>
-                              <button
-                                className="fix-orphan-btn"
-                                type="button"
-                                disabled={deletingBackups.has(issue.backup_path ?? "")}
-                                onClick={() => {
-                                  const bp = issue.backup_path!;
-                                  setDeletingBackups(prev => new Set(prev).add(bp));
-                                  void (async () => {
-                                    try {
-                                      await invoke("delete_backup_file", { backupPath: bp });
-                                      setFileIssues(prev => prev.filter(fi => fi.backup_path !== bp));
-                                      setPendingFileIssues(prev => prev ? prev.filter(fi => fi.backup_path !== bp) : null);
-                                    } finally {
-                                      setDeletingBackups(prev => { const n = new Set(prev); n.delete(bp); return n; });
-                                    }
-                                  })();
-                                }}
-                              >
-                                {deletingBackups.has(issue.backup_path ?? "") ? "Deleting…" : "Delete backup"}
-                              </button>
-                            </>
-
-                          ) : null}
-                        </div>
-                        <span className="issue-path" title={issue.file_path}>
-                          {issue.file_path}
-                        </span>
-                        <span className="issue-message">{issue.message}</span>
-                      </li>
-                      );
-                    })}
-                  </ol>
-                )}
+                <button
+                  className="secondary-button"
+                  disabled={isSavingMusicRoot}
+                  onClick={() => { void saveMusicRoot(); }}
+                  type="button"
+                >
+                  {isSavingMusicRoot ? "Saving…" : "Save"}
+                </button>
               </div>
-            )}
+              <div className="modal-actions">
+                <button
+                  className="secondary-button"
+                  onClick={handleRescan}
+                  type="button"
+                >
+                  Scan for new files
+                </button>
+                <button
+                  className="secondary-button"
+                  onClick={handleRescanAll}
+                  type="button"
+                >
+                  Rescan all files
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-section">
+              <p className="modal-section-label">Queue</p>
+              <div className="settings-row">
+                <div>
+                  <label className="input-label" htmlFor="modal-queue-history-limit">
+                    History limit
+                  </label>
+                  <input
+                    id="modal-queue-history-limit"
+                    className="small-input"
+                    inputMode="numeric"
+                    onChange={(event) => setQueueHistoryLimitInput(event.currentTarget.value)}
+                    value={queueHistoryLimitInput}
+                  />
+                </div>
+                <button
+                  className="secondary-button"
+                  disabled={isSavingQueueSettings}
+                  onClick={() => { void saveQueueSettings(); }}
+                  type="button"
+                >
+                  {isSavingQueueSettings ? "Saving…" : "Save"}
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-section">
+              <p className="modal-section-label">Last.fm</p>
+              {!lastfmStatus?.configured ? (
+                <>
+                  <p className="lastfm-hint">Enter your Last.fm API credentials (get them at <span className="lastfm-link" onClick={() => { void openUrl("https://www.last.fm/api"); }} role="link" tabIndex={0}>last.fm/api</span>).</p>
+                  <div className="settings-row">
+                    <div>
+                      <label className="input-label" htmlFor="lastfm-api-key">API Key</label>
+                      <input
+                        id="lastfm-api-key"
+                        className="small-input"
+                        type="text"
+                        value={lastfmApiKeyInput}
+                        onChange={(e) => setLastfmApiKeyInput(e.currentTarget.value)}
+                        placeholder="your_api_key"
+                      />
+                    </div>
+                  </div>
+                  <div className="settings-row">
+                    <div>
+                      <label className="input-label" htmlFor="lastfm-shared-secret">Shared Secret</label>
+                      <input
+                        id="lastfm-shared-secret"
+                        className="small-input"
+                        type="text"
+                        value={lastfmSharedSecretInput}
+                        onChange={(e) => setLastfmSharedSecretInput(e.currentTarget.value)}
+                        placeholder="your_shared_secret"
+                      />
+                    </div>
+                  </div>
+                  <div className="settings-row">
+                    <button
+                      className="secondary-button"
+                      disabled={isSavingLastfmCredentials || !lastfmApiKeyInput.trim() || !lastfmSharedSecretInput.trim()}
+                      onClick={() => { void handleSaveLastfmCredentials(); }}
+                      type="button"
+                    >
+                      {isSavingLastfmCredentials ? "Saving…" : "Save Credentials"}
+                    </button>
+                  </div>
+                </>
+              ) : lastfmStatus.logged_in ? (
+                <div className="settings-row">
+                  <span className="lastfm-connected">Connected as <strong>{lastfmStatus.username}</strong></span>
+                  <button className="secondary-button" onClick={() => { void handleLastfmDisconnect(); }} type="button">Disconnect</button>
+                </div>
+              ) : (
+                <div className="settings-row">
+                  <button className="secondary-button" disabled={isLastfmConnecting} onClick={() => { void handleLastfmConnect(); }} type="button">
+                    {isLastfmConnecting ? "Connecting…" : "Connect to Last.fm"}
+                  </button>
+                  {lastfmAuthUrl ? (
+                    <button className="secondary-button" disabled={isLastfmCompleting} onClick={() => { void handleLastfmCompleteAuth(); }} type="button">
+                      {isLastfmCompleting ? "Completing…" : "Complete Login"}
+                    </button>
+                  ) : null}
+                </div>
+              )}
+            </div>
+
+            <div className="modal-section">
+              <p className="modal-section-label">External Commands</p>
+              <p className="ext-cmd-hint">Use <code>%%</code> as a placeholder for the file path.</p>
+              {externalCommands.map((cmd, i) => (
+                <div key={i} className="settings-row ext-cmd-row">
+                  <span className="ext-cmd-name">{cmd.name}</span>
+                  <span className="ext-cmd-template">{cmd.template}</span>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => {
+                      const updated = externalCommands.filter((_, j) => j !== i);
+                      void saveExternalCommands(updated);
+                    }}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <div className="settings-row ext-cmd-row">
+                <input
+                  className="small-input ext-cmd-name-input"
+                  type="text"
+                  placeholder="Name"
+                  value={newCmdName}
+                  onChange={(e) => setNewCmdName(e.currentTarget.value)}
+                />
+                <input
+                  className="small-input ext-cmd-template-input"
+                  type="text"
+                  placeholder="Command (e.g. picard %%)"
+                  value={newCmdTemplate}
+                  onChange={(e) => setNewCmdTemplate(e.currentTarget.value)}
+                />
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={!newCmdName.trim() || !newCmdTemplate.trim()}
+                  onClick={() => {
+                    const updated = [...externalCommands, { name: newCmdName.trim(), template: newCmdTemplate.trim() }];
+                    void saveExternalCommands(updated);
+                    setNewCmdName("");
+                    setNewCmdTemplate("");
+                  }}
+                >
+                  Add
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       ) : null}
@@ -3841,6 +3776,7 @@ function App() {
             onContextMenu={(e) => { e.preventDefault(); setContextMenu(null); }}
           />
           <ul
+            ref={contextMenuRef}
             className="ctx-menu"
             style={{ left: contextMenu.x, top: contextMenu.y }}
           >
@@ -4063,6 +3999,54 @@ function App() {
         </>
       )}
 
+      {isIssuesPanelOpen ? (
+        <section
+          className="table-panel issues-panel"
+          aria-label="File Issues"
+          onMouseEnter={() => { isPointerOverIssuesPanelRef.current = true; }}
+          onMouseLeave={() => {
+            isPointerOverIssuesPanelRef.current = false;
+            flushPendingFileIssues();
+          }}
+        >
+          <div className="modal-header issues-panel-header">
+            <h2>File Issues</h2>
+            {fileIssues.length > 0 && (
+              <span className="issues-panel-count">{fileIssues.length}</span>
+            )}
+            {pendingFileIssues !== null && (
+              <span className="pending-updates-badge">
+                Updates pending (will apply when the pointer leaves this panel)
+              </span>
+            )}
+            <button
+              className="modal-close-btn"
+              onClick={closeIssuesPanel}
+              type="button"
+              aria-label="Close File Issues"
+            >✕</button>
+          </div>
+          {issuesRefreshError !== null && (
+            <p className="issue-refresh-error" role="alert">
+              Couldn't refresh file issues: {issuesRefreshError}
+            </p>
+          )}
+          <div className="issues-panel-body">
+            {fileIssues.length === 0 ? (
+              issuesRefreshError === null ? <p className="issue-empty">No file issues recorded.</p> : null
+            ) : (
+              <FileIssueList
+                issues={fileIssues}
+                firstDupIndexByFile={firstDupIndexByFile}
+                fixingOrphans={fixingOrphans}
+                deletingBackups={deletingBackups}
+                actions={issueActions}
+              />
+            )}
+          </div>
+        </section>
+      ) : null}
+
       <footer className="status-bar">
         <span className={`status-bar-indicator ${bootstrap?.import_progress.is_running || pendingJobs > 0 || integrityProgress ? "status-bar-indicator-active" : ""}`} />
         <span>Scanned {bootstrap?.import_progress.scanned ?? 0}</span>
@@ -4100,19 +4084,16 @@ function App() {
             <span>Checking audio integrity {integrityProgress.done}/{integrityProgress.total}</span>
           </>
         ) : null}
-        {fileIssues.length > 0 ? (
-          <>
-            <span className="status-bar-sep">·</span>
-            <button
-              className="status-bar-warning"
-              onClick={() => { setSettingsTab("issues"); setIsModalOpen(true); }}
-              type="button"
-              title={`${fileIssues.length} file issue${fileIssues.length !== 1 ? "s" : ""}`}
-            >
-              ⚠ {fileIssues.length}
-            </button>
-          </>
-        ) : null}
+        <span className="status-bar-sep">·</span>
+        <button
+          className={`status-bar-warning${fileIssues.length === 0 ? " status-bar-warning-none" : ""}${isIssuesPanelOpen ? " status-bar-warning-active" : ""}`}
+          onClick={() => { if (isIssuesPanelOpen) closeIssuesPanel(); else setIsIssuesPanelOpen(true); }}
+          type="button"
+          aria-expanded={isIssuesPanelOpen}
+          title={`${fileIssues.length} file issue${fileIssues.length !== 1 ? "s" : ""} (click to ${isIssuesPanelOpen ? "hide" : "show"} the File Issues panel)`}
+        >
+          ⚠ {fileIssues.length}
+        </button>
       </footer>
     </main>
   );
