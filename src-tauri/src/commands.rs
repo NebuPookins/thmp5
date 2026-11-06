@@ -1,6 +1,6 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::command_error::CommandError;
-use crate::file_issues::{FileIssue, FileIssueKind};
+use crate::file_issues::{sorted_by_rating_desc, FileIssue, FileIssueKind};
 use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistRow, CompoundArtistCheck, DbPoolDebugSnapshot,
@@ -798,14 +798,17 @@ pub async fn get_file_issues(
             row.note,
         )
     });
-    Ok(state
+    let issues = state
         .file_issues
         .all()
         .into_iter()
         .chain(catalog.file_issues())
         .chain(corrupt_issues)
-        .chain(manual_issues)
-        .collect())
+        .chain(manual_issues);
+    Ok(sorted_by_rating_desc(
+        issues,
+        catalog.effective_rating_lookup(),
+    ))
 }
 
 /// Store the single user-authored issue note for a local source file.

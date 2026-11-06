@@ -1244,4 +1244,63 @@ mod tests {
             file2_path
         );
     }
+
+    // ── Effective rating lookup ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_effective_rating_prefers_actual_then_predicted_rating() {
+        let tmp = TempDir::new().unwrap();
+        let pool = init_pool(&tmp.path().join("test.db")).await.unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+
+        let tracks = [
+            ("rated", "Known Artist"),
+            ("predicted", "Known Artist"),
+            ("unrated", "Unknown Artist"),
+        ];
+        for (title, artist) in tracks {
+            let file = tmp.path().join(format!("{title}.mp3"));
+            write_tagged_mp3(&file, title, artist, artist, title);
+            let import = PreparedImport {
+                raw_tags_json: serde_json::json!([
+                    ["TIT2", title],
+                    ["TPE1", artist],
+                    ["TALB", title]
+                ])
+                .to_string(),
+                ..prepared_import_for_path(
+                    &file,
+                    tagged_meta(title, artist, artist, title, 1),
+                    Some(&format!("acoustid-{title}")),
+                )
+            };
+            store_prepared_import(&pool, import, &serializer)
+                .await
+                .unwrap();
+        }
+
+        let rated = tmp.path().join("rated.mp3");
+        let source_id = source_id_for_path(&pool, &rated).await;
+        let mut conn = pool.acquire("test.rate").await.unwrap();
+        sqlx::query!(
+            "INSERT INTO source_rating (source_id, stars, updated_at)
+             VALUES (?, 5, datetime('now'))",
+            source_id,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        drop(conn);
+
+        let catalog = crate::storage::memory::MemoryCatalog::load_from_db(&pool)
+            .await
+            .unwrap();
+        let lookup = catalog.effective_rating_lookup();
+        let rating_of = |name: &str| lookup(&tmp.path().join(name).to_string_lossy());
+
+        assert_eq!(rating_of("rated.mp3"), Some(5.0));
+        assert_eq!(rating_of("predicted.mp3"), Some(5.0));
+        assert_eq!(rating_of("unrated.mp3"), None);
+        assert_eq!(rating_of("not-in-library.mp3"), None);
+    }
 }

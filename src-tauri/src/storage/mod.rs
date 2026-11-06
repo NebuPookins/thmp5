@@ -98,6 +98,12 @@ impl Catalog {
             Catalog::Memory(c) => c.recording_id_for_source(source_id),
         }
     }
+
+    pub fn effective_rating_lookup(&self) -> impl Fn(&str) -> Option<f64> + '_ {
+        match self {
+            Catalog::Memory(c) => c.effective_rating_lookup(),
+        }
+    }
 }
 
 /// Builds the in-memory catalog from the database, logging its size and

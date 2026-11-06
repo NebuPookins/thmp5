@@ -67,6 +67,27 @@ impl FileIssue {
     }
 }
 
+/// Rating assumed for a file with no actual or predicted rating.
+const UNRATED_SORT_RATING: f64 = 3.0;
+
+/// Orders issues so those on the best-rated files come first. `rating_of` gives
+/// the actual or predicted rating of a file's recording; files without one count
+/// as [`UNRATED_SORT_RATING`]. Issues with equal ratings keep their relative order.
+pub fn sorted_by_rating_desc(
+    issues: impl IntoIterator<Item = FileIssue>,
+    rating_of: impl Fn(&str) -> Option<f64>,
+) -> Vec<FileIssue> {
+    let mut rated: Vec<(f64, FileIssue)> = issues
+        .into_iter()
+        .map(|issue| {
+            let rating = rating_of(&issue.file_path).unwrap_or(UNRATED_SORT_RATING);
+            (rating, issue)
+        })
+        .collect();
+    rated.sort_by(|(a, _), (b, _)| b.total_cmp(a));
+    rated.into_iter().map(|(_, issue)| issue).collect()
+}
+
 /// Shared, in-memory log of files that have encountered problems.
 /// Cheap to clone — all clones share the same underlying list.
 #[derive(Clone, Default)]
@@ -315,6 +336,40 @@ impl FileIssueLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sorted_paths(files: &[(&str, Option<f64>)]) -> Vec<String> {
+        let log = FileIssueLog::new();
+        files
+            .iter()
+            .for_each(|(path, _)| log.push_import_error(*path, "bad"));
+        let ratings: std::collections::HashMap<&str, Option<f64>> = files.iter().copied().collect();
+        sorted_by_rating_desc(log.all(), |path| ratings[path])
+            .into_iter()
+            .map(|issue| issue.file_path)
+            .collect()
+    }
+
+    #[test]
+    fn test_sorted_by_rating_puts_best_rated_files_first() {
+        let sorted = sorted_paths(&[
+            ("/low", Some(1.5)),
+            ("/high", Some(4.5)),
+            ("/mid", Some(3.5)),
+        ]);
+        assert_eq!(sorted, ["/high", "/mid", "/low"]);
+    }
+
+    #[test]
+    fn test_sorted_by_rating_treats_unrated_files_as_three_stars() {
+        let sorted = sorted_paths(&[("/two", Some(2.0)), ("/none", None), ("/four", Some(4.0))]);
+        assert_eq!(sorted, ["/four", "/none", "/two"]);
+    }
+
+    #[test]
+    fn test_sorted_by_rating_keeps_order_of_equal_ratings() {
+        let sorted = sorted_paths(&[("/b", Some(3.0)), ("/none", None), ("/a", Some(3.0))]);
+        assert_eq!(sorted, ["/b", "/none", "/a"]);
+    }
 
     #[test]
     fn test_push_duplicate_frame_adds_issue() {

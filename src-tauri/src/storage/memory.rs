@@ -224,6 +224,53 @@ impl MemoryCatalog {
             .map(|&idx| self.recordings[idx].id.clone())
     }
 
+    /// A lookup from file path to the rating of the recording that groups the
+    /// file, falling back to its predicted rating. It gives `None` if the file
+    /// isn't in the catalog or nothing about it has been rated. The path index
+    /// it builds lives only as long as the lookup, so create one per use.
+    pub fn effective_rating_lookup(&self) -> impl Fn(&str) -> Option<f64> + '_ {
+        let recording_by_path: HashMap<&str, &MemRecording> = self
+            .recordings
+            .iter()
+            .flat_map(|rec| {
+                rec.sources
+                    .iter()
+                    .filter_map(move |s| s.file_path.as_deref().map(|path| (path, rec)))
+            })
+            .collect();
+        move |file_path| {
+            let rec = recording_by_path.get(file_path)?;
+            rec.avg_rating().or_else(|| self.predicted_rating(rec))
+        }
+    }
+
+    /// See [`compute_predicted_rating`].
+    fn predicted_rating(&self, rec: &MemRecording) -> Option<f64> {
+        let artist_ratings: Vec<Option<f64>> = rec
+            .artist_ids
+            .iter()
+            .map(|aid| {
+                self.recordings_by_artist.get(aid).and_then(|indices| {
+                    avg_f64(
+                        indices
+                            .iter()
+                            .filter_map(|&i| self.recordings[i].avg_rating()),
+                    )
+                })
+            })
+            .collect();
+        let album_ratings: Vec<Option<f64>> = rec
+            .release_group_assocs
+            .iter()
+            .map(|assoc| {
+                self.recordings_by_rg
+                    .get(&assoc.rg_id)
+                    .and_then(|indices| rg_avg_rating(indices, &self.recordings))
+            })
+            .collect();
+        compute_predicted_rating(&artist_ratings, &album_ratings)
+    }
+
     fn summary(&self) -> LibrarySummary {
         LibrarySummary {
             recording_count: self.recordings.len() as i64,
@@ -1306,31 +1353,6 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
         })
         .collect();
 
-    let artist_ratings: Vec<Option<f64>> = rec
-        .artist_ids
-        .iter()
-        .map(|aid| {
-            catalog.recordings_by_artist.get(aid).and_then(|indices| {
-                avg_f64(
-                    indices
-                        .iter()
-                        .filter_map(|&i| catalog.recordings[i].avg_rating()),
-                )
-            })
-        })
-        .collect();
-    let album_ratings: Vec<Option<f64>> = rec
-        .release_group_assocs
-        .iter()
-        .map(|assoc| {
-            catalog
-                .recordings_by_rg
-                .get(&assoc.rg_id)
-                .and_then(|indices| rg_avg_rating(indices, &catalog.recordings))
-        })
-        .collect();
-    let predicted_rating = compute_predicted_rating(&artist_ratings, &album_ratings);
-
     RecordingRow {
         id: rec.id.clone(),
         title: rec.title.clone(),
@@ -1339,7 +1361,7 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
         artist_credit_name: rec.artist_credit_name.clone(),
         genre: rec.genre.clone(),
         rating: rec.avg_rating(),
-        predicted_rating,
+        predicted_rating: catalog.predicted_rating(rec),
         play_count: rec.total_play_count(),
         last_played: rec.last_played().map(String::from),
         primary_source_id: primary_source.map(|s| s.id.clone()),
