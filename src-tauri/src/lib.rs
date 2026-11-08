@@ -252,6 +252,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::log_frontend,
             commands::import_paths,
             commands::fix_merged_recordings,
             commands::get_app_bootstrap,

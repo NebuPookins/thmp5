@@ -1102,12 +1102,22 @@ fn compute_normalization_gain(
     (gain.clamp(0.1, 10.0) as f32, source)
 }
 
+/// Result of `play`: the source actually handed to the engine. It differs from
+/// the requested one when the requested file was missing and another source of
+/// the same recording was used instead. (The engine applies the request
+/// asynchronously, so a player snapshot taken here would still describe the
+/// previous track.)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlayStarted {
+    pub source_id: String,
+}
+
 #[tauri::command]
 #[tracing::instrument(skip_all, fields(source_id = %request.source_id))]
 pub async fn play(
     state: tauri::State<'_, AppState>,
     request: PlayRequest,
-) -> Result<PlayerState, CommandError> {
+) -> Result<PlayStarted, CommandError> {
     tracing::info!("Play command received");
     let mut conn = state
         .db
@@ -1288,7 +1298,7 @@ pub async fn play(
         })
         .with_context(|| format!("Failed to start playback of {file_path}"))?;
 
-    Ok(state.player.snapshot())
+    Ok(PlayStarted { source_id })
 }
 
 #[tauri::command]
@@ -2209,6 +2219,31 @@ pub async fn split_recording(
             format!("Split succeeded but source {first_sid} is not in any recording after reload")
         })?;
     Ok(recording_id)
+}
+
+/// Severity of a message forwarded from the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrontendLogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Write a frontend message to the app log, so UI-side events show up next to
+/// backend ones. `context` is free-form structured data (ids, reasons, ...).
+#[tauri::command]
+#[tracing::instrument(skip_all, fields(?level))]
+pub fn log_frontend(level: FrontendLogLevel, message: String, context: Option<serde_json::Value>) {
+    const TARGET: &str = "thmp5_lib::frontend";
+    let context = context.map(|c| c.to_string()).unwrap_or_default();
+    match level {
+        FrontendLogLevel::Debug => tracing::debug!(target: TARGET, %context, "{message}"),
+        FrontendLogLevel::Info => tracing::info!(target: TARGET, %context, "{message}"),
+        FrontendLogLevel::Warn => tracing::warn!(target: TARGET, %context, "{message}"),
+        FrontendLogLevel::Error => tracing::error!(target: TARGET, %context, "{message}"),
+    }
 }
 
 #[cfg(test)]

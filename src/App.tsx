@@ -26,6 +26,8 @@ import {
   splitModalReducer,
 } from "./modalReducers";
 import { useRequestId } from "./useRequestId";
+import { frontendLog } from "./frontendLog";
+import { endedEventAppliesTo } from "./trackEnded";
 import { clampMenuPosition } from "./contextMenuPosition";
 import { FileIssueList, fileIssueLabel, type FileIssue, type FileIssueListActions } from "./FileIssueList";
 import "./App.css";
@@ -144,6 +146,9 @@ type PlaylistRow = {
 };
 
 type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
+
+/** Mirrors `commands::PlayStarted`: the source the backend actually started. */
+type PlayStarted = { source_id: string };
 
 type PlayerState = {
   status: PlaybackStatus;
@@ -642,6 +647,13 @@ const POMODORO_PRESETS = [
   { durationMs: 5 * 60 * 1000 }, // 5m quick break
 ];
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Why the current track was cleared; logged so the cause shows up in thmp5.log. */
+type ClearReason = "track ended" | "track failed" | "skip" | "play error";
+
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
@@ -654,6 +666,9 @@ function App() {
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const currentTrackRef = useRef<QueueItem | null>(null);
   const playerSourceIdRef = useRef<string | null>(null);
+  // The source the backend actually started for a requested one (they differ
+  // when a missing file fell back to another copy). Set when `play` resolves.
+  const startedSourceRef = useRef<{ requested: string; actual: string } | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
   const [search, setSearch] = useState("");
   const [selectedArtistId, setSelectedArtistId] = useState<string | null>(null);
@@ -1535,10 +1550,22 @@ function App() {
         if (!isMounted) {
           return;
         }
+        const currentId = currentTrackRef.current?.source.id;
+        const started = startedSourceRef.current;
+        const startedId = started && started.requested === currentId ? started.actual : undefined;
+        if (!endedEventAppliesTo(event.payload.source_id, [currentId, startedId])) {
+          frontendLog("info", "Ignored stale player-track-ended event", {
+            ended_source_id: event.payload.source_id,
+            current_source_id: currentId ?? null,
+            started_source_id: startedId ?? null,
+            reason: event.payload.reason,
+          });
+          return;
+        }
         if (event.payload.reason === "failed") {
-          clearCurrentTrack();
+          clearCurrentTrack("track failed");
         } else {
-          void completeCurrentTrack(event.payload.position_ms);
+          completeCurrentTrack(event.payload.position_ms, "track ended");
         }
       });
       const unlistenError = await listen<PlayerErrorEvent>("player-error", (event) => {
@@ -1643,12 +1670,7 @@ function App() {
     }
 
     setError(null);
-    void invoke<PlayerState>("play", {
-      request: { source_id: currentTrack.source.id },
-    }).catch((playError) => {
-      setError(playError instanceof Error ? playError.message : String(playError));
-      setCurrentTrack(null);
-    });
+    startPlayback(currentTrack.source.id);
   }, [currentTrack?.source.id]);
 
   useEffect(() => {
@@ -1796,39 +1818,80 @@ function App() {
   const nowPlayingLoved = currentTrack !== null && (currentTrackLoved || hasTrack(lovedKeys, currentTrack.artist_credit_name, currentTrack.title));
   playerSourceIdRef.current = playerState.source_id;
 
-  async function completeCurrentTrack(positionMs?: number) {
+  /**
+   * Apply the UI transition for a finished track synchronously (so a newer
+   * track started meanwhile is never clobbered), then record the play and
+   * refresh the library in the background.
+   */
+  function completeCurrentTrack(positionMs: number | undefined, reason: ClearReason) {
     const finishedTrack = currentTrackRef.current;
     if (finishedTrack) {
-      try {
-        await invoke("record_play_history", {
-          input: {
-            source_id: finishedTrack.source.id,
-            duration_played_ms: positionMs ?? playerState.position_ms,
-          },
-        });
-      } catch (recordError) {
-        setError(recordError instanceof Error ? recordError.message : String(recordError));
-      }
-      void loadRecordings();
-      void (async () => {
-        try {
-          const artistRows = await loadArtists();
-          const resolvedArtistId = selectedArtistId && artistRows.some((artist) => artist.id === selectedArtistId)
-            ? selectedArtistId
-            : null;
-          await loadReleaseGroups(resolvedArtistId, search);
-        } catch (reloadError) {
-          setError(reloadError instanceof Error ? reloadError.message : String(reloadError));
-        }
-      })();
-
       setHistory((current) => [finishedTrack, ...current].slice(0, queueHistoryLimit));
     }
-
-    clearCurrentTrack();
+    clearCurrentTrack(reason);
+    if (finishedTrack) {
+      void recordPlayAndRefresh(finishedTrack, positionMs ?? playerState.position_ms);
+    }
   }
 
-  function clearCurrentTrack() {
+  /** Background bookkeeping after a track finishes; never touches the current track. */
+  async function recordPlayAndRefresh(finishedTrack: QueueItem, playedMs: number) {
+    const sourceId = finishedTrack.source.id;
+    try {
+      await invoke("record_play_history", {
+        input: { source_id: sourceId, duration_played_ms: playedMs },
+      });
+    } catch (recordError) {
+      frontendLog("error", "record_play_history failed", {
+        source_id: sourceId,
+        duration_played_ms: playedMs,
+        error: errorMessage(recordError),
+      });
+      setError(errorMessage(recordError));
+    }
+    void loadRecordings();
+    try {
+      const artistRows = await loadArtists();
+      const resolvedArtistId = selectedArtistId && artistRows.some((artist) => artist.id === selectedArtistId)
+        ? selectedArtistId
+        : null;
+      await loadReleaseGroups(resolvedArtistId, search);
+    } catch (reloadError) {
+      frontendLog("error", "library reload after play failed", {
+        source_id: sourceId,
+        error: errorMessage(reloadError),
+      });
+      setError(errorMessage(reloadError));
+    }
+  }
+
+  /** The single place that asks the backend to play a source. */
+  function startPlayback(sourceId: string) {
+    void invoke<PlayStarted>("play", { request: { source_id: sourceId } }).then((started) => {
+      if (currentTrackRef.current?.source.id === sourceId) {
+        startedSourceRef.current = { requested: sourceId, actual: started.source_id };
+      }
+    }, (playError: unknown) => {
+      const stillCurrent = currentTrackRef.current?.source.id === sourceId;
+      frontendLog("error", "play invoke failed", {
+        source_id: sourceId,
+        still_current: stillCurrent,
+        error: errorMessage(playError),
+      });
+      setError(errorMessage(playError));
+      // A late failure for a track that's already been replaced must not clear the newer one.
+      if (stillCurrent) {
+        clearCurrentTrack("play error");
+      }
+    });
+  }
+
+  function clearCurrentTrack(reason: ClearReason) {
+    frontendLog("info", "Clearing current track", {
+      reason,
+      source_id: currentTrackRef.current?.source.id ?? null,
+      player_source_id: playerSourceIdRef.current,
+    });
     setCurrentTrack(null);
     setPlayerState((current) => ({
       ...current,
@@ -2170,12 +2233,22 @@ function App() {
   }
 
   async function handleSkip() {
+    const skippedSourceId = currentTrackRef.current?.source.id;
+    const skippedPositionMs = playerState.position_ms;
     try {
       await invoke<PlayerState>("stop");
     } catch (stopError) {
-      setError(stopError instanceof Error ? stopError.message : String(stopError));
+      setError(errorMessage(stopError));
     }
-    await completeCurrentTrack(playerState.position_ms);
+    // The track may have ended (and been replaced) during the await; don't skip its successor.
+    if (currentTrackRef.current?.source.id !== skippedSourceId) {
+      frontendLog("info", "Skip superseded: current track changed while stopping", {
+        skipped_source_id: skippedSourceId ?? null,
+        current_source_id: currentTrackRef.current?.source.id ?? null,
+      });
+      return;
+    }
+    completeCurrentTrack(skippedPositionMs, "skip");
   }
 
   async function handleSeek(nextPositionMs: number) {
@@ -2455,13 +2528,17 @@ function App() {
     if (currentTrack) {
       setHistory((prev) => [currentTrack, ...prev].slice(0, queueHistoryLimit));
     }
-    setCurrentTrack(targetTrack);
-    void invoke<PlayerState>("play", {
-      request: { source_id: targetTrack.source.id },
-    }).catch((playError) => {
-      console.error(`Failed to play ${issue.file_path} from the File Issues panel`, playError);
-      setError(playError instanceof Error ? playError.message : String(playError));
+    frontendLog("info", "Play from File Issues panel", {
+      file_path: issue.file_path,
+      source_id: targetTrack.source.id,
+      previous_source_id: currentTrack?.source.id ?? null,
     });
+    setCurrentTrack(targetTrack);
+    // The currentTrack?.source.id effect issues the play. It won't re-fire for
+    // the same source, so restart that one explicitly.
+    if (currentTrack?.source.id === targetTrack.source.id) {
+      startPlayback(targetTrack.source.id);
+    }
   }
 
   // The player position re-renders App about 4x a second, so FileIssueList is
