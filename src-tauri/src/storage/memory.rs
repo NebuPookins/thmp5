@@ -12,7 +12,11 @@ use anyhow::{Context, Result};
 use nonempty::NonEmpty;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Source of catalog generation numbers; every built catalog takes the next one.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 // ── Internal data structures ──────────────────────────────────────────────────
 
@@ -147,6 +151,8 @@ fn compute_predicted_rating(
 // ── Public catalog struct ─────────────────────────────────────────────────────
 
 pub struct MemoryCatalog {
+    /// Identifies this build of the catalog; every load gets a fresh, larger value.
+    generation: u64,
     recordings: Vec<MemRecording>,
     recordings_by_id: HashMap<String, usize>,
     /// Source ID -> index into `recordings` of the recording that groups it.
@@ -166,6 +172,11 @@ pub struct MemoryCatalog {
 }
 
 impl MemoryCatalog {
+    /// Generation number of this catalog build; changes on every reload.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Returns the artist's name and sorted list of local-file source paths for all
     /// recordings associated with the given artist ID.
     pub fn source_paths_for_artist(&self, artist_id: &str) -> (Option<String>, Vec<String>) {
@@ -794,6 +805,7 @@ impl MemoryCatalog {
         }
 
         Ok(MemoryCatalog {
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             recordings,
             recordings_by_id,
             recording_index_by_source,
@@ -1393,9 +1405,15 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
 
 impl super::CatalogReader for MemoryCatalog {
     async fn list_recordings(&self) -> Result<Vec<RecordingRow>> {
+        self.list_recordings_page(0, usize::MAX).await
+    }
+
+    async fn list_recordings_page(&self, offset: usize, limit: usize) -> Result<Vec<RecordingRow>> {
         Ok(self
             .recordings
             .iter()
+            .skip(offset)
+            .take(limit)
             .map(|r| mem_recording_to_row(r, self))
             .collect())
     }
@@ -1934,8 +1952,10 @@ fn pseudo_shuffle<T>(v: &mut [T], seed: u64) {
 
 #[cfg(test)]
 mod tests {
+    use super::MemoryCatalog;
     use super::{cmp_avg_rating, compute_predicted_rating, extract_artist_names};
     use crate::query::CmpOp;
+    use crate::storage::CatalogReader;
 
     #[test]
     fn avg_rating_rounds_to_nearest_star() {
@@ -2076,5 +2096,41 @@ mod tests {
         let tags = vec![("TXXX:ARTISTS".into(), "Single Artist".into())];
         let names = extract_artist_names(&tags);
         assert_eq!(names, vec!["Single Artist"]);
+    }
+
+    // ── Paged recording reads ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_recordings_pages_cover_every_recording_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pool = crate::db::init_pool(&tmp.path().join("test.db"))
+            .await
+            .unwrap();
+        let serializer = tokio::sync::Semaphore::new(1);
+        crate::library::import::tests::import_titles(
+            &tmp,
+            &pool,
+            &serializer,
+            &["a", "b", "c", "d", "e"],
+        )
+        .await;
+        let catalog = MemoryCatalog::load_from_db(&pool).await.unwrap();
+
+        let all = catalog.list_recordings().await.unwrap();
+        let mut paged = Vec::new();
+        for offset in (0..all.len()).step_by(2) {
+            paged.extend(catalog.list_recordings_page(offset, 2).await.unwrap());
+        }
+
+        let ids = |rows: &[crate::models::RecordingRow]| {
+            rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(all.len(), 5);
+        assert_eq!(ids(&paged), ids(&all));
+        assert!(catalog
+            .list_recordings_page(all.len(), 2)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

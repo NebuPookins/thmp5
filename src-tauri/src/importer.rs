@@ -15,14 +15,14 @@ pub struct ImportManager {
     progress: Arc<Mutex<ImportProgress>>,
     file_issues: FileIssueLog,
     write_serializer: Arc<Semaphore>,
-    catalog: Arc<tokio::sync::RwLock<crate::storage::Catalog>>,
+    catalog: crate::storage::CatalogStore,
 }
 
 impl ImportManager {
     pub fn new(
         file_issues: FileIssueLog,
         write_serializer: Arc<Semaphore>,
-        catalog: Arc<tokio::sync::RwLock<crate::storage::Catalog>>,
+        catalog: crate::storage::CatalogStore,
     ) -> Self {
         Self {
             progress: Arc::new(Mutex::new(ImportProgress::default())),
@@ -60,7 +60,7 @@ impl ImportManager {
         let progress = Arc::clone(&self.progress);
         let file_issues = self.file_issues.clone();
         let write_serializer = Arc::clone(&self.write_serializer);
-        let catalog = Arc::clone(&self.catalog);
+        let catalog = self.catalog.clone();
         tauri::async_runtime::spawn(async move {
             println!("[importer] scan started: {root_path}");
             let result = run_scan(
@@ -87,7 +87,10 @@ impl ImportManager {
                     );
                 }
             }
-            match crate::storage::reload(&db, &catalog).await {
+            match catalog
+                .reload(&db, crate::storage::Announce::Frontend)
+                .await
+            {
                 Ok(()) => println!("[importer] catalog reloaded after scan"),
                 Err(e) => eprintln!("[importer] catalog reload failed: {e:#}"),
             }

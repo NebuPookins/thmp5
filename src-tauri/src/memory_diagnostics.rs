@@ -7,13 +7,11 @@
 //! the UI.
 
 use crate::file_issues::FileIssueLog;
-use crate::storage::{Catalog, CatalogStats};
+use crate::storage::{CatalogStats, CatalogStore};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -298,7 +296,7 @@ pub fn record_catalog_load(stats: &CatalogStats, elapsed: Duration) {
 
 /// Logs a snapshot (plus catalog and file-issue counts) every
 /// [`SNAPSHOT_INTERVAL`] for the lifetime of the app.
-pub fn spawn_periodic_logging(catalog: Arc<RwLock<Catalog>>, file_issues: FileIssueLog) {
+pub fn spawn_periodic_logging(catalog: CatalogStore, file_issues: FileIssueLog) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + SNAPSHOT_INTERVAL,

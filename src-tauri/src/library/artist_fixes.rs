@@ -1,12 +1,10 @@
 use crate::library::scanner;
 use crate::models::CompoundArtistCheck;
-use crate::storage::Catalog;
+use crate::storage::CatalogStore;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 pub async fn check_artist_compound(
-    catalog: &Arc<RwLock<Catalog>>,
+    catalog: &CatalogStore,
     artist_id: &str,
 ) -> Result<CompoundArtistCheck, String> {
     let (artist_name_opt, paths) = {

@@ -653,7 +653,7 @@ fn file_identity(path: &Path) -> Result<(i64, i64)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::init_pool;
     use crate::file_issues::FileIssueKind;
@@ -1243,6 +1243,29 @@ mod tests {
             file1_path,
             file2_path
         );
+    }
+
+    pub(crate) async fn import_titles(
+        tmp: &TempDir,
+        pool: &crate::db::DbPool,
+        serializer: &tokio::sync::Semaphore,
+        titles: &[&str],
+    ) {
+        for title in titles {
+            let file = tmp.path().join(format!("{title}.mp3"));
+            write_tagged_mp3(&file, title, "Artist", "Artist", "Album");
+            store_prepared_import(
+                pool,
+                prepared_import_for_path(
+                    &file,
+                    tagged_meta(title, "Artist", "Artist", "Album", 1),
+                    Some(&format!("acoustid-{title}")),
+                ),
+                serializer,
+            )
+            .await
+            .unwrap();
+        }
     }
 
     // ── Effective rating lookup ─────────────────────────────────────────

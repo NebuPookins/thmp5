@@ -95,6 +95,30 @@ type AppBootstrap = {
 };
 
 const RECORDINGS_PAGE_SIZE = 5_000;
+const RECORDINGS_LOAD_MAX_ATTEMPTS = 3;
+
+/** Bookkeeping that serializes every library load; see `requestLibraryLoad`. */
+type CatalogSync = {
+  running: boolean;
+  /** Newest catalog generation announced by the backend. */
+  wantedGeneration: number;
+  /** Newest generation a load has been started for (successful or not). */
+  attemptedGeneration: number;
+  /** Explicit load requests made so far. */
+  forcedRequests: number;
+  /** Explicit load requests covered by a load that has completed. */
+  servedRequests: number;
+  waiters: { request: number; resolve: () => void }[];
+};
+
+/** What triggers a library load: a catalog generation the backend announced, or a caller that needs a fresh load. */
+type LibraryLoadRequest = { readonly generation: number } | { readonly force: true };
+
+/** Mirrors the backend's `RecordingPage`: rows plus the catalog generation they came from. */
+type RecordingPage = {
+  generation: number;
+  rows: RecordingRow[];
+};
 // How often the open File Issues panel re-fetches the list.
 const FILE_ISSUES_POLL_MS = 5_000;
 
@@ -1039,25 +1063,69 @@ function App() {
     overscan: 10,
   });
 
-  async function loadRecordings() {
-    const rows: RecordingRow[] = [];
-    let offset = 0;
+  const loadedGenerationRef = useRef(0);
+  const catalogSyncRef = useRef<CatalogSync>({
+    running: false,
+    wantedGeneration: 0,
+    attemptedGeneration: 0,
+    forcedRequests: 0,
+    servedRequests: 0,
+    waiters: [],
+  });
+  const libraryReadyRef = useRef(false);
 
-    while (true) {
-      const page = await invoke<RecordingRow[]>("list_recordings", {
+  /** Loads every recording and returns the catalog generation they were read from. */
+  async function loadRecordings(): Promise<number> {
+    // Pages are only consistent with each other when read from one catalog
+    // generation, so a catalog reload mid-pagination restarts the load. The
+    // final attempt is not strict: it logs the change and keeps going rather
+    // than leave the list empty.
+    type PagedLoad =
+      | { readonly kind: "loaded"; readonly rows: RecordingRow[]; readonly generation: number }
+      | { readonly kind: "changed"; readonly from: number; readonly to: number };
+
+    const loadPages = async (
+      strict: boolean,
+      generation: number | null = null,
+      pages: readonly RecordingRow[][] = [],
+      offset = 0,
+    ): Promise<PagedLoad> => {
+      const page = await invoke<RecordingPage>("list_recordings", {
         limit: RECORDINGS_PAGE_SIZE,
         offset,
       });
-      rows.push(...page);
-
-      if (page.length < RECORDINGS_PAGE_SIZE) {
-        break;
+      if (generation !== null && page.generation !== generation) {
+        if (strict) {
+          return { kind: "changed", from: generation, to: page.generation };
+        }
+        frontendLog("error", "Catalog changed while loading recordings on the final attempt; rows may be missing until the next reload", {
+          attempts: RECORDINGS_LOAD_MAX_ATTEMPTS,
+          oldGeneration: generation,
+          newGeneration: page.generation,
+        });
       }
+      // Generations only grow, so the first page's is the oldest. A torn
+      // result reports that one, so the newer generation still gets reloaded.
+      const oldest = generation ?? page.generation;
+      const loaded = [...pages, page.rows];
+      return page.rows.length < RECORDINGS_PAGE_SIZE
+        ? { kind: "loaded", rows: loaded.flat(), generation: oldest }
+        : loadPages(strict, oldest, loaded, offset + page.rows.length);
+    };
 
-      offset += page.length;
+    for (let attempt = 1; ; attempt++) {
+      const result = await loadPages(attempt < RECORDINGS_LOAD_MAX_ATTEMPTS);
+      if (result.kind === "loaded") {
+        setRecordings(result.rows);
+        loadedGenerationRef.current = Math.max(loadedGenerationRef.current, result.generation);
+        return result.generation;
+      }
+      frontendLog("warn", "Catalog changed while loading recordings; restarting", {
+        attempt,
+        oldGeneration: result.from,
+        newGeneration: result.to,
+      });
     }
-
-    setRecordings(rows);
   }
 
   async function loadAllTags() {
@@ -1282,6 +1350,70 @@ function App() {
     })();
   }
 
+  /**
+   * The only way to load library data. Loads never overlap, so a stale result
+   * cannot overwrite a newer one. Requests arriving mid-load are folded into
+   * one follow-up load. A generation request is skipped when that generation
+   * is already loaded. The returned promise resolves once a load that started
+   * after the request was made has completed (immediately for a generation
+   * request, which nobody awaits).
+   */
+  function requestLibraryLoad(request: LibraryLoadRequest): Promise<void> {
+    const sync = catalogSyncRef.current;
+    if ("generation" in request) {
+      if (!libraryReadyRef.current) {
+        frontendLog("debug", "Skipped catalog-reloaded: library not set up yet", {
+          generation: request.generation,
+        });
+        return Promise.resolve();
+      }
+      sync.wantedGeneration = Math.max(sync.wantedGeneration, request.generation);
+    } else {
+      sync.forcedRequests += 1;
+    }
+    const ticket = "force" in request ? sync.forcedRequests : 0;
+    const done =
+      ticket > 0
+        ? new Promise<void>((resolve) => sync.waiters.push({ request: ticket, resolve }))
+        : Promise.resolve();
+    if (sync.running) {
+      frontendLog("debug", "Coalesced library load request into the load in flight", { ...request });
+    } else {
+      void runLibraryLoads();
+    }
+    return done;
+  }
+
+  async function runLibraryLoads() {
+    const sync = catalogSyncRef.current;
+    sync.running = true;
+    try {
+      const pending = () =>
+        sync.forcedRequests > sync.servedRequests ||
+        sync.wantedGeneration > Math.max(sync.attemptedGeneration, loadedGenerationRef.current);
+      while (pending()) {
+        const targetGeneration = sync.wantedGeneration;
+        const targetRequests = sync.forcedRequests;
+        frontendLog("debug", "Loading library data", {
+          targetGeneration,
+          loaded: loadedGenerationRef.current,
+        });
+        // loadLibraryData logs and reports its own failures and never rejects.
+        // Recording the targets afterwards (not on success) keeps a persistent
+        // failure from spinning this loop.
+        await loadLibraryDataRef.current();
+        sync.attemptedGeneration = targetGeneration;
+        sync.servedRequests = targetRequests;
+        sync.waiters
+          .filter((waiter) => waiter.request <= targetRequests)
+          .forEach((waiter) => waiter.resolve());
+        sync.waiters = sync.waiters.filter((waiter) => waiter.request > targetRequests);
+      }
+    } finally {
+      sync.running = false;
+    }
+  }
+
   async function loadLibraryData(nextArtistId = selectedArtistId, nextSearch = search) {
     try {
       await loadRecordings();
@@ -1293,6 +1425,7 @@ function App() {
       await loadAllTags();
       await loadPlaylists();
     } catch (loadError) {
+      frontendLog("error", "loadLibraryData failed", { error: errorMessage(loadError) });
       await reportPoolTimeout("loadLibraryData", loadError);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     }
@@ -1414,8 +1547,27 @@ function App() {
       return;
     }
 
-    void loadLibraryData();
+    void requestLibraryLoad({ force: true });
   }, [bootstrap?.needs_setup]);
+
+  // Always points at the latest render's loadLibraryData (current artist/search),
+  // so the long-lived catalog-reloaded listener never loads with stale selections.
+  const loadLibraryDataRef = useRef(loadLibraryData);
+  loadLibraryDataRef.current = loadLibraryData;
+  libraryReadyRef.current = bootstrap !== null && !bootstrap.needs_setup;
+
+  useEffect(() => {
+    let isMounted = true;
+    const unlistenPromise = listen<{ generation: number }>("catalog-reloaded", (event) => {
+      if (isMounted) {
+        void requestLibraryLoad({ generation: event.payload.generation });
+      }
+    });
+    return () => {
+      isMounted = false;
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   useEffect(() => {
     if (!bootstrap || bootstrap.needs_setup) {
@@ -1446,7 +1598,6 @@ function App() {
     }
 
     const isRunning = bootstrap.import_progress.is_running;
-    let wasRunning = isRunning;
     let cancelled = false;
     let timeoutId: number | null = null;
 
@@ -1463,12 +1614,6 @@ function App() {
               }
             : current,
         );
-
-        const shouldReloadLibrary = wasRunning && !progress.is_running;
-        wasRunning = progress.is_running;
-        if (shouldReloadLibrary) {
-          await loadLibraryData(selectedArtistId, search);
-        }
 
         if (!cancelled) {
           const interval = progress.is_running ? 2000 : 60000;
@@ -1498,7 +1643,7 @@ function App() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [bootstrap?.needs_setup, bootstrap?.import_progress.is_running, search, selectedArtistId]);
+  }, [bootstrap?.needs_setup, bootstrap?.import_progress.is_running]);
 
   useEffect(() => {
     if (recordings.length === 0) {
@@ -1577,9 +1722,6 @@ function App() {
         if (isMounted) {
           setPendingJobs(Math.max(0, event.payload.remaining));
           setCurrentJobType(event.payload.job_type);
-          if (event.payload.remaining <= 0 && !bootstrap?.import_progress.is_running) {
-            void loadLibraryData(selectedArtistId, search);
-          }
         }
       });
       let lastDamaged = 0;
@@ -1834,7 +1976,7 @@ function App() {
     }
   }
 
-  /** Background bookkeeping after a track finishes; never touches the current track. */
+  /** Background bookkeeping after a track finishes; never touches the current track or reloads the library itself. */
   async function recordPlayAndRefresh(finishedTrack: QueueItem, playedMs: number) {
     const sourceId = finishedTrack.source.id;
     try {
@@ -1849,20 +1991,8 @@ function App() {
       });
       setError(errorMessage(recordError));
     }
-    void loadRecordings();
-    try {
-      const artistRows = await loadArtists();
-      const resolvedArtistId = selectedArtistId && artistRows.some((artist) => artist.id === selectedArtistId)
-        ? selectedArtistId
-        : null;
-      await loadReleaseGroups(resolvedArtistId, search);
-    } catch (reloadError) {
-      frontendLog("error", "library reload after play failed", {
-        source_id: sourceId,
-        error: errorMessage(reloadError),
-      });
-      setError(errorMessage(reloadError));
-    }
+    // The backend reloads its catalog when the play is recorded and announces
+    // it with `catalog-reloaded`, which refreshes the library.
   }
 
   /** The single place that asks the backend to play a source. */
@@ -1921,7 +2051,7 @@ function App() {
         library_summary: summary,
       });
       setQueueHistoryLimitInput(String(config.queue_history_limit));
-      await loadLibraryData();
+      await requestLibraryLoad({ force: true });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : String(submitError));
     } finally {
@@ -2023,9 +2153,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleFileIssue(path: string, existingNote: string | null) {
@@ -2056,9 +2187,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleRescanArtist(artistId: string) {
@@ -2068,9 +2200,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleRescanRecording(recordingId: string) {
@@ -2080,9 +2213,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleRescanReleaseGroup(releaseGroupId: string) {
@@ -2092,9 +2226,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   function openRecordingContextMenu(e: React.MouseEvent, recording: RecordingRow) {
@@ -2276,7 +2411,7 @@ function App() {
         sourceIdsToMove,
       });
       splitDispatch({ type: "submitOk", requestId });
-      await loadLibraryData(selectedArtistId, search);
+      await requestLibraryLoad({ force: true });
       dispatchNav({ type: "navigate", nav: { type: "recording", id: newId } });
     } catch (e) {
       splitDispatch({ type: "submitErr", requestId, error: e instanceof Error ? e.message : String(e) });
@@ -3004,7 +3139,7 @@ function App() {
                   }}
                   onRescanRecording={(recordingId) => { void handleRescanRecording(recordingId); }}
                   onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
-                  onRefreshLibrary={() => { void loadLibraryData(selectedArtistId, search); }}
+                  onRefreshLibrary={() => { void requestLibraryLoad({ force: true }); }}
                   onSplitRecording={(recordingId) => openSplit(recordingId)}
                 />
               ) : browserLeftTab === "smartplaylists" ? (
