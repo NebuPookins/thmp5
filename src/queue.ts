@@ -137,3 +137,22 @@ export function mapQueueEntryRecording(
   });
   return changed ? next : entries;
 }
+
+/**
+ * Replace every queued entry playing `deadSourceId` with `replacement`, keeping each entry's
+ * stable key, or drop those entries when `replacement` is null. Returns the original array
+ * when no entry is affected.
+ */
+export function replaceSourceInQueue(
+  entries: QueueEntry[],
+  deadSourceId: string,
+  replacement: QueueItem | null,
+): QueueEntry[] {
+  if (!entries.some((entry) => entry.recording.source.id === deadSourceId)) {
+    return entries;
+  }
+  return entries.flatMap((entry) => {
+    if (entry.recording.source.id !== deadSourceId) return [entry];
+    return replacement === null ? [] : [{ ...entry, recording: replacement }];
+  });
+}

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -7,12 +8,30 @@ pub enum FileIssueKind {
     Manual,
     ImportError,
     PlaybackError,
-    OrphanSource,
     DuplicateFrame,
     BackupFileExists,
     DurationMismatch,
     /// The audio stream has frames the decoder rejects, or ends with an error.
     CorruptAudio,
+    /// The source's audio file no longer exists on disk.
+    MissingFile,
+}
+
+impl FileIssueKind {
+    /// Whether an issue of this kind stays relevant once its file is known to be missing.
+    /// Every kind must decide: user-authored notes and the missing-file issue itself stay, while
+    /// problems detected in the file's contents or tags are noise.
+    pub fn survives_missing_file(&self) -> bool {
+        match self {
+            FileIssueKind::Manual | FileIssueKind::MissingFile => true,
+            FileIssueKind::ImportError
+            | FileIssueKind::PlaybackError
+            | FileIssueKind::DuplicateFrame
+            | FileIssueKind::BackupFileExists
+            | FileIssueKind::DurationMismatch
+            | FileIssueKind::CorruptAudio => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -20,8 +39,8 @@ pub struct FileIssue {
     pub file_path: String,
     pub kind: FileIssueKind,
     pub message: String,
-    /// Present only for OrphanSource issues — the source row id so
-    /// the frontend can request a fix without re‑querying.
+    /// The source row id, for issues attached to a stored source, so the
+    /// frontend can act on it without re-querying.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,6 +107,18 @@ pub fn sorted_by_rating_desc(
     rated.into_iter().map(|(_, issue)| issue).collect()
 }
 
+/// Drops every issue about a file in `missing_paths`, except user-authored `Manual` notes and
+/// `MissingFile` issues themselves: problems detected in a file that no longer exists are
+/// noise.
+pub fn suppress_for_missing<'a>(
+    issues: impl IntoIterator<Item = FileIssue> + 'a,
+    missing_paths: &'a HashSet<&'a str>,
+) -> impl Iterator<Item = FileIssue> + 'a {
+    issues.into_iter().filter(|issue| {
+        issue.kind.survives_missing_file() || !missing_paths.contains(issue.file_path.as_str())
+    })
+}
+
 /// Shared, in-memory log of files that have encountered problems.
 /// Cheap to clone — all clones share the same underlying list.
 #[derive(Clone, Default)]
@@ -122,27 +153,6 @@ impl FileIssueLog {
             message: message.into(),
             source_id: None,
             recording_id: None,
-            frame_id: None,
-            field_name: None,
-            lofty_value: None,
-            corrected_value: None,
-            backup_path: None,
-        });
-    }
-
-    pub fn push_orphan_source(
-        &self,
-        file_path: impl Into<String>,
-        message: impl Into<String>,
-        source_id: impl Into<String>,
-        recording_id: impl Into<String>,
-    ) {
-        self.push(FileIssue {
-            file_path: file_path.into(),
-            kind: FileIssueKind::OrphanSource,
-            message: message.into(),
-            source_id: Some(source_id.into()),
-            recording_id: Some(recording_id.into()),
             frame_id: None,
             field_name: None,
             lofty_value: None,
@@ -347,6 +357,35 @@ mod tests {
             .into_iter()
             .map(|issue| issue.file_path)
             .collect()
+    }
+
+    fn issue(kind: FileIssueKind, path: &str) -> FileIssue {
+        FileIssue::for_source(kind, path.into(), "id".into(), None, "msg".into())
+    }
+
+    #[test]
+    fn suppress_for_missing_drops_detected_issues_but_keeps_notes_and_missing_file() {
+        let missing: HashSet<&str> = ["/gone.mp3"].into();
+        let issues = vec![
+            issue(FileIssueKind::CorruptAudio, "/gone.mp3"),
+            issue(FileIssueKind::DuplicateFrame, "/gone.mp3"),
+            issue(FileIssueKind::Manual, "/gone.mp3"),
+            issue(FileIssueKind::MissingFile, "/gone.mp3"),
+            issue(FileIssueKind::CorruptAudio, "/here.mp3"),
+        ];
+
+        let kept: Vec<(FileIssueKind, String)> = suppress_for_missing(issues, &missing)
+            .map(|i| (i.kind, i.file_path))
+            .collect();
+
+        assert_eq!(
+            kept,
+            vec![
+                (FileIssueKind::Manual, "/gone.mp3".to_string()),
+                (FileIssueKind::MissingFile, "/gone.mp3".to_string()),
+                (FileIssueKind::CorruptAudio, "/here.mp3".to_string()),
+            ]
+        );
     }
 
     #[test]

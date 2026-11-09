@@ -151,6 +151,22 @@ pub struct SourceRow {
     pub last_played: Option<String>,
 }
 
+/// A live library source that a missing source's user data could be relinked onto.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RelinkCandidate {
+    pub source_id: String,
+    pub file_path: String,
+    pub recording_id: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub rating: Option<f64>,
+    /// The candidate is in the same recording as the missing source (same hash, fingerprint or
+    /// MBID), e.g. because the file was moved.
+    pub same_recording: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordingRow {
     pub id: String,

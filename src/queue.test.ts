@@ -6,6 +6,7 @@ import {
   moveEntryByKey,
   makeQueueEntry,
   mapQueueEntryRecording,
+  replaceSourceInQueue,
   type QueueEntry,
 } from "./queue";
 import { makeQueueItem } from "./testHelpers";
@@ -168,5 +169,26 @@ describe("mapQueueEntryRecording", () => {
     const entries = [entry("a", "r1")];
     const result = mapQueueEntryRecording(entries, (r) => r);
     expect(result).toBe(entries);
+  });
+});
+
+// ── replaceSourceInQueue ─────────────────────────────────────────────────────
+
+describe("replaceSourceInQueue", () => {
+  const entries = [entry("k1", "a"), entry("k2", "b"), entry("k3", "a")];
+
+  it("swaps every entry playing the dead source, keeping the entry keys", () => {
+    const replacement = makeQueueItem({ id: "c" });
+    const result = replaceSourceInQueue(entries, "src-a", replacement);
+    expect(result.map((e) => [e.key, e.recording.id])).toEqual([["k1", "c"], ["k2", "b"], ["k3", "c"]]);
+  });
+
+  it("drops the entries playing the dead source when there is no replacement", () => {
+    const result = replaceSourceInQueue(entries, "src-a", null);
+    expect(result.map((e) => e.key)).toEqual(["k2"]);
+  });
+
+  it("returns the same array when no entry plays the source", () => {
+    expect(replaceSourceInQueue(entries, "src-zzz", null)).toBe(entries);
   });
 });

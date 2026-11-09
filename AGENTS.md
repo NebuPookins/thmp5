@@ -17,15 +17,16 @@ A desktop music player built with **Tauri** (Rust backend + TypeScript/React fro
 ## Key Architectural Decisions
 - See `ARCHITECTURE.md` for the full plan and data model
 - The `Source` trait abstracts over local files / YouTube / HTTP streams so the audio engine is source-agnostic
-- Ratings, play history, and smart-playlist membership are tracked per **Recording** (not per file)
+- Recordings are not stored: since migration 014, `MemoryCatalog` (`storage/memory.rs`) derives them at load by grouping `source` rows (MBID, then file_hash, then fingerprint). Ratings, play history, playlist entries and file-issue notes all reference `source.id`, so deleting or merging source rows is how recordings disappear or merge. ARCHITECTURE.md's data model predates this.
 - The smart playlist query language compiles to SQL + a post-filter for duration limits
 
 ## Development Conventions
 - Run `cargo fmt` and `cargo clippy` before committing Rust code
-- All Tauri commands are typed end-to-end (Rust `#[tauri::command]` + generated TypeScript types)
+- Tauri commands are called via untyped `invoke<T>` with hand-written TS types next to the caller (no codegen), so keep the Rust struct and the TS type in sync by hand.
 - Database migrations live in `src-tauri/migrations/` and are managed by `sqlx migrate`
 - Never edit an existing migration (sqlx checksums applied ones, and the user may have applied it on any machine); always add a new one, unless the user explicitly says the migration hasn't been applied and editing it is safe
 - Use `sqlx::query!` macros for compile-time query checking where possible. `build.rs` builds a scratch DB from `migrations/` and sets `DATABASE_URL` to it, so queries are always checked against the current schema (no `.sqlx` offline data, no `.env` needed). SQLite's nullability inference is conservative: TEXT primary keys and `INTEGER PRIMARY KEY` come out as `Option`, so use `AS "id!"` overrides; only mark a nullable column like `file_path` with `!` when the query filters `IS NOT NULL`
+- To pass a list of ids to `sqlx::query!`, bind a JSON array and use `IN (SELECT value FROM json_each(?))`. A `json_each` inside a scalar subquery fails the compile-time check ('no such table column: json_each.value').
 - Tauri commands return `Result<T, CommandError>` (`src-tauri/src/command_error.rs`) and use `?`/`.context(...)`; converting an error into `CommandError` logs it once, with the command's span fields. Annotate every `#[tauri::command]` with `#[tracing::instrument(skip_all, fields(...))]` listing its identifying inputs (never secrets) as `fields(id = id)` / `fields(%path)` — a bare `fields(id)` records an *empty* field. Use `CommandError::rejected(msg)` for invalid input / not found. Only `#[tauri::command]` fns return `CommandError`; helpers and background tasks (e.g. the Last.fm listener in `lib.rs`) return `anyhow::Result` (with `Option` for "not configured"), because converting into `CommandError` logs an ERROR "Command failed" even outside a command.
 
 ## Build & Run

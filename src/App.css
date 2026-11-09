@@ -1420,7 +1420,7 @@ thead th {
   margin: 0;
 }
 
-.issue-kind-orphan_source {
+.issue-kind-missing_file {
   background: rgba(240, 196, 50, 0.18);
   color: #f0c050;
 }
@@ -1435,7 +1435,7 @@ thead th {
   color: #5cc5c5;
 }
 
-.fix-orphan-btn {
+.issue-action-btn {
   margin-left: auto;
   font-size: 0.72rem;
   padding: 2px 10px;
@@ -1449,12 +1449,12 @@ thead th {
   transition: background 0.15s, border-color 0.15s;
 }
 
-.fix-orphan-btn:hover {
+.issue-action-btn:hover {
   background: rgba(76, 175, 125, 0.25);
   border-color: rgba(76, 175, 125, 0.7);
 }
 
-.fix-orphan-btn:active {
+.issue-action-btn:active {
   background: rgba(76, 175, 125, 0.35);
 }
 
@@ -2185,4 +2185,61 @@ thead th {
   margin: 0 0 6px;
   font-size: 0.72rem;
   color: #8fa5c2;
+}
+
+/* ── Relink missing source ────────────────────────────────────────────── */
+.relink-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 8px 0;
+}
+
+.relink-candidate-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  min-height: 0;
+  max-height: 50vh;
+}
+
+.relink-candidate {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: #1a1a2e;
+  border: 1px solid #3a3f55;
+  border-radius: 4px;
+  padding: 6px 8px;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+.relink-candidate-selected {
+  border-color: #4a7c59;
+  background: #22332a;
+}
+
+.relink-candidate-title {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.relink-candidate-same {
+  color: #5cc5c5;
+  font-size: 0.72rem;
+}
+
+.relink-candidate-path {
+  display: block;
+  font-size: 0.72rem;
+  color: #6b819c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

@@ -113,6 +113,17 @@ impl Catalog {
         }
     }
 
+    pub fn relink_candidates(
+        &self,
+        dead_source_id: &str,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Vec<crate::models::RelinkCandidate> {
+        match self {
+            Catalog::Memory(c) => c.relink_candidates(dead_source_id, query, limit),
+        }
+    }
+
     pub fn effective_rating_lookup(&self) -> impl Fn(&str) -> Option<f64> + '_ {
         match self {
             Catalog::Memory(c) => c.effective_rating_lookup(),

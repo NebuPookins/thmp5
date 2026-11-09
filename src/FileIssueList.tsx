@@ -2,7 +2,7 @@ import { memo } from "react";
 
 export type FileIssue = {
   file_path: string;
-  kind: "manual" | "import_error" | "playback_error" | "orphan_source" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch" | "corrupt_audio";
+  kind: "manual" | "import_error" | "playback_error" | "duplicate_frame" | "backup_file_exists" | "duration_mismatch" | "corrupt_audio" | "missing_file";
   message: string;
   source_id?: string;
   recording_id?: string;
@@ -17,11 +17,11 @@ export const fileIssueLabel = (kind: FileIssue["kind"]): string => ({
   manual: "File issue",
   import_error: "Import error",
   playback_error: "Playback error",
-  orphan_source: "Orphan source",
   duplicate_frame: "Duplicate tag",
   backup_file_exists: "Backup file",
   duration_mismatch: "Duration mismatch",
   corrupt_audio: "Corrupt audio",
+  missing_file: "Missing file",
 }[kind]);
 
 /**
@@ -42,7 +42,8 @@ export function issueRowKeys(issues: readonly FileIssue[]): string[] {
 export type FileIssueListActions = {
   onContextMenu: (e: React.MouseEvent, filePath: string) => void;
   onClearManual: (filePath: string) => void;
-  onFixOrphan: (sourceId: string) => void;
+  onRelinkMissing: (issue: FileIssue) => void;
+  onRemoveMissing: (issue: FileIssue) => void;
   onOpenMerge: (filePath: string) => void;
   onPlayFile: (issue: FileIssue) => void;
   onDeleteBackup: (backupPath: string) => void;
@@ -51,7 +52,6 @@ export type FileIssueListActions = {
 type Props = {
   issues: readonly FileIssue[];
   firstDupIndexByFile: ReadonlyMap<string, number>;
-  fixingOrphans: ReadonlySet<string>;
   deletingBackups: ReadonlySet<string>;
   /** Must be referentially stable, or memoization is defeated. */
   actions: FileIssueListActions;
@@ -60,7 +60,6 @@ type Props = {
 export const FileIssueList = memo(function FileIssueList({
   issues,
   firstDupIndexByFile,
-  fixingOrphans,
   deletingBackups,
   actions,
 }: Props) {
@@ -85,25 +84,35 @@ export const FileIssueList = memo(function FileIssueList({
               </span>
               {issue.kind === "manual" ? (
                 <button
-                  className="fix-orphan-btn"
+                  className="issue-action-btn"
                   type="button"
                   onClick={() => actions.onClearManual(issue.file_path)}
                 >
                   Clear
                 </button>
-              ) : issue.kind === "orphan_source" && sourceId !== undefined ? (
-                <button
-                  className="fix-orphan-btn"
-                  type="button"
-                  disabled={fixingOrphans.has(sourceId)}
-                  onClick={() => actions.onFixOrphan(sourceId)}
-                >
-                  {fixingOrphans.has(sourceId) ? "Fixing…" : "Fix"}
-                </button>
+              ) : issue.kind === "missing_file" && sourceId !== undefined ? (
+                <>
+                  <button
+                    className="issue-action-btn"
+                    type="button"
+                    title="Move this source's plays, rating and playlist entries onto another library file"
+                    onClick={() => actions.onRelinkMissing(issue)}
+                  >
+                    Relink…
+                  </button>
+                  <button
+                    className="issue-action-btn"
+                    type="button"
+                    title="Delete this source and its play history, rating and playlist entries"
+                    onClick={() => actions.onRemoveMissing(issue)}
+                  >
+                    Remove
+                  </button>
+                </>
               ) : issue.kind === "duplicate_frame" ? (
                 isFirstDupForFile ? (
                   <button
-                    className="fix-orphan-btn"
+                    className="issue-action-btn"
                     type="button"
                     onClick={() => actions.onOpenMerge(issue.file_path)}
                   >
@@ -113,7 +122,7 @@ export const FileIssueList = memo(function FileIssueList({
               ) : issue.kind === "backup_file_exists" ? (
                 <>
                   <button
-                    className="fix-orphan-btn"
+                    className="issue-action-btn"
                     type="button"
                     title="Play the current file to confirm it's still valid before deleting the backup"
                     onClick={() => actions.onPlayFile(issue)}
@@ -122,7 +131,7 @@ export const FileIssueList = memo(function FileIssueList({
                   </button>
                   {backupPath !== undefined && (
                     <button
-                      className="fix-orphan-btn"
+                      className="issue-action-btn"
                       type="button"
                       disabled={deletingBackups.has(backupPath)}
                       onClick={() => actions.onDeleteBackup(backupPath)}

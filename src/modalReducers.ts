@@ -206,3 +206,110 @@ export function splitModalReducer(state: SplitModalState, action: SplitModalActi
       return { phase: "closed" };
   }
 }
+
+// ── Relink-missing-source modal ─────────────────────────────────────────────
+
+/** The missing source being relinked. */
+export type RelinkSubject = {
+  sourceId: string;
+  filePath: string;
+  /** The issue message, e.g. "File not found (3 plays, rated 4★)". */
+  message: string;
+};
+
+/** A live library source the missing source's data can be moved onto. */
+export type RelinkCandidate = {
+  source_id: string;
+  file_path: string;
+  recording_id: string;
+  title: string;
+  artist: string | null;
+  album: string | null;
+  duration_ms: number | null;
+  rating: number | null;
+  same_recording: boolean;
+};
+
+export type RelinkModalState =
+  | { phase: "closed" }
+  | {
+      phase: "open";
+      subject: RelinkSubject;
+      /** What the user has typed in the search box. */
+      query: string;
+      /** The query of the most recently issued search; differs from `query` while typing. */
+      issuedQuery: string;
+      requestId: number;
+      candidates: RelinkCandidate[];
+      selectedSourceId: string | null;
+      status: "loading" | "ready" | "submitting";
+      error: string | null;
+    };
+
+export type RelinkModalAction =
+  | { type: "open"; subject: RelinkSubject; requestId: number }
+  | { type: "setQuery"; query: string }
+  | { type: "search"; query: string; requestId: number }
+  | { type: "searchOk"; requestId: number; candidates: RelinkCandidate[] }
+  | { type: "searchErr"; requestId: number; error: string }
+  | { type: "select"; sourceId: string }
+  | { type: "submit" }
+  | { type: "submitOk"; requestId: number }
+  | { type: "submitErr"; requestId: number; error: string }
+  | { type: "close" };
+
+export function relinkModalReducer(state: RelinkModalState, action: RelinkModalAction): RelinkModalState {
+  if (action.type === "open") {
+    return {
+      phase: "open",
+      subject: action.subject,
+      query: "",
+      issuedQuery: "",
+      requestId: action.requestId,
+      candidates: [],
+      selectedSourceId: null,
+      status: "loading",
+      error: null,
+    };
+  }
+  if (state.phase === "closed") return state;
+  switch (action.type) {
+    case "setQuery":
+      return state.status === "submitting" ? state : { ...state, query: action.query };
+    case "search":
+      return state.status === "submitting"
+        ? state
+        : { ...state, query: action.query, issuedQuery: action.query, requestId: action.requestId, status: "loading", error: null };
+    case "searchOk":
+      if (state.status === "loading" && state.requestId === action.requestId) {
+        // Keep the selection only if the chosen source is still among the results.
+        const selectedSourceId = action.candidates.some((c) => c.source_id === state.selectedSourceId)
+          ? state.selectedSourceId
+          : null;
+        return { ...state, status: "ready", candidates: action.candidates, selectedSourceId, error: null };
+      }
+      return state;
+    case "searchErr":
+      if (state.status === "loading" && state.requestId === action.requestId) {
+        return { ...state, status: "ready", candidates: [], selectedSourceId: null, error: action.error };
+      }
+      return state;
+    case "select":
+      if (state.status === "ready" && state.candidates.some((c) => c.source_id === action.sourceId)) {
+        return { ...state, selectedSourceId: action.sourceId };
+      }
+      return state;
+    case "submit":
+      return state.status === "ready" && state.selectedSourceId !== null ? { ...state, status: "submitting", error: null } : state;
+    case "submitOk":
+      return state.status === "submitting" && state.requestId === action.requestId ? { phase: "closed" } : state;
+    case "submitErr":
+      if (state.status === "submitting" && state.requestId === action.requestId) {
+        return { ...state, status: "ready", error: action.error };
+      }
+      return state;
+    case "close":
+      // An in-flight write can't be cancelled.
+      return state.status === "submitting" ? state : { phase: "closed" };
+  }
+}

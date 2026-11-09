@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   artistFixReducer,
   mergeModalReducer,
+  relinkModalReducer,
   splitModalReducer,
   type ArtistFixState,
   type CompoundArtistCheck,
   type MergeModalState,
+  type RelinkCandidate,
+  type RelinkModalState,
+  type RelinkSubject,
   type SplitModalState,
   type SplitRecordingDetail,
 } from "./modalReducers";
@@ -162,5 +166,100 @@ describe("mergeModalReducer", () => {
       conflicts: [{ frame_id: "TIT2", field_name: "Title", values: ["One", "Two"] }],
     });
     expect(state.phase === "ready" && state.choices).toEqual({ TIT2: "One" });
+  });
+});
+
+// ── relinkModalReducer ──────────────────────────────────────────────────────
+
+const subject: RelinkSubject = { sourceId: "dead", filePath: "/gone.mp3", message: "File not found" };
+
+function candidate(sourceId: string): RelinkCandidate {
+  return {
+    source_id: sourceId,
+    file_path: `/${sourceId}.mp3`,
+    recording_id: `rec-${sourceId}`,
+    title: sourceId,
+    artist: null,
+    album: null,
+    duration_ms: null,
+    rating: null,
+    same_recording: false,
+  };
+}
+
+function readyWith(ids: string[], selected: string | null): RelinkModalState {
+  const opened = relinkModalReducer({ phase: "closed" }, { type: "open", subject, requestId: 1 });
+  const ready = relinkModalReducer(opened, { type: "searchOk", requestId: 1, candidates: ids.map(candidate) });
+  return selected === null ? ready : relinkModalReducer(ready, { type: "select", sourceId: selected });
+}
+
+describe("relinkModalReducer", () => {
+  it("shows the results of the latest search", () => {
+    const state = relinkModalReducer(readyWith(["a"], null), { type: "search", query: "x", requestId: 2 });
+    const done = relinkModalReducer(state, { type: "searchOk", requestId: 2, candidates: [candidate("b")] });
+    expect(done).toMatchObject({ phase: "open", status: "ready", query: "x", candidates: [{ source_id: "b" }] });
+  });
+
+  it("drops the response of a superseded search", () => {
+    const first = relinkModalReducer(readyWith(["a"], null), { type: "search", query: "x", requestId: 2 });
+    const second = relinkModalReducer(first, { type: "search", query: "xy", requestId: 3 });
+    const afterStale = relinkModalReducer(second, { type: "searchOk", requestId: 2, candidates: [candidate("stale")] });
+    expect(afterStale).toBe(second);
+  });
+
+  it("drops a search response that arrives after the modal was closed", () => {
+    const opened = relinkModalReducer({ phase: "closed" }, { type: "open", subject, requestId: 1 });
+    const closed = relinkModalReducer(opened, { type: "close" });
+    expect(relinkModalReducer(closed, { type: "searchOk", requestId: 1, candidates: [candidate("a")] })).toEqual({ phase: "closed" });
+  });
+
+  it("keeps the selection across a search only while it is still listed", () => {
+    const searching = relinkModalReducer(readyWith(["a", "b"], "a"), { type: "search", query: "q", requestId: 2 });
+    const kept = relinkModalReducer(searching, { type: "searchOk", requestId: 2, candidates: [candidate("a")] });
+    expect(kept).toMatchObject({ phase: "open", status: "ready", selectedSourceId: "a" });
+
+    const searchingAgain = relinkModalReducer(kept, { type: "search", query: "r", requestId: 3 });
+    const lost = relinkModalReducer(searchingAgain, { type: "searchOk", requestId: 3, candidates: [candidate("z")] });
+    expect(lost).toMatchObject({ phase: "open", status: "ready", selectedSourceId: null });
+  });
+
+  it("cannot submit without a selection", () => {
+    const state = readyWith(["a"], null);
+    expect(relinkModalReducer(state, { type: "submit" })).toBe(state);
+  });
+
+  it("cannot select a source that is not listed", () => {
+    const state = readyWith(["a"], null);
+    expect(relinkModalReducer(state, { type: "select", sourceId: "nope" })).toBe(state);
+  });
+
+  it("closes when the submission succeeds", () => {
+    const submitting = relinkModalReducer(readyWith(["a"], "a"), { type: "submit" });
+    expect(submitting).toMatchObject({ phase: "open", status: "submitting" });
+    expect(relinkModalReducer(submitting, { type: "submitOk", requestId: 1 })).toEqual({ phase: "closed" });
+  });
+
+  it("returns to the results with the error when the submission fails", () => {
+    const submitting = relinkModalReducer(readyWith(["a"], "a"), { type: "submit" });
+    const failed = relinkModalReducer(submitting, { type: "submitErr", requestId: 1, error: "boom" });
+    expect(failed).toMatchObject({ phase: "open", status: "ready", error: "boom", selectedSourceId: "a" });
+  });
+
+  it("ignores searches while submitting", () => {
+    const submitting = relinkModalReducer(readyWith(["a"], "a"), { type: "submit" });
+    expect(relinkModalReducer(submitting, { type: "search", query: "x", requestId: 9 })).toBe(submitting);
+  });
+
+  it("keeps results and selection while the query is edited, and records the issued query on search", () => {
+    const typed = relinkModalReducer(readyWith(["a"], "a"), { type: "setQuery", query: "abc" });
+    expect(typed).toMatchObject({ query: "abc", issuedQuery: "", status: "ready", selectedSourceId: "a", candidates: [{ source_id: "a" }] });
+    const searching = relinkModalReducer(typed, { type: "search", query: "abc", requestId: 2 });
+    expect(searching).toMatchObject({ query: "abc", issuedQuery: "abc" });
+  });
+
+  it("ignores query edits and close while submitting", () => {
+    const submitting = relinkModalReducer(readyWith(["a"], "a"), { type: "submit" });
+    expect(relinkModalReducer(submitting, { type: "setQuery", query: "x" })).toBe(submitting);
+    expect(relinkModalReducer(submitting, { type: "close" })).toBe(submitting);
   });
 });

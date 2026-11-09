@@ -15,12 +15,16 @@ import {
   makeQueueEntry,
   moveEntryByKey,
   mapQueueEntryRecording,
+  replaceSourceInQueue,
 } from "./queue";
 import {
   type CompoundArtistCheck,
   type MergeConflict,
   artistFixReducer,
   mergeModalReducer,
+  relinkModalReducer,
+  type RelinkCandidate,
+  type RelinkSubject,
   type SplitSourceDetail,
   type SplitRecordingDetail,
   splitModalReducer,
@@ -734,7 +738,6 @@ function App() {
     return result;
   }, [fileIssues]);
 
-  const [fixingOrphans, setFixingOrphans] = useState<Set<string>>(new Set());
   const [deletingBackups, setDeletingBackups] = useState<Set<string>>(new Set());
   const [mergeModal, mergeDispatch] = useReducer(mergeModalReducer, { phase: "closed" });
   const nextMergeRequestId = useRequestId();
@@ -791,6 +794,106 @@ function App() {
       if (ok) mergeDispatch({ type: "submitOk", requestId });
     })();
   };
+  // ── Missing-file issues: relink onto another source, or remove ──────────
+  const [relinkModal, relinkDispatch] = useReducer(relinkModalReducer, { phase: "closed" });
+  const nextRelinkRequestId = useRequestId();
+  const [removeMissing, setRemoveMissing] = useState<
+    { subject: RelinkSubject; removing: boolean; error: string | null } | null
+  >(null);
+  const relinkOpen = relinkModal.phase === "open" ? relinkModal : null;
+
+  const subjectOfIssue = (issue: FileIssue): RelinkSubject | null => {
+    if (issue.source_id === undefined) {
+      console.error("Missing-file issue has no source id", issue);
+      setError(`Cannot act on "${issue.file_path}": the issue has no source id.`);
+      return null;
+    }
+    return { sourceId: issue.source_id, filePath: issue.file_path, message: issue.message };
+  };
+  const searchRelinkCandidates = (sourceId: string, query: string, requestId: number) => {
+    void (async () => {
+      try {
+        const candidates = await invoke<RelinkCandidate[]>("search_relink_candidates", {
+          sourceId,
+          query: query.trim() === "" ? null : query,
+        });
+        relinkDispatch({ type: "searchOk", requestId, candidates });
+      } catch (e) {
+        frontendLog("error", "Relink candidate search failed", { sourceId, query, error: String(e) });
+        relinkDispatch({ type: "searchErr", requestId, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+  };
+  const openRelink = (issue: FileIssue) => {
+    const subject = subjectOfIssue(issue);
+    if (!subject) return;
+    const requestId = nextRelinkRequestId();
+    relinkDispatch({ type: "open", subject, requestId });
+    searchRelinkCandidates(subject.sourceId, "", requestId);
+  };
+  const closeRelink = () => {
+    relinkDispatch({ type: "close" });
+  };
+  // Debounced search as the user types; skipped when the query was already issued.
+  useEffect(() => {
+    if (relinkOpen === null || relinkOpen.status === "submitting" || relinkOpen.query === relinkOpen.issuedQuery) return;
+    const { query, subject } = relinkOpen;
+    const timer = window.setTimeout(() => {
+      const requestId = nextRelinkRequestId();
+      relinkDispatch({ type: "search", query, requestId });
+      searchRelinkCandidates(subject.sourceId, query, requestId);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [relinkOpen?.query, relinkOpen?.subject.sourceId]);
+
+  /** After a missing source is gone: fix up the queue and drop its issues from the list. */
+  function afterMissingSourceGone(subject: RelinkSubject, replacement: QueueItem | null) {
+    setQueue((current) => replaceSourceInQueue(current, subject.sourceId, replacement));
+    removeFileIssues((fi) => fi.source_id === subject.sourceId || fi.file_path === subject.filePath);
+  }
+  const applyRelink = () => {
+    if (relinkModal.phase !== "open" || relinkModal.status !== "ready" || relinkModal.selectedSourceId === null) return;
+    const { subject, requestId, selectedSourceId } = relinkModal;
+    const target = relinkModal.candidates.find((c) => c.source_id === selectedSourceId);
+    const targetRecording = target ? recordings.find((r) => r.id === target.recording_id) : undefined;
+    const replacement = targetRecording ? pinSource(targetRecording, selectedSourceId) : null;
+    relinkDispatch({ type: "submit" });
+    void (async () => {
+      const ok = await runIssueMutation(
+        `relink missing source ${subject.sourceId} (${subject.filePath}) onto ${selectedSourceId}`,
+        async () => {
+          await invoke("relink_missing_source", { sourceId: subject.sourceId, targetSourceId: selectedSourceId });
+          afterMissingSourceGone(subject, replacement);
+        },
+        (message) => relinkDispatch({ type: "submitErr", requestId, error: message }),
+      );
+      if (ok) relinkDispatch({ type: "submitOk", requestId });
+    })();
+  };
+  const openRemoveMissing = (issue: FileIssue) => {
+    const subject = subjectOfIssue(issue);
+    if (subject) setRemoveMissing({ subject, removing: false, error: null });
+  };
+  const closeRemoveMissing = () => setRemoveMissing((current) => (current?.removing ? current : null));
+  const applyRemoveMissing = () => {
+    if (!removeMissing || removeMissing.removing) return;
+    const { subject } = removeMissing;
+    setRemoveMissing({ subject, removing: true, error: null });
+    void (async () => {
+      const ok = await runIssueMutation(
+        `remove missing source ${subject.sourceId} (${subject.filePath})`,
+        async () => {
+          await invoke("remove_missing_source", { sourceId: subject.sourceId });
+          afterMissingSourceGone(subject, null);
+        },
+        (message) => setRemoveMissing({ subject, removing: false, error: message }),
+      );
+      if (ok) setRemoveMissing(null);
+    })();
+  };
+  const missingFileIssue = (path: string): FileIssue | undefined =>
+    (issuesByPath.get(path) ?? []).find((fi) => fi.kind === "missing_file");
+
   // Index of the first duplicate_frame issue per file, so the merge button is
   // rendered once per file rather than once per conflicting frame.
   const firstDupIndexByFile = useMemo(() => {
@@ -1486,13 +1589,10 @@ function App() {
     flushPendingFileIssues();
   }, [flushPendingFileIssues]);
 
-  // After bootstrap, run the orphan-source check and refresh issue list.
+  // After bootstrap, load the issue list.
   useEffect(() => {
     if (!bootstrap) return;
     void (async () => {
-      try {
-        await invoke("find_orphan_sources");
-      } catch { /* best-effort */ }
       try {
         const issues = await invoke<FileIssue[]>("get_file_issues");
         updateFileIssues(issues);
@@ -2621,18 +2721,6 @@ function App() {
     }
   }
 
-  async function fixOrphan(sourceId: string) {
-    setFixingOrphans((prev) => new Set(prev).add(sourceId));
-    try {
-      await runIssueMutation(`fix orphan source ${sourceId}`, async () => {
-        await invoke("fix_orphan_source", { sourceId });
-        removeFileIssues((fi) => fi.source_id === sourceId);
-      });
-    } finally {
-      setFixingOrphans((prev) => { const n = new Set(prev); n.delete(sourceId); return n; });
-    }
-  }
-
   async function deleteBackup(backupPath: string) {
     setDeletingBackups((prev) => new Set(prev).add(backupPath));
     try {
@@ -2682,7 +2770,8 @@ function App() {
   const latestIssueActions: FileIssueListActions = {
     onContextMenu: (e, filePath) => openEntitySourceContextMenu(e, filePath),
     onClearManual: (filePath) => { void handleClearFileIssue(filePath); },
-    onFixOrphan: (sourceId) => { void fixOrphan(sourceId); },
+    onRelinkMissing: openRelink,
+    onRemoveMissing: openRemoveMissing,
     onOpenMerge: openMerge,
     onPlayFile: playIssueFile,
     onDeleteBackup: (backupPath) => { void deleteBackup(backupPath); },
@@ -2692,7 +2781,8 @@ function App() {
   const issueActions = useMemo<FileIssueListActions>(() => ({
     onContextMenu: (e, filePath) => issueActionsRef.current.onContextMenu(e, filePath),
     onClearManual: (filePath) => issueActionsRef.current.onClearManual(filePath),
-    onFixOrphan: (sourceId) => issueActionsRef.current.onFixOrphan(sourceId),
+    onRelinkMissing: (issue) => issueActionsRef.current.onRelinkMissing(issue),
+    onRemoveMissing: (issue) => issueActionsRef.current.onRemoveMissing(issue),
     onOpenMerge: (filePath) => issueActionsRef.current.onOpenMerge(filePath),
     onPlayFile: (issue) => issueActionsRef.current.onPlayFile(issue),
     onDeleteBackup: (backupPath) => issueActionsRef.current.onDeleteBackup(backupPath),
@@ -4025,6 +4115,112 @@ function App() {
         </div>
       )}
 
+      {relinkModal.phase === "open" && (
+        <div className="modal-overlay" onClick={closeRelink}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 640 }}>
+            <div className="modal-header">
+              <h2>Relink Missing File</h2>
+              <button className="modal-close-btn" onClick={closeRelink} type="button">×</button>
+            </div>
+            <div className="modal-section">
+              <p className="subtle-text">
+                <strong title={relinkModal.subject.filePath}>{relinkModal.subject.filePath}</strong> no
+                longer exists. Pick the library file it was replaced by: this source's plays, rating,
+                playlist entries and note move onto it, and this source is deleted.
+              </p>
+              <input
+                className="relink-search"
+                type="search"
+                placeholder="Search title, artist, album or path…"
+                value={relinkModal.query}
+                autoFocus
+                disabled={relinkModal.status === "submitting"}
+                onChange={(e) => relinkDispatch({ type: "setQuery", query: e.target.value })}
+              />
+              {relinkModal.status === "loading" ? (
+                <p className="issue-empty">Searching…</p>
+              ) : relinkModal.candidates.length === 0 ? (
+                relinkModal.status === "ready" && relinkModal.error !== null ? null : (
+                  <p className="issue-empty">No matching files found.</p>
+                )
+              ) : (
+                <ul className="relink-candidate-list">
+                  {relinkModal.candidates.map((c) => (
+                    <li key={c.source_id}>
+                      <button
+                        type="button"
+                        className={`relink-candidate${relinkModal.selectedSourceId === c.source_id ? " relink-candidate-selected" : ""}`}
+                        disabled={relinkModal.status === "submitting"}
+                        onClick={() => relinkDispatch({ type: "select", sourceId: c.source_id })}
+                      >
+                        <span className="relink-candidate-title">
+                          <span>
+                            {c.title}
+                            {c.artist ? ` — ${c.artist}` : ""}
+                            {c.album ? ` (${c.album})` : ""}
+                          </span>
+                          <span>{c.duration_ms ? formatDuration(c.duration_ms) : null}</span>
+                        </span>
+                        {c.same_recording && (
+                          <span className="relink-candidate-same">Same recording</span>
+                        )}
+                        <span className="relink-candidate-path" title={c.file_path}>{c.file_path}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {relinkModal.status === "ready" && relinkModal.error !== null && (
+                <div className="error-banner">{relinkModal.error}</div>
+              )}
+            </div>
+            <div className="comparison-modal-footer">
+              <button className="comparison-cancel-btn" onClick={closeRelink} type="button">Cancel</button>
+              <button
+                className="comparison-confirm-btn"
+                disabled={relinkModal.status !== "ready" || relinkModal.selectedSourceId === null}
+                onClick={applyRelink}
+                type="button"
+              >
+                {relinkModal.status === "submitting" ? "Relinking…" : "Relink"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {removeMissing !== null && (
+        <div className="modal-overlay" onClick={closeRemoveMissing} role="dialog" aria-modal="true">
+          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 480 }}>
+            <div className="modal-header">
+              <h2>Remove Missing File</h2>
+              <button className="modal-close-btn" onClick={closeRemoveMissing} type="button">×</button>
+            </div>
+            <div className="modal-section">
+              <p className="subtle-text">
+                <strong title={removeMissing.subject.filePath}>{removeMissing.subject.filePath}</strong>
+              </p>
+              <p>
+                {removeMissing.subject.message}. Removing it permanently deletes this source together
+                with its play history, rating, playlist entries and file-issue note.
+              </p>
+              {removeMissing.error !== null && <div className="error-banner">{removeMissing.error}</div>}
+            </div>
+            <div className="comparison-modal-footer">
+              <button className="comparison-cancel-btn" onClick={closeRemoveMissing} type="button">Cancel</button>
+              <button
+                className="comparison-confirm-btn"
+                disabled={removeMissing.removing}
+                onClick={applyRemoveMissing}
+                type="button"
+              >
+                {removeMissing.removing ? "Removing…" : "Remove"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {artistFix.phase !== "closed" && (() => {
         const { artistName } = artistFix;
         const checking = artistFix.phase === "checking";
@@ -4205,6 +4401,25 @@ function App() {
                     setContextMenu(null);
                   }}>Clear file issue</button>
                 </li>}
+                {(() => {
+                  const missing = missingFileIssue(contextMenu.path);
+                  return missing === undefined ? null : (
+                    <>
+                      <li>
+                        <button className="ctx-menu-item" type="button" onClick={() => {
+                          openRelink(missing);
+                          setContextMenu(null);
+                        }}>Relink missing file…</button>
+                      </li>
+                      <li>
+                        <button className="ctx-menu-item" type="button" onClick={() => {
+                          openRemoveMissing(missing);
+                          setContextMenu(null);
+                        }}>Remove missing file…</button>
+                      </li>
+                    </>
+                  );
+                })()}
               </>
             )}
             {contextMenu.kind === "artist" && (
@@ -4370,7 +4585,6 @@ function App() {
               <FileIssueList
                 issues={fileIssues}
                 firstDupIndexByFile={firstDupIndexByFile}
-                fixingOrphans={fixingOrphans}
                 deletingBackups={deletingBackups}
                 actions={issueActions}
               />

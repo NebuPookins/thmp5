@@ -5,7 +5,8 @@ use crate::models::{
     ArtistDetail, ArtistReleaseGroup, ArtistRow, GuestAppearanceReleaseGroup, GuestAppearanceTrack,
     LibrarySummary, MediumDetail, MissingTrackDetail, RecordingArtistInfo, RecordingDetail,
     RecordingRow, ReleaseCompleteness, ReleaseDetail, ReleaseGroupDetail, ReleaseGroupRow,
-    ReleaseInfo, SmartPlaylistResult, SourceDetail, SourceRow, SourceTagInfo, TrackDetail,
+    ReleaseInfo, RelinkCandidate, SmartPlaylistResult, SourceDetail, SourceRow, SourceTagInfo,
+    TrackDetail,
 };
 use crate::query::{CmpOp, Expr, LastPlayedDir, LimitUnit, Predicate, StrOp, TimeUnit};
 use anyhow::{Context, Result};
@@ -233,6 +234,98 @@ impl MemoryCatalog {
         self.recording_index_by_source
             .get(source_id)
             .map(|&idx| self.recordings[idx].id.clone())
+    }
+
+    /// Local sources a missing source could be relinked onto, best matches first, at most
+    /// `limit`. The dead source itself is excluded. Existence of the files is not checked here.
+    ///
+    /// With a non-blank `query`, every whitespace-separated term must appear (case-insensitively)
+    /// in the title, artist, album or path. Otherwise the dead source's own title is used, so
+    /// that likely replacements show first. Sources in the dead source's own recording always
+    /// come first, then those that also match its artist.
+    pub fn relink_candidates(
+        &self,
+        dead_source_id: &str,
+        query: Option<&str>,
+        limit: usize,
+    ) -> Vec<RelinkCandidate> {
+        let dead_rec = self
+            .recording_index_by_source
+            .get(dead_source_id)
+            .map(|&idx| &self.recordings[idx]);
+        let query_terms: Vec<String> = query
+            .map(|q| q.split_whitespace().map(str::to_lowercase).collect())
+            .unwrap_or_default();
+        let default_title = dead_rec.map(|r| r.title.to_lowercase());
+        let default_artist =
+            dead_rec.and_then(|r| r.artist_credit_name.as_ref().map(|a| a.to_lowercase()));
+
+        let mut scored: Vec<(u8, RelinkCandidate)> = self
+            .recordings
+            .iter()
+            .flat_map(|rec| {
+                rec.sources
+                    .iter()
+                    .filter(|s| s.source_type == "local_file" && s.id != dead_source_id)
+                    .filter_map(move |s| s.file_path.as_ref().map(|path| (rec, s, path)))
+            })
+            .filter_map(|(rec, source, path)| {
+                let album = rec
+                    .release_group_assocs
+                    .first()
+                    .and_then(|a| self.rgs_by_id.get(&a.rg_id))
+                    .map(|&idx| self.release_groups[idx].title.clone());
+                let haystack = format!(
+                    "{}\n{}\n{}\n{}",
+                    rec.title,
+                    rec.artist_credit_name.as_deref().unwrap_or_default(),
+                    album.as_deref().unwrap_or_default(),
+                    path
+                )
+                .to_lowercase();
+                let same_recording = dead_rec.is_some_and(|d| d.id == rec.id);
+                let matches = if query_terms.is_empty() {
+                    default_title
+                        .as_ref()
+                        .is_some_and(|t| !t.is_empty() && haystack.contains(t.as_str()))
+                } else {
+                    query_terms.iter().all(|t| haystack.contains(t.as_str()))
+                };
+                if !matches && !(same_recording && query_terms.is_empty()) {
+                    return None;
+                }
+                let artist_matches = default_artist.as_ref().is_some_and(|a| {
+                    rec.artist_credit_name
+                        .as_deref()
+                        .is_some_and(|c| c.to_lowercase() == *a)
+                });
+                let rank = match (same_recording, artist_matches) {
+                    (true, _) => 0,
+                    (false, true) => 1,
+                    (false, false) => 2,
+                };
+                Some((
+                    rank,
+                    RelinkCandidate {
+                        source_id: source.id.clone(),
+                        file_path: path.clone(),
+                        recording_id: rec.id.clone(),
+                        title: rec.title.clone(),
+                        artist: rec.artist_credit_name.clone(),
+                        album,
+                        duration_ms: source.duration_ms,
+                        rating: source.rating(),
+                        same_recording,
+                    },
+                ))
+            })
+            .collect();
+        scored.sort_by_key(|(rank, _)| *rank);
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, candidate)| candidate)
+            .collect()
     }
 
     /// A lookup from file path to the rating of the recording that groups the
@@ -2132,5 +2225,69 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    async fn insert_tagged_source(
+        pool: &crate::db::DbPool,
+        id: &str,
+        path: &str,
+        hash: &str,
+        title: &str,
+        artist: &str,
+    ) {
+        let tags =
+            serde_json::json!([["TIT2", title], ["TPE1", artist], ["TALB", "Album"]]).to_string();
+        let mut conn = pool.acquire("test.insert_tagged_source").await.unwrap();
+        sqlx::query!(
+            "INSERT INTO source (id, source_type, file_path, file_hash, duration_ms, raw_tags_json)
+             VALUES (?, 'local_file', ?, ?, 1000, ?)",
+            id,
+            path,
+            hash,
+            tags,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relink_candidates_exclude_dead_source_and_rank_same_recording_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pool = crate::db::init_pool(&tmp.path().join("test.db"))
+            .await
+            .unwrap();
+        insert_tagged_source(&pool, "dead", "/old/song.mp3", "h1", "Song", "Band").await;
+        insert_tagged_source(&pool, "moved", "/new/song.mp3", "h1", "Song", "Band").await;
+        insert_tagged_source(&pool, "cover", "/x/cover.mp3", "h2", "Song", "Other").await;
+        insert_tagged_source(
+            &pool,
+            "unrelated",
+            "/x/other.mp3",
+            "h3",
+            "Different",
+            "Band",
+        )
+        .await;
+        let catalog = MemoryCatalog::load_from_db(&pool).await.unwrap();
+
+        let ids = |query: Option<&str>| -> Vec<String> {
+            catalog
+                .relink_candidates("dead", query, 50)
+                .into_iter()
+                .map(|c| c.source_id)
+                .collect()
+        };
+
+        assert_eq!(ids(None), ["moved", "cover"]);
+        assert_eq!(ids(Some("different band")), ["unrelated"]);
+        assert_eq!(ids(Some("CoVeR")), ["cover"]);
+        assert!(ids(Some("no such thing")).is_empty());
+        assert!(catalog
+            .relink_candidates("dead", None, 50)
+            .iter()
+            .find(|c| c.source_id == "moved")
+            .is_some_and(|c| c.same_recording));
+        assert_eq!(catalog.relink_candidates("dead", Some("song"), 1).len(), 1);
     }
 }

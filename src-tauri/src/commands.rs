@@ -1,7 +1,11 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::command_error::CommandError;
-use crate::file_issues::{sorted_by_rating_desc, FileIssue, FileIssueKind};
+use crate::file_issues::{sorted_by_rating_desc, suppress_for_missing, FileIssue, FileIssueKind};
 use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
+use crate::library::source_merge::{
+    delete_source, find_missing_sources, merge_source_into, source_file_state, user_data_of,
+    SourceFileState,
+};
 use crate::models::{
     AppBootstrap, AppConfig, ArtistDetail, ArtistRow, CompoundArtistCheck, DbPoolDebugSnapshot,
     EntityRatingUpdate, ExternalCommand, FixMergedRecordingsStats, Id3FrameDebugInfo,
@@ -9,8 +13,8 @@ use crate::models::{
     LastFmGetTrackLovedRequest, LastFmLoveTrackRequest, LastFmNowPlayingRequest,
     LastFmScrobbleRequest, LastFmStatus, LibrarySummary, PlayHistoryInput, PlayRequest,
     PlayerState, PlaylistRow, QueueSettingsUpdate, RecordingDetail, RecordingRatingUpdateResult,
-    RecordingRow, ReleaseGroupDetail, ReleaseGroupRow, SaveSmartPlaylistRequest, SeekRequest,
-    SmartPlaylistResult, SourceRatingUpdateRequest, VolumeRequest,
+    RecordingRow, ReleaseGroupDetail, ReleaseGroupRow, RelinkCandidate, SaveSmartPlaylistRequest,
+    SeekRequest, SmartPlaylistResult, SourceRatingUpdateRequest, VolumeRequest,
 };
 use crate::query;
 use crate::storage::{Announce, Catalog, CatalogReader};
@@ -18,6 +22,8 @@ use crate::AppState;
 use anyhow::Context;
 use serde::Serialize;
 use sqlx::Acquire;
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use tauri::Emitter;
 
@@ -764,6 +770,10 @@ pub async fn get_file_issues(
         .context("Failed to load corrupt audio issues")?;
         (manual, corrupt)
     };
+    // Scan the disk before taking the catalog lock, so a reload isn't blocked behind it.
+    let missing = find_missing_sources(&state.db)
+        .await
+        .context("Failed to look for sources whose files are missing")?;
 
     let catalog = state.catalog.read().await;
     // Recordings are derived in memory, so resolve each source's recording via the catalog.
@@ -800,13 +810,24 @@ pub async fn get_file_issues(
             row.note,
         )
     });
-    let issues = state
+    let missing_paths: HashSet<&str> = missing.iter().map(|m| m.file_path.as_str()).collect();
+    let missing_issues = missing.iter().map(|m| {
+        FileIssue::for_source(
+            FileIssueKind::MissingFile,
+            m.file_path.clone(),
+            m.id.clone(),
+            catalog.recording_id_for_source(&m.id),
+            m.issue_message(),
+        )
+    });
+    let detected_issues = state
         .file_issues
         .all()
         .into_iter()
         .chain(catalog.file_issues())
         .chain(corrupt_issues)
         .chain(manual_issues);
+    let issues = suppress_for_missing(detected_issues, &missing_paths).chain(missing_issues);
     Ok(sorted_by_rating_desc(
         issues,
         catalog.effective_rating_lookup(),
@@ -955,50 +976,167 @@ pub async fn delete_tag_frame(
     Ok(result)
 }
 
-/// Fix an orphan source by re-scanning its file metadata and re-creating the
-/// album structure (release-group / release / medium / track) so the recording
-/// becomes visible in the library.
+/// Whether a source's file is required to be gone or to be there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileExpectation {
+    Missing,
+    Present,
+}
+
+/// The file path of a source that is a local file in the state `expect` demands; rejects the
+/// request otherwise, so a live file's source is never removed or relinked away and a relink
+/// never targets a missing file. `role` names the source in rejection messages (e.g. "Source").
+async fn require_local_source(
+    conn: &mut sqlx::SqliteConnection,
+    source_id: &str,
+    role: &str,
+    expect: FileExpectation,
+) -> Result<String, CommandError> {
+    match (source_file_state(conn, source_id).await?, expect) {
+        (SourceFileState::FileMissing { file_path }, FileExpectation::Missing)
+        | (SourceFileState::FileExists { file_path }, FileExpectation::Present) => Ok(file_path),
+        (SourceFileState::NoSuchSource, _) => Err(CommandError::rejected(format!(
+            "{role} {source_id} not found"
+        ))),
+        (SourceFileState::NotLocalFile, _) => Err(CommandError::rejected(format!(
+            "{role} {source_id} is not a local file"
+        ))),
+        (SourceFileState::FileExists { file_path }, FileExpectation::Missing) => {
+            Err(CommandError::rejected(format!(
+                "{role} {source_id}: the file still exists, so it cannot be removed or relinked: {file_path}"
+            )))
+        }
+        (SourceFileState::FileMissing { file_path }, FileExpectation::Present) => {
+            Err(CommandError::rejected(format!(
+                "{role} {source_id}: the file is missing too: {file_path}"
+            )))
+        }
+    }
+}
+
+/// Delete a source whose file is missing, together with its plays, rating, playlist entries and
+/// note. Refuses if the file exists.
 #[tauri::command]
 #[tracing::instrument(skip_all, fields(source_id = %source_id))]
-pub async fn fix_orphan_source(
-    app: tauri::AppHandle,
+pub async fn remove_missing_source(
     state: tauri::State<'_, AppState>,
     source_id: String,
 ) -> Result<(), CommandError> {
-    let file_path = sqlx::query_scalar!("SELECT file_path FROM source WHERE id = ?", source_id)
-        .fetch_optional(state.db.raw_pool())
-        .await
-        .context("Failed to look up source")?
-        .flatten()
-        .ok_or_else(|| CommandError::rejected(format!("Source {source_id} not found")))?;
-    let source_path = std::path::Path::new(&file_path);
-    if !source_path.is_file() {
-        return Err(CommandError::rejected(format!(
-            "Source file is missing: {}",
-            source_path.display()
-        )));
+    {
+        let _permit = state
+            .write_serializer
+            .acquire()
+            .await
+            .context("Failed to acquire write lock for removing a missing source")?;
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.remove_missing_source source_id={source_id}"
+            ))
+            .await
+            .context("Failed to acquire connection")?;
+        let mut tx = conn.begin().await.context("Failed to begin transaction")?;
+        let file_path =
+            require_local_source(&mut tx, &source_id, "Source", FileExpectation::Missing).await?;
+        let lost = user_data_of(&mut tx, &source_id).await?;
+        delete_source(&mut tx, &source_id).await?;
+        tx.commit().await.context("Failed to commit removal")?;
+        tracing::info!(
+            %source_id,
+            %file_path,
+            plays = lost.plays,
+            stars = ?lost.stars,
+            playlist_entries = lost.playlist_entries,
+            "Removed source whose file is missing"
+        );
     }
-
-    state.pending_jobs.fetch_add(1, Ordering::Relaxed);
-    emit_job_update(&app, &state, "rescan");
-
-    let rescan = do_rescan_source(
-        &state.db,
-        source_path,
-        state.acoustid_api_key.as_deref(),
-        &state.write_serializer,
-        &state.file_issues,
-    )
-    .await
-    .map(|_| ())
-    .with_context(|| format!("Failed to fix orphan source {}", source_path.display()));
-
-    state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
-    emit_job_update(&app, &state, "rescan");
-    rescan?;
-
     reload_catalog(&state, Announce::Frontend).await;
     Ok(())
+}
+
+/// Move a missing source's plays, rating, playlist entries and note onto another library source
+/// whose file exists, then delete the missing source. Returns nothing; the catalog reload tells
+/// the frontend what changed.
+#[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %source_id, target_source_id = %target_source_id))]
+pub async fn relink_missing_source(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    target_source_id: String,
+) -> Result<(), CommandError> {
+    if source_id == target_source_id {
+        return Err(CommandError::rejected("Cannot relink a source onto itself"));
+    }
+    {
+        let _permit = state
+            .write_serializer
+            .acquire()
+            .await
+            .context("Failed to acquire write lock for relinking a missing source")?;
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.relink_missing_source source_id={source_id} target={target_source_id}"
+            ))
+            .await
+            .context("Failed to acquire connection")?;
+        let mut tx = conn.begin().await.context("Failed to begin transaction")?;
+        let dead_path =
+            require_local_source(&mut tx, &source_id, "Source", FileExpectation::Missing).await?;
+        let target_path = require_local_source(
+            &mut tx,
+            &target_source_id,
+            "Target source",
+            FileExpectation::Present,
+        )
+        .await?;
+        let summary = merge_source_into(&mut tx, &source_id, &target_source_id)
+            .await
+            .with_context(|| {
+                format!("Failed to merge source {source_id} ({dead_path}) into {target_source_id} ({target_path})")
+            })?;
+        tx.commit().await.context("Failed to commit relink")?;
+        tracing::info!(
+            %source_id,
+            %dead_path,
+            %target_source_id,
+            %target_path,
+            ?summary,
+            "Relinked missing source onto another source"
+        );
+    }
+    reload_catalog(&state, Announce::Frontend).await;
+    Ok(())
+}
+
+/// How many live relink candidates to return at most.
+const RELINK_CANDIDATE_LIMIT: usize = 50;
+
+/// Library sources a missing source could be relinked onto, filtered by `query` (or, if blank,
+/// matching the missing source's own title). Only sources whose files exist are returned.
+#[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %source_id, query = ?query))]
+pub async fn search_relink_candidates(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    query: Option<String>,
+) -> Result<Vec<RelinkCandidate>, CommandError> {
+    // Over-fetch, since some matches may be missing files themselves.
+    let candidates = state.catalog.read().await.relink_candidates(
+        &source_id,
+        query.as_deref(),
+        RELINK_CANDIDATE_LIMIT * 4,
+    );
+    let live = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|c| !crate::library::source_merge::file_is_missing(Path::new(&c.file_path)))
+            .take(RELINK_CANDIDATE_LIMIT)
+            .collect::<Vec<_>>()
+    })
+    .await
+    .context("Relink candidate existence check panicked")?;
+    Ok(live)
 }
 
 /// Enumerate conflicting frames across all consecutive ID3v2 tags in a file,
