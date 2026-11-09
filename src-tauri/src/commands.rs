@@ -13,7 +13,7 @@ use crate::models::{
     SmartPlaylistResult, SourceRatingUpdateRequest, VolumeRequest,
 };
 use crate::query;
-use crate::storage::{Catalog, CatalogReader};
+use crate::storage::{Announce, Catalog, CatalogReader};
 use crate::AppState;
 use anyhow::Context;
 use serde::Serialize;
@@ -40,9 +40,10 @@ fn emit_job_update(app: &tauri::AppHandle, state: &AppState, job_type: &str) {
 }
 
 /// Rebuild the in-memory catalog from the current database state.
-/// Called after any write that changes source or user data.
-async fn reload_catalog(state: &AppState) {
-    if let Err(e) = crate::storage::reload(&state.db, &state.catalog).await {
+/// Called after any write that changes source or user data. `announce` says
+/// whether the frontend is told to refresh (see [`Announce`]).
+async fn reload_catalog(state: &AppState, announce: Announce) {
+    if let Err(e) = state.catalog.reload(&state.db, announce).await {
         tracing::error!("Failed to reload memory catalog: {e:#}");
     }
 }
@@ -63,7 +64,7 @@ async fn rescan_and_reload(state: &AppState, path: &std::path::Path) -> anyhow::
     .await
     .map(|_| ())?;
 
-    reload_catalog(state).await;
+    reload_catalog(state, Announce::Frontend).await;
     Ok(())
 }
 
@@ -82,7 +83,7 @@ pub async fn import_paths(
         &state.write_serializer,
     )
     .await?;
-    reload_catalog(&state).await;
+    reload_catalog(&state, Announce::Frontend).await;
     Ok(result)
 }
 
@@ -163,7 +164,7 @@ pub async fn fix_merged_recordings(
         &state.write_serializer,
     )
     .await?;
-    reload_catalog(&state).await;
+    reload_catalog(&state, Announce::Frontend).await;
     Ok(result)
 }
 
@@ -221,7 +222,7 @@ pub async fn rescan_source(
     state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
     emit_job_update(&app, &state, "rescan");
 
-    reload_catalog(&state).await;
+    reload_catalog(&state, Announce::Frontend).await;
     Ok(result?)
 }
 
@@ -278,7 +279,7 @@ async fn rescan_path_list(
         emit_job_update(app, state, "rescan");
     }
 
-    reload_catalog(state).await;
+    reload_catalog(state, Announce::Frontend).await;
 
     // Each failure was already logged above with full context; the returned
     // error is only a summary so it is not logged a second time in full.
@@ -530,7 +531,7 @@ pub async fn record_play_history(
     .await
     .context("Failed to insert play history")?;
 
-    reload_catalog(&state).await;
+    reload_catalog(&state, Announce::Frontend).await;
     Ok(())
 }
 
@@ -696,7 +697,8 @@ pub async fn set_source_rating(
         };
     }
 
-    reload_catalog(&state).await;
+    // Quiet: the frontend applies the rating update returned below locally.
+    reload_catalog(&state, Announce::Quiet).await;
 
     // Find which recording this source belongs to via the in-memory catalog.
     let catalog = state.catalog.read().await;
@@ -995,7 +997,7 @@ pub async fn fix_orphan_source(
     emit_job_update(&app, &state, "rescan");
     rescan?;
 
-    reload_catalog(&state).await;
+    reload_catalog(&state, Announce::Frontend).await;
     Ok(())
 }
 
@@ -1064,7 +1066,7 @@ pub async fn apply_duplicate_merge(
             "Re-scan after tag merge failed; merge already applied"
         );
     }
-    reload_catalog(&state).await;
+    reload_catalog(&state, Announce::Frontend).await;
 
     Ok(write_result)
 }
@@ -1102,12 +1104,22 @@ fn compute_normalization_gain(
     (gain.clamp(0.1, 10.0) as f32, source)
 }
 
+/// Result of `play`: the source actually handed to the engine. It differs from
+/// the requested one when the requested file was missing and another source of
+/// the same recording was used instead. (The engine applies the request
+/// asynchronously, so a player snapshot taken here would still describe the
+/// previous track.)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlayStarted {
+    pub source_id: String,
+}
+
 #[tauri::command]
 #[tracing::instrument(skip_all, fields(source_id = %request.source_id))]
 pub async fn play(
     state: tauri::State<'_, AppState>,
     request: PlayRequest,
-) -> Result<PlayerState, CommandError> {
+) -> Result<PlayStarted, CommandError> {
     tracing::info!("Play command received");
     let mut conn = state
         .db
@@ -1288,7 +1300,7 @@ pub async fn play(
         })
         .with_context(|| format!("Failed to start playback of {file_path}"))?;
 
-    Ok(state.player.snapshot())
+    Ok(PlayStarted { source_id })
 }
 
 #[tauri::command]
@@ -1356,17 +1368,30 @@ pub async fn get_library_summary(
     Ok(state.catalog.read().await.get_library_summary().await?)
 }
 
+/// One page of recordings, tagged with the generation of the catalog it was
+/// read from so callers can detect a catalog swap between pages.
+#[derive(Debug, serde::Serialize)]
+pub struct RecordingPage {
+    pub generation: u64,
+    pub rows: Vec<RecordingRow>,
+}
+
 #[tauri::command]
 #[tracing::instrument(skip_all, fields(limit = ?limit, offset = ?offset))]
 pub async fn list_recordings(
     state: tauri::State<'_, AppState>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<Vec<RecordingRow>, CommandError> {
-    let limit = limit.unwrap_or(200) as usize;
-    let offset = offset.unwrap_or(0) as usize;
-    let all = state.catalog.read().await.list_recordings().await?;
-    Ok(all.into_iter().skip(offset).take(limit).collect())
+) -> Result<RecordingPage, CommandError> {
+    let limit = usize::try_from(limit.unwrap_or(200))
+        .map_err(|_| CommandError::rejected("limit must not be negative"))?;
+    let offset = usize::try_from(offset.unwrap_or(0))
+        .map_err(|_| CommandError::rejected("offset must not be negative"))?;
+    // Generation and rows come from one read guard, so they always agree.
+    let catalog = state.catalog.read().await;
+    let generation = catalog.generation();
+    let rows = catalog.list_recordings_page(offset, limit).await?;
+    Ok(RecordingPage { generation, rows })
 }
 
 #[tauri::command]
@@ -2194,7 +2219,7 @@ pub async fn split_recording(
         tx.commit().await.context("Failed to commit transaction")?;
     }
 
-    reload_catalog(&state).await;
+    reload_catalog(&state, Announce::Frontend).await;
 
     // Return the recording ID that the catalog assigned to the first moved source.
     let first_sid = source_ids_to_move
@@ -2209,6 +2234,31 @@ pub async fn split_recording(
             format!("Split succeeded but source {first_sid} is not in any recording after reload")
         })?;
     Ok(recording_id)
+}
+
+/// Severity of a message forwarded from the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrontendLogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Write a frontend message to the app log, so UI-side events show up next to
+/// backend ones. `context` is free-form structured data (ids, reasons, ...).
+#[tauri::command]
+#[tracing::instrument(skip_all, fields(?level))]
+pub fn log_frontend(level: FrontendLogLevel, message: String, context: Option<serde_json::Value>) {
+    const TARGET: &str = "thmp5_lib::frontend";
+    let context = context.map(|c| c.to_string()).unwrap_or_default();
+    match level {
+        FrontendLogLevel::Debug => tracing::debug!(target: TARGET, %context, "{message}"),
+        FrontendLogLevel::Info => tracing::info!(target: TARGET, %context, "{message}"),
+        FrontendLogLevel::Warn => tracing::warn!(target: TARGET, %context, "{message}"),
+        FrontendLogLevel::Error => tracing::error!(target: TARGET, %context, "{message}"),
+    }
 }
 
 #[cfg(test)]

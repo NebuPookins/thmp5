@@ -26,6 +26,8 @@ import {
   splitModalReducer,
 } from "./modalReducers";
 import { useRequestId } from "./useRequestId";
+import { frontendLog } from "./frontendLog";
+import { endedEventAppliesTo } from "./trackEnded";
 import { clampMenuPosition } from "./contextMenuPosition";
 import { FileIssueList, fileIssueLabel, type FileIssue, type FileIssueListActions } from "./FileIssueList";
 import "./App.css";
@@ -93,6 +95,30 @@ type AppBootstrap = {
 };
 
 const RECORDINGS_PAGE_SIZE = 5_000;
+const RECORDINGS_LOAD_MAX_ATTEMPTS = 3;
+
+/** Bookkeeping that serializes every library load; see `requestLibraryLoad`. */
+type CatalogSync = {
+  running: boolean;
+  /** Newest catalog generation announced by the backend. */
+  wantedGeneration: number;
+  /** Newest generation a load has been started for (successful or not). */
+  attemptedGeneration: number;
+  /** Explicit load requests made so far. */
+  forcedRequests: number;
+  /** Explicit load requests covered by a load that has completed. */
+  servedRequests: number;
+  waiters: { request: number; resolve: () => void }[];
+};
+
+/** What triggers a library load: a catalog generation the backend announced, or a caller that needs a fresh load. */
+type LibraryLoadRequest = { readonly generation: number } | { readonly force: true };
+
+/** Mirrors the backend's `RecordingPage`: rows plus the catalog generation they came from. */
+type RecordingPage = {
+  generation: number;
+  rows: RecordingRow[];
+};
 // How often the open File Issues panel re-fetches the list.
 const FILE_ISSUES_POLL_MS = 5_000;
 
@@ -144,6 +170,9 @@ type PlaylistRow = {
 };
 
 type PlaybackStatus = "stopped" | "loading" | "playing" | "paused";
+
+/** Mirrors `commands::PlayStarted`: the source the backend actually started. */
+type PlayStarted = { source_id: string };
 
 type PlayerState = {
   status: PlaybackStatus;
@@ -642,6 +671,13 @@ const POMODORO_PRESETS = [
   { durationMs: 5 * 60 * 1000 }, // 5m quick break
 ];
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Why the current track was cleared; logged so the cause shows up in thmp5.log. */
+type ClearReason = "track ended" | "track failed" | "skip" | "play error";
+
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
   const [recordings, setRecordings] = useState<RecordingRow[]>([]);
@@ -654,6 +690,9 @@ function App() {
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const currentTrackRef = useRef<QueueItem | null>(null);
   const playerSourceIdRef = useRef<string | null>(null);
+  // The source the backend actually started for a requested one (they differ
+  // when a missing file fell back to another copy). Set when `play` resolves.
+  const startedSourceRef = useRef<{ requested: string; actual: string } | null>(null);
   const [playerState, setPlayerState] = useState<PlayerState>(DEFAULT_PLAYER_STATE);
   const [search, setSearch] = useState("");
   const [selectedArtistId, setSelectedArtistId] = useState<string | null>(null);
@@ -1024,25 +1063,69 @@ function App() {
     overscan: 10,
   });
 
-  async function loadRecordings() {
-    const rows: RecordingRow[] = [];
-    let offset = 0;
+  const loadedGenerationRef = useRef(0);
+  const catalogSyncRef = useRef<CatalogSync>({
+    running: false,
+    wantedGeneration: 0,
+    attemptedGeneration: 0,
+    forcedRequests: 0,
+    servedRequests: 0,
+    waiters: [],
+  });
+  const libraryReadyRef = useRef(false);
 
-    while (true) {
-      const page = await invoke<RecordingRow[]>("list_recordings", {
+  /** Loads every recording and returns the catalog generation they were read from. */
+  async function loadRecordings(): Promise<number> {
+    // Pages are only consistent with each other when read from one catalog
+    // generation, so a catalog reload mid-pagination restarts the load. The
+    // final attempt is not strict: it logs the change and keeps going rather
+    // than leave the list empty.
+    type PagedLoad =
+      | { readonly kind: "loaded"; readonly rows: RecordingRow[]; readonly generation: number }
+      | { readonly kind: "changed"; readonly from: number; readonly to: number };
+
+    const loadPages = async (
+      strict: boolean,
+      generation: number | null = null,
+      pages: readonly RecordingRow[][] = [],
+      offset = 0,
+    ): Promise<PagedLoad> => {
+      const page = await invoke<RecordingPage>("list_recordings", {
         limit: RECORDINGS_PAGE_SIZE,
         offset,
       });
-      rows.push(...page);
-
-      if (page.length < RECORDINGS_PAGE_SIZE) {
-        break;
+      if (generation !== null && page.generation !== generation) {
+        if (strict) {
+          return { kind: "changed", from: generation, to: page.generation };
+        }
+        frontendLog("error", "Catalog changed while loading recordings on the final attempt; rows may be missing until the next reload", {
+          attempts: RECORDINGS_LOAD_MAX_ATTEMPTS,
+          oldGeneration: generation,
+          newGeneration: page.generation,
+        });
       }
+      // Generations only grow, so the first page's is the oldest. A torn
+      // result reports that one, so the newer generation still gets reloaded.
+      const oldest = generation ?? page.generation;
+      const loaded = [...pages, page.rows];
+      return page.rows.length < RECORDINGS_PAGE_SIZE
+        ? { kind: "loaded", rows: loaded.flat(), generation: oldest }
+        : loadPages(strict, oldest, loaded, offset + page.rows.length);
+    };
 
-      offset += page.length;
+    for (let attempt = 1; ; attempt++) {
+      const result = await loadPages(attempt < RECORDINGS_LOAD_MAX_ATTEMPTS);
+      if (result.kind === "loaded") {
+        setRecordings(result.rows);
+        loadedGenerationRef.current = Math.max(loadedGenerationRef.current, result.generation);
+        return result.generation;
+      }
+      frontendLog("warn", "Catalog changed while loading recordings; restarting", {
+        attempt,
+        oldGeneration: result.from,
+        newGeneration: result.to,
+      });
     }
-
-    setRecordings(rows);
   }
 
   async function loadAllTags() {
@@ -1267,6 +1350,70 @@ function App() {
     })();
   }
 
+  /**
+   * The only way to load library data. Loads never overlap, so a stale result
+   * cannot overwrite a newer one. Requests arriving mid-load are folded into
+   * one follow-up load. A generation request is skipped when that generation
+   * is already loaded. The returned promise resolves once a load that started
+   * after the request was made has completed (immediately for a generation
+   * request, which nobody awaits).
+   */
+  function requestLibraryLoad(request: LibraryLoadRequest): Promise<void> {
+    const sync = catalogSyncRef.current;
+    if ("generation" in request) {
+      if (!libraryReadyRef.current) {
+        frontendLog("debug", "Skipped catalog-reloaded: library not set up yet", {
+          generation: request.generation,
+        });
+        return Promise.resolve();
+      }
+      sync.wantedGeneration = Math.max(sync.wantedGeneration, request.generation);
+    } else {
+      sync.forcedRequests += 1;
+    }
+    const ticket = "force" in request ? sync.forcedRequests : 0;
+    const done =
+      ticket > 0
+        ? new Promise<void>((resolve) => sync.waiters.push({ request: ticket, resolve }))
+        : Promise.resolve();
+    if (sync.running) {
+      frontendLog("debug", "Coalesced library load request into the load in flight", { ...request });
+    } else {
+      void runLibraryLoads();
+    }
+    return done;
+  }
+
+  async function runLibraryLoads() {
+    const sync = catalogSyncRef.current;
+    sync.running = true;
+    try {
+      const pending = () =>
+        sync.forcedRequests > sync.servedRequests ||
+        sync.wantedGeneration > Math.max(sync.attemptedGeneration, loadedGenerationRef.current);
+      while (pending()) {
+        const targetGeneration = sync.wantedGeneration;
+        const targetRequests = sync.forcedRequests;
+        frontendLog("debug", "Loading library data", {
+          targetGeneration,
+          loaded: loadedGenerationRef.current,
+        });
+        // loadLibraryData logs and reports its own failures and never rejects.
+        // Recording the targets afterwards (not on success) keeps a persistent
+        // failure from spinning this loop.
+        await loadLibraryDataRef.current();
+        sync.attemptedGeneration = targetGeneration;
+        sync.servedRequests = targetRequests;
+        sync.waiters
+          .filter((waiter) => waiter.request <= targetRequests)
+          .forEach((waiter) => waiter.resolve());
+        sync.waiters = sync.waiters.filter((waiter) => waiter.request > targetRequests);
+      }
+    } finally {
+      sync.running = false;
+    }
+  }
+
   async function loadLibraryData(nextArtistId = selectedArtistId, nextSearch = search) {
     try {
       await loadRecordings();
@@ -1278,6 +1425,7 @@ function App() {
       await loadAllTags();
       await loadPlaylists();
     } catch (loadError) {
+      frontendLog("error", "loadLibraryData failed", { error: errorMessage(loadError) });
       await reportPoolTimeout("loadLibraryData", loadError);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     }
@@ -1399,8 +1547,27 @@ function App() {
       return;
     }
 
-    void loadLibraryData();
+    void requestLibraryLoad({ force: true });
   }, [bootstrap?.needs_setup]);
+
+  // Always points at the latest render's loadLibraryData (current artist/search),
+  // so the long-lived catalog-reloaded listener never loads with stale selections.
+  const loadLibraryDataRef = useRef(loadLibraryData);
+  loadLibraryDataRef.current = loadLibraryData;
+  libraryReadyRef.current = bootstrap !== null && !bootstrap.needs_setup;
+
+  useEffect(() => {
+    let isMounted = true;
+    const unlistenPromise = listen<{ generation: number }>("catalog-reloaded", (event) => {
+      if (isMounted) {
+        void requestLibraryLoad({ generation: event.payload.generation });
+      }
+    });
+    return () => {
+      isMounted = false;
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   useEffect(() => {
     if (!bootstrap || bootstrap.needs_setup) {
@@ -1431,7 +1598,6 @@ function App() {
     }
 
     const isRunning = bootstrap.import_progress.is_running;
-    let wasRunning = isRunning;
     let cancelled = false;
     let timeoutId: number | null = null;
 
@@ -1448,12 +1614,6 @@ function App() {
               }
             : current,
         );
-
-        const shouldReloadLibrary = wasRunning && !progress.is_running;
-        wasRunning = progress.is_running;
-        if (shouldReloadLibrary) {
-          await loadLibraryData(selectedArtistId, search);
-        }
 
         if (!cancelled) {
           const interval = progress.is_running ? 2000 : 60000;
@@ -1483,7 +1643,7 @@ function App() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [bootstrap?.needs_setup, bootstrap?.import_progress.is_running, search, selectedArtistId]);
+  }, [bootstrap?.needs_setup, bootstrap?.import_progress.is_running]);
 
   useEffect(() => {
     if (recordings.length === 0) {
@@ -1535,10 +1695,22 @@ function App() {
         if (!isMounted) {
           return;
         }
+        const currentId = currentTrackRef.current?.source.id;
+        const started = startedSourceRef.current;
+        const startedId = started && started.requested === currentId ? started.actual : undefined;
+        if (!endedEventAppliesTo(event.payload.source_id, [currentId, startedId])) {
+          frontendLog("info", "Ignored stale player-track-ended event", {
+            ended_source_id: event.payload.source_id,
+            current_source_id: currentId ?? null,
+            started_source_id: startedId ?? null,
+            reason: event.payload.reason,
+          });
+          return;
+        }
         if (event.payload.reason === "failed") {
-          clearCurrentTrack();
+          clearCurrentTrack("track failed");
         } else {
-          void completeCurrentTrack(event.payload.position_ms);
+          completeCurrentTrack(event.payload.position_ms, "track ended");
         }
       });
       const unlistenError = await listen<PlayerErrorEvent>("player-error", (event) => {
@@ -1550,9 +1722,6 @@ function App() {
         if (isMounted) {
           setPendingJobs(Math.max(0, event.payload.remaining));
           setCurrentJobType(event.payload.job_type);
-          if (event.payload.remaining <= 0 && !bootstrap?.import_progress.is_running) {
-            void loadLibraryData(selectedArtistId, search);
-          }
         }
       });
       let lastDamaged = 0;
@@ -1643,12 +1812,7 @@ function App() {
     }
 
     setError(null);
-    void invoke<PlayerState>("play", {
-      request: { source_id: currentTrack.source.id },
-    }).catch((playError) => {
-      setError(playError instanceof Error ? playError.message : String(playError));
-      setCurrentTrack(null);
-    });
+    startPlayback(currentTrack.source.id);
   }, [currentTrack?.source.id]);
 
   useEffect(() => {
@@ -1796,39 +1960,68 @@ function App() {
   const nowPlayingLoved = currentTrack !== null && (currentTrackLoved || hasTrack(lovedKeys, currentTrack.artist_credit_name, currentTrack.title));
   playerSourceIdRef.current = playerState.source_id;
 
-  async function completeCurrentTrack(positionMs?: number) {
+  /**
+   * Apply the UI transition for a finished track synchronously (so a newer
+   * track started meanwhile is never clobbered), then record the play and
+   * refresh the library in the background.
+   */
+  function completeCurrentTrack(positionMs: number | undefined, reason: ClearReason) {
     const finishedTrack = currentTrackRef.current;
     if (finishedTrack) {
-      try {
-        await invoke("record_play_history", {
-          input: {
-            source_id: finishedTrack.source.id,
-            duration_played_ms: positionMs ?? playerState.position_ms,
-          },
-        });
-      } catch (recordError) {
-        setError(recordError instanceof Error ? recordError.message : String(recordError));
-      }
-      void loadRecordings();
-      void (async () => {
-        try {
-          const artistRows = await loadArtists();
-          const resolvedArtistId = selectedArtistId && artistRows.some((artist) => artist.id === selectedArtistId)
-            ? selectedArtistId
-            : null;
-          await loadReleaseGroups(resolvedArtistId, search);
-        } catch (reloadError) {
-          setError(reloadError instanceof Error ? reloadError.message : String(reloadError));
-        }
-      })();
-
       setHistory((current) => [finishedTrack, ...current].slice(0, queueHistoryLimit));
     }
-
-    clearCurrentTrack();
+    clearCurrentTrack(reason);
+    if (finishedTrack) {
+      void recordPlayAndRefresh(finishedTrack, positionMs ?? playerState.position_ms);
+    }
   }
 
-  function clearCurrentTrack() {
+  /** Background bookkeeping after a track finishes; never touches the current track or reloads the library itself. */
+  async function recordPlayAndRefresh(finishedTrack: QueueItem, playedMs: number) {
+    const sourceId = finishedTrack.source.id;
+    try {
+      await invoke("record_play_history", {
+        input: { source_id: sourceId, duration_played_ms: playedMs },
+      });
+    } catch (recordError) {
+      frontendLog("error", "record_play_history failed", {
+        source_id: sourceId,
+        duration_played_ms: playedMs,
+        error: errorMessage(recordError),
+      });
+      setError(errorMessage(recordError));
+    }
+    // The backend reloads its catalog when the play is recorded and announces
+    // it with `catalog-reloaded`, which refreshes the library.
+  }
+
+  /** The single place that asks the backend to play a source. */
+  function startPlayback(sourceId: string) {
+    void invoke<PlayStarted>("play", { request: { source_id: sourceId } }).then((started) => {
+      if (currentTrackRef.current?.source.id === sourceId) {
+        startedSourceRef.current = { requested: sourceId, actual: started.source_id };
+      }
+    }, (playError: unknown) => {
+      const stillCurrent = currentTrackRef.current?.source.id === sourceId;
+      frontendLog("error", "play invoke failed", {
+        source_id: sourceId,
+        still_current: stillCurrent,
+        error: errorMessage(playError),
+      });
+      setError(errorMessage(playError));
+      // A late failure for a track that's already been replaced must not clear the newer one.
+      if (stillCurrent) {
+        clearCurrentTrack("play error");
+      }
+    });
+  }
+
+  function clearCurrentTrack(reason: ClearReason) {
+    frontendLog("info", "Clearing current track", {
+      reason,
+      source_id: currentTrackRef.current?.source.id ?? null,
+      player_source_id: playerSourceIdRef.current,
+    });
     setCurrentTrack(null);
     setPlayerState((current) => ({
       ...current,
@@ -1858,7 +2051,7 @@ function App() {
         library_summary: summary,
       });
       setQueueHistoryLimitInput(String(config.queue_history_limit));
-      await loadLibraryData();
+      await requestLibraryLoad({ force: true });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : String(submitError));
     } finally {
@@ -1960,9 +2153,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleFileIssue(path: string, existingNote: string | null) {
@@ -1993,9 +2187,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleRescanArtist(artistId: string) {
@@ -2005,9 +2200,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleRescanRecording(recordingId: string) {
@@ -2017,9 +2213,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   async function handleRescanReleaseGroup(releaseGroupId: string) {
@@ -2029,9 +2226,10 @@ function App() {
     } catch (rescanError) {
       await reportPoolTimeout("source rescan", rescanError);
       setError(rescanError instanceof Error ? rescanError.message : String(rescanError));
-    } finally {
-      await loadLibraryData(selectedArtistId, search);
     }
+    // A rescan that changes anything makes the backend reload and announce its
+    // catalog (`catalog-reloaded`), which refreshes the library. A rejected
+    // rescan changes nothing, so there is nothing to refresh.
   }
 
   function openRecordingContextMenu(e: React.MouseEvent, recording: RecordingRow) {
@@ -2170,12 +2368,22 @@ function App() {
   }
 
   async function handleSkip() {
+    const skippedSourceId = currentTrackRef.current?.source.id;
+    const skippedPositionMs = playerState.position_ms;
     try {
       await invoke<PlayerState>("stop");
     } catch (stopError) {
-      setError(stopError instanceof Error ? stopError.message : String(stopError));
+      setError(errorMessage(stopError));
     }
-    await completeCurrentTrack(playerState.position_ms);
+    // The track may have ended (and been replaced) during the await; don't skip its successor.
+    if (currentTrackRef.current?.source.id !== skippedSourceId) {
+      frontendLog("info", "Skip superseded: current track changed while stopping", {
+        skipped_source_id: skippedSourceId ?? null,
+        current_source_id: currentTrackRef.current?.source.id ?? null,
+      });
+      return;
+    }
+    completeCurrentTrack(skippedPositionMs, "skip");
   }
 
   async function handleSeek(nextPositionMs: number) {
@@ -2203,7 +2411,7 @@ function App() {
         sourceIdsToMove,
       });
       splitDispatch({ type: "submitOk", requestId });
-      await loadLibraryData(selectedArtistId, search);
+      await requestLibraryLoad({ force: true });
       dispatchNav({ type: "navigate", nav: { type: "recording", id: newId } });
     } catch (e) {
       splitDispatch({ type: "submitErr", requestId, error: e instanceof Error ? e.message : String(e) });
@@ -2455,13 +2663,17 @@ function App() {
     if (currentTrack) {
       setHistory((prev) => [currentTrack, ...prev].slice(0, queueHistoryLimit));
     }
-    setCurrentTrack(targetTrack);
-    void invoke<PlayerState>("play", {
-      request: { source_id: targetTrack.source.id },
-    }).catch((playError) => {
-      console.error(`Failed to play ${issue.file_path} from the File Issues panel`, playError);
-      setError(playError instanceof Error ? playError.message : String(playError));
+    frontendLog("info", "Play from File Issues panel", {
+      file_path: issue.file_path,
+      source_id: targetTrack.source.id,
+      previous_source_id: currentTrack?.source.id ?? null,
     });
+    setCurrentTrack(targetTrack);
+    // The currentTrack?.source.id effect issues the play. It won't re-fire for
+    // the same source, so restart that one explicitly.
+    if (currentTrack?.source.id === targetTrack.source.id) {
+      startPlayback(targetTrack.source.id);
+    }
   }
 
   // The player position re-renders App about 4x a second, so FileIssueList is
@@ -2927,7 +3139,7 @@ function App() {
                   }}
                   onRescanRecording={(recordingId) => { void handleRescanRecording(recordingId); }}
                   onRescanReleaseGroup={(releaseGroupId) => { void handleRescanReleaseGroup(releaseGroupId); }}
-                  onRefreshLibrary={() => { void loadLibraryData(selectedArtistId, search); }}
+                  onRefreshLibrary={() => { void requestLibraryLoad({ force: true }); }}
                   onSplitRecording={(recordingId) => openSplit(recordingId)}
                 />
               ) : browserLeftTab === "smartplaylists" ? (

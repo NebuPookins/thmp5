@@ -25,12 +25,12 @@ use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 
 pub struct AppState {
     pub db: DbPool,
     /// In-memory catalog rebuilt from `source.raw_tags_json` on startup and after every write.
-    pub catalog: Arc<RwLock<storage::Catalog>>,
+    pub catalog: storage::CatalogStore,
     /// AcoustID client API key, read from the `ACOUSTID_API_KEY` environment variable.
     /// AcoustID lookups are skipped when this is `None`.
     pub acoustid_api_key: Option<String>,
@@ -216,13 +216,16 @@ pub fn run() {
             memory_diagnostics::log_snapshot("before_catalog_load");
             let catalog = tauri::async_runtime::block_on(storage::load(&pool))
                 .map_err(|e| format!("Failed to build in-memory catalog: {e}"))?;
-            let catalog = Arc::new(RwLock::new(catalog));
+            let catalog = storage::CatalogStore::new(
+                catalog,
+                Arc::new(storage::TauriReloadNotifier::new(app.handle().clone())),
+            );
             memory_diagnostics::log_snapshot("after_catalog_load");
-            memory_diagnostics::spawn_periodic_logging(Arc::clone(&catalog), file_issues.clone());
+            memory_diagnostics::spawn_periodic_logging(catalog.clone(), file_issues.clone());
             let importer = ImportManager::new(
                 file_issues.clone(),
                 write_serializer.clone(),
-                Arc::clone(&catalog),
+                catalog.clone(),
             );
             let state = AppState {
                 db: pool.clone(),
@@ -252,6 +255,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::log_frontend,
             commands::import_paths,
             commands::fix_merged_recordings,
             commands::get_app_bootstrap,
