@@ -1892,6 +1892,21 @@ thead th {
   gap: 5px;
 }
 
+.comparison-side-current {
+  outline: 2px solid #4caf50;
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
+.comparison-now-playing {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #4caf50;
+  color: #fff;
+  font-size: 0.7rem;
+}
+
 .comparison-side-label {
   font-size: 0.7rem;
   text-transform: uppercase;
@@ -1961,6 +1976,17 @@ thead th {
 }
 .comparison-confirm-btn:hover:not(:disabled) { background: #5a9c6a; }
 .comparison-confirm-btn:disabled { opacity: 0.5; cursor: default; }
+
+.comparison-danger-btn {
+  background: #8a2f2f;
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.comparison-danger-btn:hover:not(:disabled) { background: #b03c3c; }
+.comparison-danger-btn:disabled { opacity: 0.5; cursor: default; }
 
 .comparison-cancel-btn,
 .comparison-back-btn {

@@ -207,9 +207,18 @@ export function splitModalReducer(state: SplitModalState, action: SplitModalActi
   }
 }
 
-// ── Relink-missing-source modal ─────────────────────────────────────────────
+// ── Relink-missing / replace-corrupt source modal ───────────────────────────
 
-/** The missing source being relinked. */
+/** How the corrupt file is disposed of when replaced; mirrors Rust `FileDisposal`. */
+export type FileDisposal = "trash" | "delete";
+
+/** Result of `replace_corrupt_source`; mirrors Rust `ReplaceCorruptOutcome`. */
+export type ReplaceCorruptOutcome = { outcome: "replaced" } | { outcome: "trash_failed"; message: string };
+
+/** What is wrong with the source: its file is gone (relink), or its audio is damaged (replace). */
+export type RelinkKind = "relink_missing" | "replace_corrupt";
+
+/** The source whose data is moved onto another source. */
 export type RelinkSubject = {
   sourceId: string;
   filePath: string;
@@ -230,42 +239,86 @@ export type RelinkCandidate = {
   same_recording: boolean;
 };
 
+/**
+ * Where the flow is: picking a replacement, or comparing the subject with the selected one
+ * before confirming. Relink-missing flows are always in "pick".
+ */
+export type RelinkStep = "pick" | "compare";
+
+/**
+ * Why the last submission or search failed. `trash_failed` means the corrupt file could not be
+ * moved to the trash and nothing was changed, so a permanent delete may be offered.
+ */
+export type RelinkError = { kind: "plain"; message: string } | { kind: "trash_failed"; message: string };
+
 export type RelinkModalState =
   | { phase: "closed" }
   | {
       phase: "open";
+      kind: RelinkKind;
       subject: RelinkSubject;
       /** What the user has typed in the search box. */
       query: string;
       /** The query of the most recently issued search; differs from `query` while typing. */
       issuedQuery: string;
       requestId: number;
+      step: RelinkStep;
       candidates: RelinkCandidate[];
       selectedSourceId: string | null;
       status: "loading" | "ready" | "submitting";
-      error: string | null;
+      error: RelinkError | null;
     };
 
 export type RelinkModalAction =
-  | { type: "open"; subject: RelinkSubject; requestId: number }
+  | { type: "open"; kind: RelinkKind; subject: RelinkSubject; requestId: number }
   | { type: "setQuery"; query: string }
   | { type: "search"; query: string; requestId: number }
   | { type: "searchOk"; requestId: number; candidates: RelinkCandidate[] }
   | { type: "searchErr"; requestId: number; error: string }
   | { type: "select"; sourceId: string }
+  | { type: "compare" }
+  | { type: "back" }
   | { type: "submit" }
   | { type: "submitOk"; requestId: number }
   | { type: "submitErr"; requestId: number; error: string }
+  | { type: "trashFailed"; requestId: number; message: string }
   | { type: "close" };
+
+/**
+ * Whether the modal's confirm action may run: a selection is made and nothing is in flight. A
+ * corrupt file is only replaced from the comparison step; a missing file is relinked straight
+ * from the list.
+ */
+/** Whether a replace-corrupt modal can move from picking a replacement to comparing it. */
+export function canCompareRelink(state: RelinkModalState): boolean {
+  return (
+    state.phase === "open" &&
+    state.kind === "replace_corrupt" &&
+    state.step === "pick" &&
+    state.status === "ready" &&
+    state.selectedSourceId !== null
+  );
+}
+
+export function canSubmitRelink(state: RelinkModalState): boolean {
+  return (
+    state.phase === "open" &&
+    state.status === "ready" &&
+    state.selectedSourceId !== null &&
+    (state.kind === "relink_missing" || state.step === "compare")
+  );
+}
 
 export function relinkModalReducer(state: RelinkModalState, action: RelinkModalAction): RelinkModalState {
   if (action.type === "open") {
     return {
       phase: "open",
+      kind: action.kind,
       subject: action.subject,
       query: "",
       issuedQuery: "",
       requestId: action.requestId,
+      step: "pick",
       candidates: [],
       selectedSourceId: null,
       status: "loading",
@@ -273,11 +326,13 @@ export function relinkModalReducer(state: RelinkModalState, action: RelinkModalA
     };
   }
   if (state.phase === "closed") return state;
+  // The search box and the candidate list are only live while picking.
+  const picking = state.step === "pick";
   switch (action.type) {
     case "setQuery":
-      return state.status === "submitting" ? state : { ...state, query: action.query };
+      return state.status === "submitting" || !picking ? state : { ...state, query: action.query };
     case "search":
-      return state.status === "submitting"
+      return state.status === "submitting" || !picking
         ? state
         : { ...state, query: action.query, issuedQuery: action.query, requestId: action.requestId, status: "loading", error: null };
     case "searchOk":
@@ -291,21 +346,32 @@ export function relinkModalReducer(state: RelinkModalState, action: RelinkModalA
       return state;
     case "searchErr":
       if (state.status === "loading" && state.requestId === action.requestId) {
-        return { ...state, status: "ready", candidates: [], selectedSourceId: null, error: action.error };
+        return { ...state, status: "ready", candidates: [], selectedSourceId: null, error: { kind: "plain", message: action.error } };
       }
       return state;
     case "select":
-      if (state.status === "ready" && state.candidates.some((c) => c.source_id === action.sourceId)) {
-        return { ...state, selectedSourceId: action.sourceId };
+      if (picking && state.status === "ready" && state.candidates.some((c) => c.source_id === action.sourceId)) {
+        return { ...state, selectedSourceId: action.sourceId, error: null };
       }
       return state;
+    case "compare":
+      return canCompareRelink(state)
+        ? { ...state, step: "compare", error: null }
+        : state;
+    case "back":
+      return state.status === "ready" && !picking ? { ...state, step: "pick", error: null } : state;
     case "submit":
-      return state.status === "ready" && state.selectedSourceId !== null ? { ...state, status: "submitting", error: null } : state;
+      return canSubmitRelink(state) ? { ...state, status: "submitting", error: null } : state;
     case "submitOk":
       return state.status === "submitting" && state.requestId === action.requestId ? { phase: "closed" } : state;
     case "submitErr":
       if (state.status === "submitting" && state.requestId === action.requestId) {
-        return { ...state, status: "ready", error: action.error };
+        return { ...state, status: "ready", error: { kind: "plain", message: action.error } };
+      }
+      return state;
+    case "trashFailed":
+      if (state.status === "submitting" && state.requestId === action.requestId) {
+        return { ...state, status: "ready", error: { kind: "trash_failed", message: action.message } };
       }
       return state;
     case "close":

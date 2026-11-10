@@ -7,6 +7,7 @@ const source = (id: string, rating: number | null): SourceRow => ({
   id,
   file_path: null,
   duration_ms: null,
+  format: null,
   rating,
   play_count: 0,
   last_played: null,

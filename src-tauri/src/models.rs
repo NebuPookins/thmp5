@@ -146,6 +146,7 @@ pub struct SourceRow {
     pub id: String,
     pub file_path: Option<String>,
     pub duration_ms: Option<i64>,
+    pub format: Option<String>,
     pub rating: Option<f64>,
     pub play_count: i64,
     pub last_played: Option<String>,

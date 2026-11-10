@@ -37,6 +37,7 @@ export function makeRecording(
     id: base.primary_source_id,
     file_path: base.primary_source_path,
     duration_ms: base.duration_ms,
+    format: null,
     rating: base.rating,
     play_count: base.play_count,
     last_played: base.last_played,

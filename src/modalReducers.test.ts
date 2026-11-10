@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   artistFixReducer,
   mergeModalReducer,
+  canCompareRelink,
+  canSubmitRelink,
   relinkModalReducer,
   splitModalReducer,
   type ArtistFixState,
@@ -10,6 +12,7 @@ import {
   type RelinkCandidate,
   type RelinkModalState,
   type RelinkSubject,
+  type RelinkKind,
   type SplitModalState,
   type SplitRecordingDetail,
 } from "./modalReducers";
@@ -187,8 +190,8 @@ function candidate(sourceId: string): RelinkCandidate {
   };
 }
 
-function readyWith(ids: string[], selected: string | null): RelinkModalState {
-  const opened = relinkModalReducer({ phase: "closed" }, { type: "open", subject, requestId: 1 });
+function readyWith(ids: string[], selected: string | null, kind: RelinkKind = "relink_missing"): RelinkModalState {
+  const opened = relinkModalReducer({ phase: "closed" }, { type: "open", kind, subject, requestId: 1 });
   const ready = relinkModalReducer(opened, { type: "searchOk", requestId: 1, candidates: ids.map(candidate) });
   return selected === null ? ready : relinkModalReducer(ready, { type: "select", sourceId: selected });
 }
@@ -208,7 +211,7 @@ describe("relinkModalReducer", () => {
   });
 
   it("drops a search response that arrives after the modal was closed", () => {
-    const opened = relinkModalReducer({ phase: "closed" }, { type: "open", subject, requestId: 1 });
+    const opened = relinkModalReducer({ phase: "closed" }, { type: "open", kind: "relink_missing", subject, requestId: 1 });
     const closed = relinkModalReducer(opened, { type: "close" });
     expect(relinkModalReducer(closed, { type: "searchOk", requestId: 1, candidates: [candidate("a")] })).toEqual({ phase: "closed" });
   });
@@ -242,7 +245,7 @@ describe("relinkModalReducer", () => {
   it("returns to the results with the error when the submission fails", () => {
     const submitting = relinkModalReducer(readyWith(["a"], "a"), { type: "submit" });
     const failed = relinkModalReducer(submitting, { type: "submitErr", requestId: 1, error: "boom" });
-    expect(failed).toMatchObject({ phase: "open", status: "ready", error: "boom", selectedSourceId: "a" });
+    expect(failed).toMatchObject({ phase: "open", status: "ready", error: { kind: "plain", message: "boom" }, selectedSourceId: "a" });
   });
 
   it("ignores searches while submitting", () => {
@@ -261,5 +264,94 @@ describe("relinkModalReducer", () => {
     const submitting = relinkModalReducer(readyWith(["a"], "a"), { type: "submit" });
     expect(relinkModalReducer(submitting, { type: "setQuery", query: "x" })).toBe(submitting);
     expect(relinkModalReducer(submitting, { type: "close" })).toBe(submitting);
+  });
+});
+
+// ── relinkModalReducer: replace_corrupt ─────────────────────────────────────
+
+const corruptReady = (selected: string | null) => readyWith(["a", "b"], selected, "replace_corrupt");
+
+/** A replace-corrupt modal with "a" selected and the comparison showing. */
+function comparedWithA(): RelinkModalState {
+  return relinkModalReducer(corruptReady("a"), { type: "compare" });
+}
+
+describe("relinkModalReducer (replace corrupt)", () => {
+  it("cannot be confirmed straight from the pick step", () => {
+    const state = corruptReady("a");
+    expect(canSubmitRelink(state)).toBe(false);
+    expect(relinkModalReducer(state, { type: "submit" })).toBe(state);
+  });
+
+  it("can be confirmed after comparing the selected candidate", () => {
+    const compared = comparedWithA();
+    expect(canSubmitRelink(compared)).toBe(true);
+    expect(relinkModalReducer(compared, { type: "submit" })).toMatchObject({ status: "submitting", selectedSourceId: "a" });
+  });
+
+  it("offers a comparison only with a selection, and only while picking", () => {
+    expect(canCompareRelink(corruptReady("a"))).toBe(true);
+    expect(canCompareRelink(comparedWithA())).toBe(false);
+  });
+
+  it("does not compare without a selection", () => {
+    const none = corruptReady(null);
+    expect(canCompareRelink(none)).toBe(false);
+    expect(relinkModalReducer(none, { type: "compare" })).toBe(none);
+  });
+
+  it("returns to picking with the selection intact", () => {
+    expect(relinkModalReducer(comparedWithA(), { type: "back" })).toMatchObject({ selectedSourceId: "a", status: "ready" });
+    expect(canSubmitRelink(relinkModalReducer(comparedWithA(), { type: "back" }))).toBe(false);
+  });
+
+  it("ignores selection changes and searches while comparing", () => {
+    const compared = comparedWithA();
+    expect(relinkModalReducer(compared, { type: "select", sourceId: "b" })).toBe(compared);
+    expect(relinkModalReducer(compared, { type: "setQuery", query: "zzz" })).toBe(compared);
+    expect(relinkModalReducer(compared, { type: "search", query: "zzz", requestId: 9 })).toBe(compared);
+  });
+
+  it("never offers a comparison for a relink of a missing file", () => {
+    const state = readyWith(["a"], "a");
+    expect(relinkModalReducer(state, { type: "compare" })).toBe(state);
+  });
+
+  it("a missing file can be relinked straight from the pick step", () => {
+    expect(canSubmitRelink(readyWith(["a"], "a"))).toBe(true);
+    expect(canSubmitRelink(readyWith(["a"], null))).toBe(false);
+    expect(canSubmitRelink({ phase: "closed" })).toBe(false);
+  });
+
+  it("closes after a successful replacement", () => {
+    const submitting = relinkModalReducer(comparedWithA(), { type: "submit" });
+    expect(relinkModalReducer(submitting, { type: "submitOk", requestId: 1 })).toEqual({ phase: "closed" });
+  });
+
+  it("reports a trash failure as a distinct error that leaves the selection intact", () => {
+    const submitting = relinkModalReducer(comparedWithA(), { type: "submit" });
+    const failed = relinkModalReducer(submitting, { type: "trashFailed", requestId: 1, message: "no trash" });
+    expect(failed).toMatchObject({
+      phase: "open",
+      status: "ready",
+      selectedSourceId: "a",
+      step: "compare",
+      error: { kind: "trash_failed", message: "no trash" },
+    });
+    expect(canSubmitRelink(failed)).toBe(true);
+  });
+
+  it("ignores a trash failure for a stale request or when not submitting", () => {
+    const submitting = relinkModalReducer(comparedWithA(), { type: "submit" });
+    expect(relinkModalReducer(submitting, { type: "trashFailed", requestId: 99, message: "x" })).toBe(submitting);
+    const compared = comparedWithA();
+    expect(relinkModalReducer(compared, { type: "trashFailed", requestId: 1, message: "x" })).toBe(compared);
+  });
+
+  it("forgets a trash failure when going back or submitting again", () => {
+    const submitting = relinkModalReducer(comparedWithA(), { type: "submit" });
+    const failed = relinkModalReducer(submitting, { type: "trashFailed", requestId: 1, message: "no trash" });
+    expect(relinkModalReducer(failed, { type: "back" })).toMatchObject({ error: null });
+    expect(relinkModalReducer(failed, { type: "submit" })).toMatchObject({ status: "submitting", error: null });
   });
 });

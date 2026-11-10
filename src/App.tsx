@@ -22,8 +22,12 @@ import {
   type MergeConflict,
   artistFixReducer,
   mergeModalReducer,
+  canSubmitRelink,
   relinkModalReducer,
+  type FileDisposal,
+  type ReplaceCorruptOutcome,
   type RelinkCandidate,
+  type RelinkKind,
   type RelinkSubject,
   type SplitSourceDetail,
   type SplitRecordingDetail,
@@ -33,6 +37,8 @@ import { useRequestId } from "./useRequestId";
 import { frontendLog } from "./frontendLog";
 import { endedEventAppliesTo } from "./trackEnded";
 import { clampMenuPosition } from "./contextMenuPosition";
+import { formatDuration, formatDurationCompact } from "./formatDuration";
+import { RelinkModal, RELINK_KINDS } from "./RelinkModal";
 import { FileIssueList, fileIssueLabel, type FileIssue, type FileIssueListActions } from "./FileIssueList";
 import "./App.css";
 
@@ -336,42 +342,6 @@ function abbreviatePaths(sources: SplitSourceDetail[]): Map<string, string> {
   return map;
 }
 
-function decomposeDuration(durationMs: number) {
-  const totalSeconds = Math.floor(durationMs / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  return { hours, minutes, seconds };
-}
-
-function formatDuration(durationMs: number | null): string {
-  if (!durationMs || durationMs <= 0) {
-    return "Unknown";
-  }
-
-  const { hours, minutes, seconds } = decomposeDuration(durationMs);
-
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds
-      .toString()
-      .padStart(2, "0")}`;
-  }
-
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-}
-
-function formatDurationCompact(durationMs: number): string {
-  if (durationMs <= 0) return "0m00s";
-
-  const { hours, minutes, seconds } = decomposeDuration(durationMs);
-
-  if (hours > 0) {
-    return `${hours}h${minutes.toString().padStart(2, "0")}m${seconds
-      .toString()
-      .padStart(2, "0")}s`;
-  }
-  return `${minutes}m${seconds.toString().padStart(2, "0")}s`;
-}
 
 function formatEtaTime(date: Date): string {
   return date
@@ -680,7 +650,7 @@ function errorMessage(error: unknown): string {
 }
 
 /** Why the current track was cleared; logged so the cause shows up in thmp5.log. */
-type ClearReason = "track ended" | "track failed" | "skip" | "play error";
+type ClearReason = "track ended" | "track failed" | "skip" | "play error" | "source merged away";
 
 function App() {
   const [bootstrap, setBootstrap] = useState<AppBootstrap | null>(null);
@@ -804,7 +774,7 @@ function App() {
 
   const subjectOfIssue = (issue: FileIssue): RelinkSubject | null => {
     if (issue.source_id === undefined) {
-      console.error("Missing-file issue has no source id", issue);
+      console.error("File issue has no source id", issue);
       setError(`Cannot act on "${issue.file_path}": the issue has no source id.`);
       return null;
     }
@@ -824,16 +794,15 @@ function App() {
       }
     })();
   };
-  const openRelink = (issue: FileIssue) => {
+  const openRelinkModal = (issue: FileIssue, kind: RelinkKind) => {
     const subject = subjectOfIssue(issue);
     if (!subject) return;
     const requestId = nextRelinkRequestId();
-    relinkDispatch({ type: "open", subject, requestId });
+    relinkDispatch({ type: "open", kind, subject, requestId });
     searchRelinkCandidates(subject.sourceId, "", requestId);
   };
-  const closeRelink = () => {
-    relinkDispatch({ type: "close" });
-  };
+  const openRelink = (issue: FileIssue) => openRelinkModal(issue, "relink_missing");
+  const openReplaceCorrupt = (issue: FileIssue) => openRelinkModal(issue, "replace_corrupt");
   // Debounced search as the user types; skipped when the query was already issued.
   useEffect(() => {
     if (relinkOpen === null || relinkOpen.status === "submitting" || relinkOpen.query === relinkOpen.issuedQuery) return;
@@ -846,28 +815,73 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [relinkOpen?.query, relinkOpen?.subject.sourceId]);
 
-  /** After a missing source is gone: fix up the queue and drop its issues from the list. */
-  function afterMissingSourceGone(subject: RelinkSubject, replacement: QueueItem | null) {
+  /** After a source is merged away or removed: fix up the queue and drop its issues from the list. */
+  function afterSourceMergedAway(subject: RelinkSubject, replacement: QueueItem | null) {
     setQueue((current) => replaceSourceInQueue(current, subject.sourceId, replacement));
+    setHistory((current) =>
+      current.flatMap((item) =>
+        item.source.id !== subject.sourceId ? [item] : replacement ? [replacement] : [],
+      ),
+    );
     removeFileIssues((fi) => fi.source_id === subject.sourceId || fi.file_path === subject.filePath);
+    // The source row is gone (e.g. the corrupt side was being auditioned in the compare step), so
+    // stop it rather than later recording a play or rating against a deleted source id.
+    if (currentTrackRef.current?.source.id === subject.sourceId) void stopMergedAwayTrack(subject.sourceId);
   }
-  const applyRelink = () => {
-    if (relinkModal.phase !== "open" || relinkModal.status !== "ready" || relinkModal.selectedSourceId === null) return;
+  async function stopMergedAwayTrack(sourceId: string) {
+    try {
+      await invoke<PlayerState>("stop");
+    } catch (stopError) {
+      frontendLog("error", "Stopping a merged-away source failed", { source_id: sourceId, error: String(stopError) });
+      setError(errorMessage(stopError));
+    }
+    // A different track may have been started during the await; leave it alone.
+    if (currentTrackRef.current?.source.id === sourceId) clearCurrentTrack("source merged away");
+  }
+  const applyRelink = (disposal: FileDisposal = "trash") => {
+    if (relinkModal.phase !== "open" || relinkModal.selectedSourceId === null || !canSubmitRelink(relinkModal)) return;
     const { subject, requestId, selectedSourceId } = relinkModal;
+    const { kind } = relinkModal;
+    const { command } = RELINK_KINDS[kind];
     const target = relinkModal.candidates.find((c) => c.source_id === selectedSourceId);
     const targetRecording = target ? recordings.find((r) => r.id === target.recording_id) : undefined;
     const replacement = targetRecording ? pinSource(targetRecording, selectedSourceId) : null;
     relinkDispatch({ type: "submit" });
     void (async () => {
+      let trashFailedMessage: string | null = null;
       const ok = await runIssueMutation(
-        `relink missing source ${subject.sourceId} (${subject.filePath}) onto ${selectedSourceId}`,
+        `${command} ${subject.sourceId} (${subject.filePath}) onto ${selectedSourceId}`,
         async () => {
-          await invoke("relink_missing_source", { sourceId: subject.sourceId, targetSourceId: selectedSourceId });
-          afterMissingSourceGone(subject, replacement);
+          if (kind === "relink_missing") {
+            await invoke(command, { sourceId: subject.sourceId, targetSourceId: selectedSourceId });
+          } else {
+            const result = await invoke<ReplaceCorruptOutcome>(command, {
+              sourceId: subject.sourceId,
+              targetSourceId: selectedSourceId,
+              disposal,
+            });
+            if (result.outcome === "trash_failed") {
+              frontendLog("warn", "Moving the corrupt file to the trash failed; offering permanent delete", {
+                source_id: subject.sourceId,
+                target_source_id: selectedSourceId,
+                file_path: subject.filePath,
+                message: result.message,
+              });
+              trashFailedMessage = result.message;
+              return;
+            }
+          }
+          afterSourceMergedAway(subject, replacement);
         },
         (message) => relinkDispatch({ type: "submitErr", requestId, error: message }),
       );
-      if (ok) relinkDispatch({ type: "submitOk", requestId });
+      if (ok) {
+        relinkDispatch(
+          trashFailedMessage === null
+            ? { type: "submitOk", requestId }
+            : { type: "trashFailed", requestId, message: trashFailedMessage },
+        );
+      }
     })();
   };
   const openRemoveMissing = (issue: FileIssue) => {
@@ -884,7 +898,7 @@ function App() {
         `remove missing source ${subject.sourceId} (${subject.filePath})`,
         async () => {
           await invoke("remove_missing_source", { sourceId: subject.sourceId });
-          afterMissingSourceGone(subject, null);
+          afterSourceMergedAway(subject, null);
         },
         (message) => setRemoveMissing({ subject, removing: false, error: message }),
       );
@@ -2734,25 +2748,28 @@ function App() {
   }
 
   function playIssueFile(issue: FileIssue) {
-    const owner = recordings.find(
-      (r) =>
-        (issue.source_id && r.sources.some((src) => src.id === issue.source_id)) ||
-        r.source_paths.includes(issue.file_path)
-    );
+    playSourceFromStart(issue.source_id, issue.file_path, "Play from File Issues panel");
+  }
+
+  /** Start one specific library source from the beginning, identified by id and/or file path. */
+  function playSourceFromStart(sourceId: string | undefined, filePath: string, context: string) {
+    // Match by id first; fall back to the path only when there is no id or it isn't found.
+    const byId = sourceId === undefined ? undefined : recordings.find((r) => r.sources.some((src) => src.id === sourceId));
+    const owner = byId ?? recordings.find((r) => r.source_paths.includes(filePath));
     const ownerSourceId = owner?.sources.find(
-      (src) => src.id === issue.source_id || src.file_path === issue.file_path
+      (src) => (byId ? src.id === sourceId : src.file_path === filePath)
     )?.id ?? null;
     const targetTrack = owner ? pinSource(owner, ownerSourceId) : null;
     if (!targetTrack) {
-      setError(`"${issue.file_path}" is not in the library.`);
+      setError(`"${filePath}" is not in the library.`);
       return;
     }
 
     if (currentTrack) {
       setHistory((prev) => [currentTrack, ...prev].slice(0, queueHistoryLimit));
     }
-    frontendLog("info", "Play from File Issues panel", {
-      file_path: issue.file_path,
+    frontendLog("info", context, {
+      file_path: filePath,
       source_id: targetTrack.source.id,
       previous_source_id: currentTrack?.source.id ?? null,
     });
@@ -2772,6 +2789,7 @@ function App() {
     onClearManual: (filePath) => { void handleClearFileIssue(filePath); },
     onRelinkMissing: openRelink,
     onRemoveMissing: openRemoveMissing,
+    onReplaceCorrupt: openReplaceCorrupt,
     onOpenMerge: openMerge,
     onPlayFile: playIssueFile,
     onDeleteBackup: (backupPath) => { void deleteBackup(backupPath); },
@@ -2783,6 +2801,7 @@ function App() {
     onClearManual: (filePath) => issueActionsRef.current.onClearManual(filePath),
     onRelinkMissing: (issue) => issueActionsRef.current.onRelinkMissing(issue),
     onRemoveMissing: (issue) => issueActionsRef.current.onRemoveMissing(issue),
+    onReplaceCorrupt: (issue) => issueActionsRef.current.onReplaceCorrupt(issue),
     onOpenMerge: (filePath) => issueActionsRef.current.onOpenMerge(filePath),
     onPlayFile: (issue) => issueActionsRef.current.onPlayFile(issue),
     onDeleteBackup: (backupPath) => issueActionsRef.current.onDeleteBackup(backupPath),
@@ -4116,77 +4135,16 @@ function App() {
       )}
 
       {relinkModal.phase === "open" && (
-        <div className="modal-overlay" onClick={closeRelink}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 640 }}>
-            <div className="modal-header">
-              <h2>Relink Missing File</h2>
-              <button className="modal-close-btn" onClick={closeRelink} type="button">×</button>
-            </div>
-            <div className="modal-section">
-              <p className="subtle-text">
-                <strong title={relinkModal.subject.filePath}>{relinkModal.subject.filePath}</strong> no
-                longer exists. Pick the library file it was replaced by: this source's plays, rating,
-                playlist entries and note move onto it, and this source is deleted.
-              </p>
-              <input
-                className="relink-search"
-                type="search"
-                placeholder="Search title, artist, album or path…"
-                value={relinkModal.query}
-                autoFocus
-                disabled={relinkModal.status === "submitting"}
-                onChange={(e) => relinkDispatch({ type: "setQuery", query: e.target.value })}
-              />
-              {relinkModal.status === "loading" ? (
-                <p className="issue-empty">Searching…</p>
-              ) : relinkModal.candidates.length === 0 ? (
-                relinkModal.status === "ready" && relinkModal.error !== null ? null : (
-                  <p className="issue-empty">No matching files found.</p>
-                )
-              ) : (
-                <ul className="relink-candidate-list">
-                  {relinkModal.candidates.map((c) => (
-                    <li key={c.source_id}>
-                      <button
-                        type="button"
-                        className={`relink-candidate${relinkModal.selectedSourceId === c.source_id ? " relink-candidate-selected" : ""}`}
-                        disabled={relinkModal.status === "submitting"}
-                        onClick={() => relinkDispatch({ type: "select", sourceId: c.source_id })}
-                      >
-                        <span className="relink-candidate-title">
-                          <span>
-                            {c.title}
-                            {c.artist ? ` — ${c.artist}` : ""}
-                            {c.album ? ` (${c.album})` : ""}
-                          </span>
-                          <span>{c.duration_ms ? formatDuration(c.duration_ms) : null}</span>
-                        </span>
-                        {c.same_recording && (
-                          <span className="relink-candidate-same">Same recording</span>
-                        )}
-                        <span className="relink-candidate-path" title={c.file_path}>{c.file_path}</span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {relinkModal.status === "ready" && relinkModal.error !== null && (
-                <div className="error-banner">{relinkModal.error}</div>
-              )}
-            </div>
-            <div className="comparison-modal-footer">
-              <button className="comparison-cancel-btn" onClick={closeRelink} type="button">Cancel</button>
-              <button
-                className="comparison-confirm-btn"
-                disabled={relinkModal.status !== "ready" || relinkModal.selectedSourceId === null}
-                onClick={applyRelink}
-                type="button"
-              >
-                {relinkModal.status === "submitting" ? "Relinking…" : "Relink"}
-              </button>
-            </div>
-          </div>
-        </div>
+        <RelinkModal
+          state={relinkModal}
+          dispatch={relinkDispatch}
+          recordings={recordings}
+          currentSourceId={currentTrack?.source.id ?? null}
+          playerSourceId={playerState.source_id}
+          playerStatus={playerState.status}
+          onConfirm={applyRelink}
+          onPlay={(sourceId, filePath) => playSourceFromStart(sourceId, filePath, "Play from relink modal")}
+        />
       )}
 
       {removeMissing !== null && (

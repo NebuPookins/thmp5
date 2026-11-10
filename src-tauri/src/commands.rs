@@ -1064,9 +1064,6 @@ pub async fn relink_missing_source(
     source_id: String,
     target_source_id: String,
 ) -> Result<(), CommandError> {
-    if source_id == target_source_id {
-        return Err(CommandError::rejected("Cannot relink a source onto itself"));
-    }
     {
         let _permit = state
             .write_serializer
@@ -1081,20 +1078,17 @@ pub async fn relink_missing_source(
             .await
             .context("Failed to acquire connection")?;
         let mut tx = conn.begin().await.context("Failed to begin transaction")?;
-        let dead_path =
-            require_local_source(&mut tx, &source_id, "Source", FileExpectation::Missing).await?;
-        let target_path = require_local_source(
+        let MergedSource {
+            source_path: dead_path,
+            target_path,
+            summary,
+        } = merge_source_onto(
             &mut tx,
+            &source_id,
             &target_source_id,
-            "Target source",
-            FileExpectation::Present,
+            FileExpectation::Missing,
         )
         .await?;
-        let summary = merge_source_into(&mut tx, &source_id, &target_source_id)
-            .await
-            .with_context(|| {
-                format!("Failed to merge source {source_id} ({dead_path}) into {target_source_id} ({target_path})")
-            })?;
         tx.commit().await.context("Failed to commit relink")?;
         tracing::info!(
             %source_id,
@@ -1107,6 +1101,191 @@ pub async fn relink_missing_source(
     }
     reload_catalog(&state, Announce::Frontend).await;
     Ok(())
+}
+
+/// The outcome of [`merge_source_onto`].
+#[derive(Debug)]
+struct MergedSource {
+    /// File path of the source that was merged away (and deleted).
+    source_path: String,
+    /// File path of the source that received its data.
+    target_path: String,
+    summary: crate::library::source_merge::MergeSummary,
+}
+
+/// Move one source's plays, rating, playlist entries and note onto another source and delete the
+/// first. Rejects merging a source onto itself. The source's file must satisfy
+/// `source_expectation` (missing when relinking, present when replacing a corrupt file); the
+/// target's file must exist. Runs inside the caller's transaction.
+async fn merge_source_onto(
+    tx: &mut sqlx::SqliteConnection,
+    source_id: &str,
+    target_source_id: &str,
+    source_expectation: FileExpectation,
+) -> Result<MergedSource, CommandError> {
+    if source_id == target_source_id {
+        return Err(CommandError::rejected("Cannot merge a source onto itself"));
+    }
+    let source_path = require_local_source(tx, source_id, "Source", source_expectation).await?;
+    let target_path = require_local_source(
+        tx,
+        target_source_id,
+        "Target source",
+        FileExpectation::Present,
+    )
+    .await?;
+    let summary = merge_source_into(tx, source_id, target_source_id)
+        .await
+        .with_context(|| {
+            format!("Failed to merge source {source_id} ({source_path}) into {target_source_id} ({target_path})")
+        })?;
+    Ok(MergedSource {
+        source_path,
+        target_path,
+        summary,
+    })
+}
+
+/// How the corrupt file is disposed of when it is replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDisposal {
+    /// Move to the system trash (recoverable).
+    Trash,
+    /// Delete permanently (for filesystems without a trash).
+    Delete,
+}
+
+/// Why a file could not be disposed of.
+#[derive(Debug)]
+enum DisposalError {
+    /// Moving to the trash failed; the caller can offer a permanent delete instead.
+    TrashFailed(anyhow::Error),
+    /// Permanent deletion failed.
+    DeleteFailed(anyhow::Error),
+}
+
+/// Trash or permanently delete `path` on a blocking thread.
+async fn dispose_of_file(path: &str, disposal: FileDisposal) -> Result<(), DisposalError> {
+    let owned = path.to_string();
+    match disposal {
+        FileDisposal::Trash => tokio::task::spawn_blocking(move || trash::delete(&owned))
+            .await
+            .map_err(|e| {
+                DisposalError::TrashFailed(anyhow::Error::new(e).context("Trash task panicked"))
+            })?
+            .map_err(|e| DisposalError::TrashFailed(anyhow::Error::new(e))),
+        FileDisposal::Delete => tokio::task::spawn_blocking(move || std::fs::remove_file(&owned))
+            .await
+            .map_err(|e| {
+                DisposalError::DeleteFailed(anyhow::Error::new(e).context("Delete task panicked"))
+            })?
+            .map_err(|e| DisposalError::DeleteFailed(anyhow::Error::new(e))),
+    }
+}
+
+/// Outcome of `replace_corrupt_source`. Failing to trash is an expected, recoverable outcome (the
+/// frontend offers a permanent delete), so it is not a `CommandError`.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ReplaceCorruptOutcome {
+    Replaced,
+    TrashFailed { message: String },
+}
+
+/// Replace a corrupt source with another library source: move the corrupt source's plays, rating,
+/// playlist entries and note onto the replacement, delete the corrupt source, and dispose of its
+/// file (trash it, or delete it permanently, per `disposal`).
+///
+/// The file is disposed of before the transaction commits, so a failure rolls the database back
+/// and leaves everything as it was. (The reverse order could leave a file on disk that a rescan
+/// re-imports as an orphan.) If the commit fails after the file was disposed of, the error says
+/// whether it is recoverable from the trash.
+#[tauri::command]
+#[tracing::instrument(skip_all, fields(source_id = %source_id, target_source_id = %target_source_id, disposal = ?disposal))]
+pub async fn replace_corrupt_source(
+    state: tauri::State<'_, AppState>,
+    source_id: String,
+    target_source_id: String,
+    disposal: FileDisposal,
+) -> Result<ReplaceCorruptOutcome, CommandError> {
+    {
+        let _permit = state
+            .write_serializer
+            .acquire()
+            .await
+            .context("Failed to acquire write lock for replacing a corrupt source")?;
+        let mut conn = state
+            .db
+            .acquire(format!(
+                "command.replace_corrupt_source source_id={source_id} target={target_source_id}"
+            ))
+            .await
+            .context("Failed to acquire connection")?;
+        let mut tx = conn.begin().await.context("Failed to begin transaction")?;
+        let MergedSource {
+            source_path: corrupt_path,
+            target_path,
+            summary,
+        } = merge_source_onto(
+            &mut tx,
+            &source_id,
+            &target_source_id,
+            FileExpectation::Present,
+        )
+        .await?;
+
+        match dispose_of_file(&corrupt_path, disposal).await {
+            Ok(()) => {}
+            Err(DisposalError::TrashFailed(e)) => {
+                tracing::warn!(
+                    %source_id,
+                    %target_source_id,
+                    %corrupt_path,
+                    error = %format!("{e:#}"),
+                    "Failed to move corrupt file to the trash; rolling back, nothing was changed"
+                );
+                // `tx` is dropped here, rolling the merge back.
+                return Ok(ReplaceCorruptOutcome::TrashFailed {
+                    message: format!(
+                        "Could not move {corrupt_path} to the trash: {e:#}. Nothing was changed."
+                    ),
+                });
+            }
+            Err(DisposalError::DeleteFailed(e)) => {
+                return Err(e
+                    .context(format!(
+                        "Failed to permanently delete corrupt file {corrupt_path}; nothing was changed"
+                    ))
+                    .into());
+            }
+        }
+
+        let file_fate = match disposal {
+            FileDisposal::Trash => {
+                "the corrupt file is in the trash and can be restored from there"
+            }
+            FileDisposal::Delete => {
+                "the corrupt file was already permanently deleted and cannot be restored"
+            }
+        };
+        tx.commit().await.with_context(|| {
+            format!(
+                "Failed to commit replacement of {corrupt_path} ({source_id}) by {target_path} ({target_source_id}); {file_fate}"
+            )
+        })?;
+        tracing::info!(
+            %source_id,
+            %corrupt_path,
+            %target_source_id,
+            %target_path,
+            ?summary,
+            ?disposal,
+            "Replaced corrupt source and disposed of its file"
+        );
+    }
+    reload_catalog(&state, Announce::Frontend).await;
+    Ok(ReplaceCorruptOutcome::Replaced)
 }
 
 /// How many live relink candidates to return at most.
@@ -2404,6 +2583,26 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[tokio::test]
+    async fn dispose_of_file_delete_removes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.mp3");
+        std::fs::write(&path, b"junk").unwrap();
+        let path_str = path.to_str().unwrap();
+        dispose_of_file(path_str, FileDisposal::Delete)
+            .await
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn dispose_of_file_delete_errors_on_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.mp3");
+        let result = dispose_of_file(path.to_str().unwrap(), FileDisposal::Delete).await;
+        assert!(matches!(result, Err(DisposalError::DeleteFailed(_))));
+    }
+
     #[test]
     fn test_compute_normalization_gain_replaygain() {
         let (gain, source) = compute_normalization_gain(Some(-6.0), None);
@@ -2486,5 +2685,127 @@ mod tests {
     #[test]
     fn strip_mbid_ufid_rejects_malformed_json() {
         assert!(strip_mbid_ufid("not json").is_err());
+    }
+
+    mod merge_source_onto {
+        use super::super::*;
+        use crate::db::init_pool;
+        use tempfile::TempDir;
+
+        async fn pool_with_sources(tmp: &TempDir, sources: &[(&str, &Path)]) -> crate::db::DbPool {
+            let pool = init_pool(&tmp.path().join("test.db")).await.unwrap();
+            let mut conn = pool.acquire("test.insert").await.unwrap();
+            for (id, path) in sources {
+                let path = path.to_string_lossy().to_string();
+                sqlx::query!(
+                    "INSERT INTO source (id, source_type, file_path) VALUES (?, 'local_file', ?)",
+                    id,
+                    path
+                )
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            }
+            drop(conn);
+            pool
+        }
+
+        async fn has_source(pool: &crate::db::DbPool, id: &str) -> bool {
+            let mut conn = pool.acquire("test.has_source").await.unwrap();
+            sqlx::query_scalar!("SELECT id FROM source WHERE id = ?", id)
+                .fetch_optional(&mut *conn)
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        #[tokio::test]
+        async fn moves_user_data_onto_replacement_and_deletes_corrupt_row() {
+            let tmp = TempDir::new().unwrap();
+            let bad = tmp.path().join("bad.mp3");
+            let good = tmp.path().join("good.mp3");
+            std::fs::write(&bad, b"x").unwrap();
+            std::fs::write(&good, b"y").unwrap();
+            let pool = pool_with_sources(&tmp, &[("bad", &bad), ("good", &good)]).await;
+            {
+                let mut conn = pool.acquire("test.play").await.unwrap();
+                sqlx::query!("INSERT INTO play_history (source_id) VALUES ('bad')")
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+            }
+            let mut conn = pool.acquire("test.merge").await.unwrap();
+            let mut tx = conn.begin().await.unwrap();
+            let MergedSource {
+                source_path: corrupt_path,
+                target_path,
+                summary,
+            } = merge_source_onto(&mut tx, "bad", "good", FileExpectation::Present)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            drop(conn);
+
+            assert_eq!(corrupt_path, bad.to_string_lossy());
+            assert_eq!(target_path, good.to_string_lossy());
+            assert_eq!(summary.plays_moved, 1);
+            assert!(!has_source(&pool, "bad").await);
+            assert!(has_source(&pool, "good").await);
+        }
+
+        #[tokio::test]
+        async fn missing_expectation_accepts_a_dead_source_and_rejects_a_present_one() {
+            let tmp = TempDir::new().unwrap();
+            let dead = tmp.path().join("dead.mp3");
+            let good = tmp.path().join("good.mp3");
+            std::fs::write(&good, b"y").unwrap();
+            let pool = pool_with_sources(&tmp, &[("dead", &dead), ("good", &good)]).await;
+            let mut conn = pool.acquire("test.merge").await.unwrap();
+            let mut tx = conn.begin().await.unwrap();
+
+            assert!(
+                merge_source_onto(&mut tx, "good", "dead", FileExpectation::Missing)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                merge_source_onto(&mut tx, "dead", "good", FileExpectation::Missing)
+                    .await
+                    .is_ok()
+            );
+            tx.commit().await.unwrap();
+            drop(conn);
+            assert!(!has_source(&pool, "dead").await);
+        }
+
+        #[tokio::test]
+        async fn rejects_self_target_and_missing_replacement_without_changes() {
+            let tmp = TempDir::new().unwrap();
+            let bad = tmp.path().join("bad.mp3");
+            std::fs::write(&bad, b"x").unwrap();
+            let gone = tmp.path().join("gone.mp3");
+            let pool = pool_with_sources(&tmp, &[("bad", &bad), ("gone", &gone)]).await;
+            let mut conn = pool.acquire("test.merge").await.unwrap();
+            let mut tx = conn.begin().await.unwrap();
+
+            assert!(
+                merge_source_onto(&mut tx, "bad", "bad", FileExpectation::Present)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                merge_source_onto(&mut tx, "bad", "gone", FileExpectation::Present)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                merge_source_onto(&mut tx, "bad", "nope", FileExpectation::Present)
+                    .await
+                    .is_err()
+            );
+            tx.commit().await.unwrap();
+            drop(conn);
+            assert!(has_source(&pool, "bad").await);
+        }
     }
 }

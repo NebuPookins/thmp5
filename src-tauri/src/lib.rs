@@ -305,6 +305,7 @@ pub fn run() {
             commands::remove_missing_source,
             commands::relink_missing_source,
             commands::search_relink_candidates,
+            commands::replace_corrupt_source,
             commands::preview_duplicate_merge,
             commands::apply_duplicate_merge,
             commands::split_recording,

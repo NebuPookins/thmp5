@@ -1485,6 +1485,7 @@ fn mem_recording_to_row(rec: &MemRecording, catalog: &MemoryCatalog) -> Recordin
                 id: s.id.clone(),
                 file_path: s.file_path.clone(),
                 duration_ms: s.duration_ms,
+                format: s.format.clone(),
                 rating: s.rating(),
                 play_count: s.play_count,
                 last_played: s.last_played.clone(),

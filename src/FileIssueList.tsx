@@ -44,6 +44,7 @@ export type FileIssueListActions = {
   onClearManual: (filePath: string) => void;
   onRelinkMissing: (issue: FileIssue) => void;
   onRemoveMissing: (issue: FileIssue) => void;
+  onReplaceCorrupt: (issue: FileIssue) => void;
   onOpenMerge: (filePath: string) => void;
   onPlayFile: (issue: FileIssue) => void;
   onDeleteBackup: (backupPath: string) => void;
@@ -109,6 +110,15 @@ export const FileIssueList = memo(function FileIssueList({
                     Remove
                   </button>
                 </>
+              ) : issue.kind === "corrupt_audio" && sourceId !== undefined ? (
+                <button
+                  className="issue-action-btn"
+                  type="button"
+                  title="Replace this corrupt file with another library source"
+                  onClick={() => actions.onReplaceCorrupt(issue)}
+                >
+                  Replace…
+                </button>
               ) : issue.kind === "duplicate_frame" ? (
                 isFirstDupForFile ? (
                   <button

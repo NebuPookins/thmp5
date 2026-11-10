@@ -27,6 +27,7 @@ export interface SourceRow {
   id: string;
   file_path: string | null;
   duration_ms: number | null;
+  format: string | null;
   rating: number | null;
   play_count: number;
   last_played: string | null;
