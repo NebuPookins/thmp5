@@ -39,7 +39,8 @@ import { endedEventAppliesTo } from "./trackEnded";
 import { clampMenuPosition } from "./contextMenuPosition";
 import { formatDuration, formatDurationCompact } from "./formatDuration";
 import { RelinkModal, RELINK_KINDS } from "./RelinkModal";
-import { FileIssueList, fileIssueLabel, type FileIssue, type FileIssueListActions } from "./FileIssueList";
+import { FileIssueList, type FileIssue, type FileIssueListActions } from "./FileIssueList";
+import { FileIssueIndicator } from "./FileIssueIndicator";
 import "./App.css";
 
 type LibrarySummary = {
@@ -210,19 +211,6 @@ type TrackEndedEvent = {
 
 const areIssuesEqual = (a: readonly FileIssue[], b: readonly FileIssue[]): boolean =>
   a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
-
-function FileIssueIndicator({ paths, issuesByPath }: {
-  paths: readonly string[];
-  issuesByPath: ReadonlyMap<string, readonly FileIssue[]>;
-}) {
-  const affected = paths.flatMap((path) => (issuesByPath.get(path) ?? []).map((issue) => ({ path, issue })));
-  if (affected.length === 0) return null;
-  const includePaths = paths.length > 1;
-  const tooltip = affected.map(({ path, issue }) => (
-    `${includePaths ? `${path}: ` : ""}${fileIssueLabel(issue.kind)} — ${issue.message}`
-  )).join("\n");
-  return <span className="file-issue-indicator" title={tooltip} aria-label={tooltip}>⚠</span>;
-}
 
 type LastFmStatus = {
   configured: boolean;
@@ -685,6 +673,10 @@ function App() {
   const waveformContainerRef = useRef<HTMLDivElement>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isIssuesPanelOpen, setIsIssuesPanelOpen] = useState(false);
+  const [revealPaths, setRevealPaths] = useState<readonly string[] | null>(null);
+  // False from opening the panel until its first refresh settles, so a reveal
+  // doesn't scroll to a row that the refresh then moves or replaces.
+  const [hasPolledSinceOpen, setHasPolledSinceOpen] = useState(false);
   const [fileIssues, setFileIssues] = useState<FileIssue[]>([]);
   const [pendingFileIssues, setPendingFileIssues] = useState<FileIssue[] | null>(null);
   // While the pointer is over the panel, background updates are held so rows
@@ -1600,8 +1592,15 @@ function App() {
   const closeIssuesPanel = useCallback(() => {
     isPointerOverIssuesPanelRef.current = false;
     setIsIssuesPanelOpen(false);
+    setRevealPaths(null);
     flushPendingFileIssues();
   }, [flushPendingFileIssues]);
+
+  const revealFileIssues = useCallback((filePaths: readonly string[]) => {
+    setIsIssuesPanelOpen(true);
+    setRevealPaths(filePaths);
+  }, []);
+  const clearRevealPaths = useCallback(() => { setRevealPaths(null); }, []);
 
   // After bootstrap, load the issue list.
   useEffect(() => {
@@ -1646,12 +1645,15 @@ function App() {
         }
         if (!isCancelled) setIssuesRefreshError(message);
       }
-      if (!isCancelled) timer = setTimeout(() => { void poll(false); }, FILE_ISSUES_POLL_MS);
+      if (isCancelled) return;
+      if (forceImmediate) setHasPolledSinceOpen(true);
+      timer = setTimeout(() => { void poll(false); }, FILE_ISSUES_POLL_MS);
     };
     void poll(true);
     return () => {
       isCancelled = true;
       clearTimeout(timer);
+      setHasPolledSinceOpen(false);
       setIssuesRefreshError(null);
     };
   }, [isIssuesPanelOpen, updateFileIssues]);
@@ -3233,7 +3235,8 @@ function App() {
                   onForward={() => dispatchNav({ type: "forward" })}
                   onClose={() => dispatchNav({ type: "close" })}
                   onSourceContextMenu={openEntitySourceContextMenu}
-                  sourceIssueTooltip={(path) => (issuesByPath.get(path) ?? []).map((issue) => `${fileIssueLabel(issue.kind)} — ${issue.message}`).join("\n") || null}
+                  issuesByPath={issuesByPath}
+                  onRevealFileIssues={revealFileIssues}
                   onEnqueueSource={(recording, source) => {
                     if (!source.file_path) {
                       setError(`No playable local file is available for "${recording.title}".`);
@@ -3287,7 +3290,7 @@ function App() {
                                 onDoubleClick={() => enqueueRecording(recording)}
                                 title={recording.primary_source_id ? "Double click to queue" : "No playable file"}
                               >
-                                <td><FileIssueIndicator paths={recording.source_paths} issuesByPath={issuesByPath} />{recording.title}</td>
+                                <td><FileIssueIndicator paths={recording.source_paths} issuesByPath={issuesByPath} onReveal={revealFileIssues} />{recording.title}</td>
                                 <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
                                 <td>
                                   {recording.releases.length === 0
@@ -3425,7 +3428,7 @@ function App() {
                                       : "No playable local file"
                                   }
                                 >
-                                  <td><FileIssueIndicator paths={recording.source_paths} issuesByPath={issuesByPath} />{recording.title}</td>
+                                  <td><FileIssueIndicator paths={recording.source_paths} issuesByPath={issuesByPath} onReveal={revealFileIssues} />{recording.title}</td>
                                   <td>{recording.artist_credit_name ?? "Unknown Artist"}</td>
                                   <td className="releases-cell">
                                     {recording.releases.length === 0
@@ -3488,7 +3491,7 @@ function App() {
                                           openEntitySourceContextMenu(e, p, recording.id);
                                         }}
                                       >
-                                        <FileIssueIndicator paths={[p]} issuesByPath={issuesByPath} />
+                                        <FileIssueIndicator paths={[p]} issuesByPath={issuesByPath} onReveal={revealFileIssues} />
                                         {p}
                                       </div>
                                     ))}
@@ -3591,7 +3594,7 @@ function App() {
                       onContextMenu={(e) => openQueueSourceContextMenu(e, item)}
                     >
                       <div className="queue-row">
-                        <strong><FileIssueIndicator paths={item.source.file_path ? [item.source.file_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
+                        <strong><FileIssueIndicator paths={item.source.file_path ? [item.source.file_path] : item.source_paths} issuesByPath={issuesByPath} onReveal={revealFileIssues} />{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
                       </div>
                       <div className="queue-row">
@@ -3611,7 +3614,7 @@ function App() {
                   {currentTrack ? (
                     <li className="queue-now-playing" onContextMenu={(e) => openQueueSourceContextMenu(e, currentTrack)}>
                       <div className="queue-row">
-                        <strong><FileIssueIndicator paths={currentTrack.source.file_path ? [currentTrack.source.file_path] : currentTrack.source_paths} issuesByPath={issuesByPath} />{currentTrack.title}</strong>
+                        <strong><FileIssueIndicator paths={currentTrack.source.file_path ? [currentTrack.source.file_path] : currentTrack.source_paths} issuesByPath={issuesByPath} onReveal={revealFileIssues} />{currentTrack.title}</strong>
                         <span className="queue-duration">{formatDuration(currentTrack.duration_ms)}</span>
                       </div>
                       <div className="queue-row">
@@ -3671,7 +3674,7 @@ function App() {
                       onContextMenu={(e) => openQueueSourceContextMenu(e, item)}
                     >
                       <div className="queue-row">
-                        <strong><FileIssueIndicator paths={item.source.file_path ? [item.source.file_path] : item.source_paths} issuesByPath={issuesByPath} />{item.title}</strong>
+                        <strong><FileIssueIndicator paths={item.source.file_path ? [item.source.file_path] : item.source_paths} issuesByPath={issuesByPath} onReveal={revealFileIssues} />{item.title}</strong>
                         <span className="queue-duration">{formatDuration(item.duration_ms)}</span>
                         <button
                           className="queue-remove-btn"
@@ -4537,16 +4540,18 @@ function App() {
             </p>
           )}
           <div className="issues-panel-body">
-            {fileIssues.length === 0 ? (
-              issuesRefreshError === null ? <p className="issue-empty">No file issues recorded.</p> : null
-            ) : (
-              <FileIssueList
-                issues={fileIssues}
-                firstDupIndexByFile={firstDupIndexByFile}
-                deletingBackups={deletingBackups}
-                actions={issueActions}
-              />
+            {fileIssues.length === 0 && issuesRefreshError === null && (
+              <p className="issue-empty">No file issues recorded.</p>
             )}
+            {/* Mounted even when empty, so a pending reveal is always consumed. */}
+            <FileIssueList
+              issues={fileIssues}
+              firstDupIndexByFile={firstDupIndexByFile}
+              deletingBackups={deletingBackups}
+              actions={issueActions}
+              revealPaths={hasPolledSinceOpen ? revealPaths : null}
+              onRevealHandled={clearRevealPaths}
+            />
           </div>
         </section>
       ) : null}

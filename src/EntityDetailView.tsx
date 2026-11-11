@@ -13,6 +13,8 @@ import {
 } from "./entityTypes";
 import { detailReducer } from "./entityDetailReducer";
 import { useRequestId } from "./useRequestId";
+import type { FileIssue } from "./FileIssueList";
+import { FileIssueIndicator } from "./FileIssueIndicator";
 import "./EntityDetailView.css";
 
 export type { DetailNav };
@@ -67,7 +69,8 @@ type Props = {
   onForward: () => void;
   onClose: () => void;
   onSourceContextMenu?: (e: React.MouseEvent<HTMLDivElement>, filePath: string) => void;
-  sourceIssueTooltip?: (filePath: string) => string | null;
+  issuesByPath: ReadonlyMap<string, readonly FileIssue[]>;
+  onRevealFileIssues: (paths: readonly string[]) => void;
   onEnqueueSource?: (recording: RecordingDetail, source: SourceDetail) => void;
   onEnqueueTrack?: (track: TrackDetail) => void;
   onRescanRecording?: (recordingId: string) => void;
@@ -165,7 +168,7 @@ function renderTagValue(tag: SourceTagInfo): React.ReactNode {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, sourceIssueTooltip, onEnqueueSource, onEnqueueTrack, onRescanRecording, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
+export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavigate, onBack, onForward, onClose, onSourceContextMenu, issuesByPath, onRevealFileIssues, onEnqueueSource, onEnqueueTrack, onRescanRecording, onRescanReleaseGroup, onRefreshLibrary, onSplitRecording }: Props) {
   const [detailState, detailDispatch] = useReducer(detailReducer, { phase: "loading", requestId: 0 });
   const nextDetailRequestId = useRequestId();
   const loading = detailState.phase === "loading";
@@ -727,7 +730,7 @@ export default function EntityDetailView({ nav, canGoBack, canGoForward, onNavig
                   onDoubleClick={() => onEnqueueSource?.(recording, source)}
                 >
                   <div className="entity-detail-source-header">
-                    {source.file_path && sourceIssueTooltip?.(source.file_path) && <span className="file-issue-indicator" title={sourceIssueTooltip(source.file_path)!}>⚠</span>}
+                    {source.file_path && <FileIssueIndicator paths={[source.file_path]} issuesByPath={issuesByPath} onReveal={onRevealFileIssues} />}
                     <span className="entity-detail-badge">{source.source_type}</span>
                     {source.format && <span className="entity-detail-badge">{source.format}</span>}
                     {source.duration_ms && <span className="subtle-text">{formatDuration(source.duration_ms)}</span>}

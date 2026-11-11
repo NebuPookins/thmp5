@@ -1182,8 +1182,12 @@ thead th {
 
 /* ── File issues list ────────────────────────────────────────────────────────── */
 .file-issue-indicator {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
   color: #d99000;
-  cursor: help;
+  cursor: pointer;
   display: inline-block;
   font-size: 0.82em;
   margin-right: 0.32rem;
@@ -1220,6 +1224,17 @@ thead th {
   display: flex;
   flex-direction: column;
   gap: 5px;
+}
+
+.issue-item-highlight {
+  animation: issue-item-flash 1.5s ease-out;
+}
+
+@keyframes issue-item-flash {
+  0%, 40% {
+    background: rgba(217, 144, 0, 0.35);
+    border-color: rgba(217, 144, 0, 0.9);
+  }
 }
 
 .issue-item-header {

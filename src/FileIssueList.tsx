@@ -1,4 +1,5 @@
-import { memo } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { frontendLog } from "./frontendLog";
 
 export type FileIssue = {
   file_path: string;
@@ -39,6 +40,16 @@ export function issueRowKeys(issues: readonly FileIssue[]): string[] {
   });
 }
 
+/** Index of the first issue whose file is in `filePaths`, or undefined when there is none. */
+export function findFirstIssueIndex(
+  issues: readonly FileIssue[],
+  filePaths: readonly string[],
+): number | undefined {
+  const wanted = new Set(filePaths);
+  const index = issues.findIndex((issue) => wanted.has(issue.file_path));
+  return index === -1 ? undefined : index;
+}
+
 export type FileIssueListActions = {
   onContextMenu: (e: React.MouseEvent, filePath: string) => void;
   onClearManual: (filePath: string) => void;
@@ -56,6 +67,13 @@ type Props = {
   deletingBackups: ReadonlySet<string>;
   /** Must be referentially stable, or memoization is defeated. */
   actions: FileIssueListActions;
+  /**
+   * Files whose first issue should be scrolled to and flashed. The list calls
+   * `onRevealHandled` once it has acted on them; the owner then clears this.
+   */
+  revealPaths: readonly string[] | null;
+  /** Must be referentially stable, or memoization is defeated. */
+  onRevealHandled: () => void;
 };
 
 export const FileIssueList = memo(function FileIssueList({
@@ -63,10 +81,36 @@ export const FileIssueList = memo(function FileIssueList({
   firstDupIndexByFile,
   deletingBackups,
   actions,
+  revealPaths,
+  onRevealHandled,
 }: Props) {
-  const keys = issueRowKeys(issues);
+  const keys = useMemo(() => issueRowKeys(issues), [issues]);
+  const listRef = useRef<HTMLOListElement>(null);
+  const [highlightedKey, setHighlightedKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (revealPaths === null) return;
+    onRevealHandled();
+    const index = findFirstIssueIndex(issues, revealPaths);
+    const key = index === undefined ? undefined : keys[index];
+    const row = key === undefined
+      ? undefined
+      : Array.from(listRef.current?.children ?? []).find(
+        (el) => el instanceof HTMLElement && el.dataset.issueKey === key,
+      );
+    if (key === undefined || row === undefined) {
+      frontendLog("warn", "File Issues: no issue row found to reveal", {
+        filePaths: revealPaths,
+        issueCount: issues.length,
+      });
+      return;
+    }
+    row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    setHighlightedKey(key);
+  }, [revealPaths, onRevealHandled, issues, keys]);
+
   return (
-    <ol className="issue-list">
+    <ol className="issue-list" ref={listRef}>
       {issues.map((issue, i) => {
         const isFirstDupForFile =
           issue.kind === "duplicate_frame" &&
@@ -76,7 +120,9 @@ export const FileIssueList = memo(function FileIssueList({
         return (
           <li
             key={keys[i]}
-            className="issue-item"
+            data-issue-key={keys[i]}
+            className={keys[i] === highlightedKey ? "issue-item issue-item-highlight" : "issue-item"}
+            onAnimationEnd={(e) => { if (e.target === e.currentTarget) setHighlightedKey(null); }}
             onContextMenu={(e) => actions.onContextMenu(e, issue.file_path)}
           >
             <div className="issue-item-header">
