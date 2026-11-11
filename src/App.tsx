@@ -16,6 +16,7 @@ import {
   moveEntryByKey,
   mapQueueEntryRecording,
   replaceSourceInQueue,
+  lastAddedEntryKey,
 } from "./queue";
 import {
   type CompoundArtistCheck,
@@ -2433,6 +2434,45 @@ function App() {
   const dragOverRef = useRef<string | null>(null);
   const [dragOverKey, setDragOverKey] = useState<string | null>(null);
   const queueListRef = useRef<HTMLOListElement>(null);
+  // What the Timeline showed at the last commit, so the effect below can tell
+  // which entry is new. Keyed on source id rather than the `currentTrack`
+  // object, which reconciliation and rating updates replace without the
+  // playing song changing.
+  const timelineSnapshotRef = useRef<{ currentSourceId: string | null; queueKeys: ReadonlySet<string> }>({
+    currentSourceId: null,
+    queueKeys: new Set(),
+  });
+
+  // Scroll the Timeline to show what just changed: the now-playing entry when
+  // the playing song changes (this wins if songs were also enqueued in the same
+  // commit), otherwise the last newly enqueued entry. Skipped while the pointer
+  // is over the Timeline's list (the user may be reading history; the header's
+  // Pomodoro / Auto DJ buttons deliberately don't count) or while an entry
+  // that is still queued is being dragged. A drag whose entry left the queue
+  // (auto-advance unmounted it, so onDragEnd never ran) doesn't count.
+  useEffect(() => {
+    const previous = timelineSnapshotRef.current;
+    const currentSourceId = currentTrack?.source.id ?? null;
+    timelineSnapshotRef.current = { currentSourceId, queueKeys: new Set(queue.map((entry) => entry.key)) };
+
+    const list = queueListRef.current;
+    const dragKey = dragRef.current;
+    if (
+      !list ||
+      list.matches(":hover") ||
+      (dragKey !== null && queue.some((entry) => entry.key === dragKey))
+    ) {
+      return;
+    }
+    const findTarget = (): Element | null => {
+      if (currentSourceId !== null && currentSourceId !== previous.currentSourceId) {
+        return list.querySelector(".queue-now-playing");
+      }
+      const addedKey = lastAddedEntryKey(previous.queueKeys, queue);
+      return addedKey === null ? null : list.querySelector(`[data-queue-key="${CSS.escape(addedKey)}"]`);
+    };
+    findTarget()?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [currentTrack, queue]);
 
   // Reorder the queue by moving the entry with `fromKey` to `overKey`. Resolved
   // inside the functional updater against the latest committed queue (not a
@@ -3635,6 +3675,7 @@ function App() {
                     <li
                       className={`queue-upcoming-item${dragOverKey === key ? " drag-over" : ""}`}
                       key={key}
+                      data-queue-key={key}
                       draggable
                       onDragStart={(e) => {
                         dragRef.current = key;

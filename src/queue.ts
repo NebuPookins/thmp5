@@ -156,3 +156,15 @@ export function replaceSourceInQueue(
     return replacement === null ? [] : [{ ...entry, recording: replacement }];
   });
 }
+
+/**
+ * Key of the last entry in `entries` whose key is not in `previousKeys`, i.e.
+ * the most recently enqueued entry, or null when nothing was added. Reordering,
+ * removal and reconciliation keep keys, so they never count as additions.
+ */
+export function lastAddedEntryKey(
+  previousKeys: ReadonlySet<string>,
+  entries: readonly QueueEntry[],
+): string | null {
+  return [...entries].reverse().find((entry) => !previousKeys.has(entry.key))?.key ?? null;
+}

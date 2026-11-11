@@ -7,6 +7,7 @@ import {
   makeQueueEntry,
   mapQueueEntryRecording,
   replaceSourceInQueue,
+  lastAddedEntryKey,
   type QueueEntry,
 } from "./queue";
 import { makeQueueItem } from "./testHelpers";
@@ -190,5 +191,31 @@ describe("replaceSourceInQueue", () => {
 
   it("returns the same array when no entry plays the source", () => {
     expect(replaceSourceInQueue(entries, "src-zzz", null)).toBe(entries);
+  });
+});
+
+// ── lastAddedEntryKey ────────────────────────────────────────────────────────
+
+describe("lastAddedEntryKey", () => {
+  it("returns null when no entry is new", () => {
+    expect(lastAddedEntryKey(new Set(["a", "b"]), [entry("b", "r2"), entry("a", "r1")])).toBeNull();
+  });
+
+  it("returns null when entries were only removed", () => {
+    expect(lastAddedEntryKey(new Set(["a", "b"]), [entry("b", "r2")])).toBeNull();
+  });
+
+  it("returns the key of a newly added entry", () => {
+    expect(lastAddedEntryKey(new Set(["a"]), [entry("a", "r1"), entry("b", "r2")])).toBe("b");
+  });
+
+  it("returns the last of several new entries", () => {
+    expect(
+      lastAddedEntryKey(new Set(["a"]), [entry("x", "r3"), entry("a", "r1"), entry("y", "r4")]),
+    ).toBe("y");
+  });
+
+  it("treats a duplicate recording under a new key as added", () => {
+    expect(lastAddedEntryKey(new Set(["a"]), [entry("a", "r1"), entry("b", "r1")])).toBe("b");
   });
 });
