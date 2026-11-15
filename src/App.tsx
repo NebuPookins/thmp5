@@ -2827,7 +2827,11 @@ function App() {
   // memoized and gets one stable actions object whose methods delegate to the
   // latest handlers through this ref.
   const latestIssueActions: FileIssueListActions = {
-    onContextMenu: (e, filePath) => openEntitySourceContextMenu(e, filePath),
+    onContextMenu: (e, filePath) => openEntitySourceContextMenu(
+      e,
+      filePath,
+      recordings.find((r) => r.source_paths.includes(filePath))?.id ?? null,
+    ),
     onClearManual: (filePath) => { void handleClearFileIssue(filePath); },
     onRelinkMissing: openRelink,
     onRemoveMissing: openRemoveMissing,
