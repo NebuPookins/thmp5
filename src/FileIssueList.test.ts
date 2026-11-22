@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findFirstIssueIndex, issueRowKeys, type FileIssue } from "./FileIssueList";
+import { findFirstIssueIndex, issueRowKeys, revealRowKey, type FileIssue } from "./FileIssueList";
 
 const issue = (over: Partial<FileIssue> = {}): FileIssue => ({
   file_path: "/a.mp3",
@@ -43,5 +43,25 @@ describe("findFirstIssueIndex", () => {
     expect(findFirstIssueIndex(issues, ["/zzz.mp3"])).toBeUndefined();
     expect(findFirstIssueIndex(issues, [])).toBeUndefined();
     expect(findFirstIssueIndex([], ["/a.mp3"])).toBeUndefined();
+  });
+});
+
+describe("revealRowKey", () => {
+  const issues = [
+    issue({ file_path: "/a.mp3" }),
+    issue({ file_path: "/b.mp3" }),
+  ];
+  const keys = issueRowKeys(issues);
+
+  it("returns undefined when there is nothing to reveal", () => {
+    expect(revealRowKey(issues, keys, null)).toBeUndefined();
+  });
+
+  it("returns undefined while the target issue is not in the list yet", () => {
+    expect(revealRowKey(issues, keys, ["/missing.mp3"])).toBeUndefined();
+  });
+
+  it("returns the target row's key once the issue is present", () => {
+    expect(revealRowKey(issues, keys, ["/b.mp3"])).toBe(keys[1]);
   });
 });

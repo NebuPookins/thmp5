@@ -1588,6 +1588,21 @@ function App() {
     }
   }, []);
 
+  // Fire-and-forget refresh of the issue list, used wherever a backend change
+  // (not the panel's own poll) may have mutated the in-memory issue log.
+  const refreshFileIssues = useCallback(() => {
+    const mutationsAtStart = issueMutationCounterRef.current;
+    invoke<FileIssue[]>("get_file_issues").then(
+      (issues) => {
+        // Drop a result that raced with a user mutation, matching the panel poll.
+        if (issueMutationCounterRef.current === mutationsAtStart) {
+          updateFileIssues(issues);
+        }
+      },
+      (e) => console.error("Failed to refresh file issues", e),
+    );
+  }, [updateFileIssues]);
+
   // `mouseleave` doesn't fire when the panel unmounts, so closing resets the
   // hover state itself.
   const closeIssuesPanel = useCallback(() => {
@@ -1634,6 +1649,9 @@ function App() {
         setIssuesRefreshError(null);
         if (issueMutationCounterRef.current === mutationsAtStart) {
           updateFileIssues(fetched, forceImmediate);
+          // A poll has replaced the list with fresh data, so a pending reveal can
+          // be resolved against it instead of waiting on a stale snapshot.
+          setHasPolledSinceOpen(true);
         } else {
           console.debug("Discarded a file issues poll result that raced with a mutation");
         }
@@ -1647,7 +1665,6 @@ function App() {
         if (!isCancelled) setIssuesRefreshError(message);
       }
       if (isCancelled) return;
-      if (forceImmediate) setHasPolledSinceOpen(true);
       timer = setTimeout(() => { void poll(false); }, FILE_ISSUES_POLL_MS);
     };
     void poll(true);
@@ -1835,6 +1852,13 @@ function App() {
           setError(event.payload.message);
         }
       });
+      // The backend emits this when the in-memory issue log changes (e.g. a
+      // playback error is recorded), so the ⚠ surfaces it without opening the panel.
+      const unlistenFileIssues = await listen("file-issues-changed", () => {
+        if (isMounted) {
+          refreshFileIssues();
+        }
+      });
       const unlistenJobUpdate = await listen<{remaining: number; job_type: string}>("job-update", (event) => {
         if (isMounted) {
           setPendingJobs(Math.max(0, event.payload.remaining));
@@ -1849,9 +1873,7 @@ function App() {
         // Surface newly found corrupt files without waiting for the issues panel to be opened.
         if (progress.damaged !== lastDamaged) {
           lastDamaged = progress.damaged;
-          invoke<FileIssue[]>("get_file_issues").then((issues) => updateFileIssues(issues), (e) => {
-            console.error("Failed to refresh file issues after integrity check", e);
-          });
+          refreshFileIssues();
         }
       });
       const unlistenLoved = await listen<LastFmLovedStatusEvent>("lastfm-loved-status", (event) => {
@@ -1876,6 +1898,7 @@ function App() {
         unlistenPosition();
         unlistenEnded();
         unlistenError();
+        unlistenFileIssues();
         unlistenJobUpdate();
         unlistenLoved();
         unlistenIntegrity();
@@ -4588,7 +4611,7 @@ function App() {
             {fileIssues.length === 0 && issuesRefreshError === null && (
               <p className="issue-empty">No file issues recorded.</p>
             )}
-            {/* Mounted even when empty, so a pending reveal is always consumed. */}
+            {/* Mounted even when empty, so a pending reveal is always resolved (scroll or give up). */}
             <FileIssueList
               issues={fileIssues}
               firstDupIndexByFile={firstDupIndexByFile}

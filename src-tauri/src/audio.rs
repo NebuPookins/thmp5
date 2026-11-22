@@ -30,6 +30,8 @@ pub const PLAYER_STATE_EVENT: &str = "player-state";
 pub const PLAYER_POSITION_EVENT: &str = "player-position";
 pub const PLAYER_TRACK_ENDED_EVENT: &str = "player-track-ended";
 pub const PLAYER_ERROR_EVENT: &str = "player-error";
+/// Emitted when the in-memory file-issue log changes so the frontend can refresh.
+pub const FILE_ISSUES_CHANGED_EVENT: &str = "file-issues-changed";
 
 const PREBUFFER_FRAMES: usize = 8_192;
 const MAX_BUFFER_FRAMES: usize = 96_000;
@@ -574,6 +576,16 @@ fn push_samples(producer: &mut Producer<f32>, buffer: &TrackBuffer, mut samples:
     true
 }
 
+/// Signal a track that failed before a decoder existed (open/probe failure) so
+/// the frontend advances to the next queue item instead of dead-stopping.
+fn report_failed_start(ctx: &AudioCallbackCtx, source_id: String) {
+    let _ = ctx.track_ended_tx.send(TrackEndedEvent {
+        source_id,
+        position_ms: 0,
+        reason: TrackEndReason::Failed,
+    });
+}
+
 fn handle_command(
     command: AudioCommand,
     shared: &Arc<Mutex<SharedState>>,
@@ -589,8 +601,15 @@ fn handle_command(
                 "Beginning streaming track load"
             );
             let file_path = request.file_path.clone();
+            let source_id = request.source_id.clone();
             if let Err(e) = start_playback(shared, ctx, app, request, 0) {
                 file_issues.push_playback_error(file_path, e.to_string());
+                // An open/probe failure never reaches the decode stage, so no decoder
+                // exists to signal its own end; report it so the queue advances.
+                report_failed_start(ctx, source_id);
+                // The in-memory issue log changed; tell the frontend to refresh so
+                // the ⚠ indicator surfaces it without opening the File Issues panel.
+                let _ = app.emit(FILE_ISSUES_CHANGED_EVENT, ());
                 return Err(e);
             }
         }
@@ -1799,6 +1818,25 @@ mod tests {
             1.0
         );
         assert!(!ctx.normalization_enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_start_signals_a_failed_track_end() {
+        let (ptx, _prx) = mpsc::channel();
+        let (stx, _srx) = mpsc::channel();
+        let (ttx, track_ended) = mpsc::channel();
+        let ctx = AudioCallbackCtx::new(48_000, 2, ptx, stx, ttx);
+
+        report_failed_start(&ctx, "src-1".to_string());
+
+        let event = track_ended
+            .try_recv()
+            .expect("a failed start must signal track end");
+        assert_eq!(event.source_id.as_str(), "src-1");
+        assert_eq!(event.position_ms, 0);
+        assert_eq!(event.reason, TrackEndReason::Failed);
+        // The end is signalled exactly once.
+        assert!(track_ended.try_recv().is_err());
     }
 
     #[test]

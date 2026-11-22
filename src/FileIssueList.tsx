@@ -50,6 +50,21 @@ export function findFirstIssueIndex(
   return index === -1 ? undefined : index;
 }
 
+/**
+ * The row key of the first issue in `revealPaths`, or `undefined` when no
+ * matching issue is in the current list (including when there is nothing to
+ * reveal).
+ */
+export function revealRowKey(
+  issues: readonly FileIssue[],
+  keys: readonly string[],
+  revealPaths: readonly string[] | null,
+): string | undefined {
+  if (revealPaths === null) return undefined;
+  const index = findFirstIssueIndex(issues, revealPaths);
+  return index === undefined ? undefined : keys[index];
+}
+
 export type FileIssueListActions = {
   onContextMenu: (e: React.MouseEvent, filePath: string) => void;
   onClearManual: (filePath: string) => void;
@@ -90,23 +105,25 @@ export const FileIssueList = memo(function FileIssueList({
 
   useEffect(() => {
     if (revealPaths === null) return;
-    onRevealHandled();
-    const index = findFirstIssueIndex(issues, revealPaths);
-    const key = index === undefined ? undefined : keys[index];
+    const key = revealRowKey(issues, keys, revealPaths);
     const row = key === undefined
       ? undefined
       : Array.from(listRef.current?.children ?? []).find(
         (el) => el instanceof HTMLElement && el.dataset.issueKey === key,
       );
-    if (key === undefined || row === undefined) {
-      frontendLog("warn", "File Issues: no issue row found to reveal", {
+    if (key !== undefined && row !== undefined) {
+      row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      setHighlightedKey(key);
+    } else {
+      frontendLog("debug", "File Issues: no issue row found to reveal", {
         filePaths: revealPaths,
         issueCount: issues.length,
       });
-      return;
     }
-    row.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    setHighlightedKey(key);
+    // One-shot: revealPaths is only passed once the panel has polled fresh data
+    // (see the hasPolledSinceOpen gate in App), so a miss means the issue is
+    // genuinely absent and we stop waiting rather than pinging on every poll.
+    onRevealHandled();
   }, [revealPaths, onRevealHandled, issues, keys]);
 
   return (
