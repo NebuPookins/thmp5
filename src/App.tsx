@@ -2251,7 +2251,7 @@ function App() {
       if (folder === null) return;
       await invoke("rescan_folder", { path: folder });
     } catch (scanError) {
-      setError(scanError instanceof Error ? scanError.message : String(scanError));
+      setError(errorMessage(scanError));
     }
   }
 

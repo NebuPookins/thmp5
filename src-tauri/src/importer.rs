@@ -1,14 +1,13 @@
 use crate::db::DbPool;
 use crate::file_issues::FileIssueLog;
 use crate::library::import::{prepare_import, store_prepared_import};
-use crate::library::scanner::is_audio_file;
+use crate::library::scanner::walk_audio_files;
 use crate::models::ImportProgress;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use walkdir::WalkDir;
 
 #[derive(Clone)]
 pub struct ImportManager {
@@ -115,13 +114,13 @@ async fn run_scan(
 
     let mut tasks = JoinSet::new();
     let mut last_log = std::time::Instant::now();
-    for entry in WalkDir::new(path).follow_links(true) {
+    for entry in walk_audio_files(path) {
         match entry {
-            Ok(entry) if entry.file_type().is_file() && is_audio_file(entry.path()) => {
+            Ok(file) => {
                 {
                     let mut state = progress.lock().expect("import progress mutex poisoned");
                     state.scanned += 1;
-                    state.current_path = Some(entry.path().display().to_string());
+                    state.current_path = Some(file.display().to_string());
                 }
                 if last_log.elapsed() >= std::time::Duration::from_secs(5) {
                     let state = progress.lock().expect("import progress mutex poisoned");
@@ -140,7 +139,7 @@ async fn run_scan(
                 }
 
                 let db = db.clone();
-                let path = entry.path().to_path_buf();
+                let path = file;
                 let acoustid_key = acoustid_key.map(ToOwned::to_owned);
                 let progress = Arc::clone(progress);
                 tasks.spawn(async move {
@@ -154,7 +153,6 @@ async fn run_scan(
                     (path, prepared)
                 });
             }
-            Ok(_) => {}
             Err(error) => {
                 let mut state = progress.lock().expect("import progress mutex poisoned");
                 state.errors += 1;

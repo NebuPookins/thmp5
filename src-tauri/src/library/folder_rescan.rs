@@ -1,11 +1,10 @@
 //! Planning for "Rescan folder": which library files under a folder to re-read, and which audio
 //! files found there are new to the library and need importing.
 
-use super::scanner::is_audio_file;
+use super::scanner::{describe_walk_error, walk_audio_files};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 /// The work a rescan does. `rescan` holds library files to re-read (a missing one is reported as a
 /// failure, not removed), `import` holds audio files not yet in the library, and `walk_errors`
@@ -25,8 +24,9 @@ impl RescanPlan {
         }
     }
 
-    pub fn total(&self) -> usize {
-        self.rescan.len() + self.import.len() + self.walk_errors.len()
+    /// Files the plan reads: library files to rescan plus new files to import.
+    pub fn file_count(&self) -> usize {
+        self.rescan.len() + self.import.len()
     }
 }
 
@@ -54,30 +54,26 @@ pub fn resolve_folder_in_root(folder: &Path, music_root: &Path) -> Result<Option
 /// Plan a recursive rescan of `folder`: every library path under it is re-read, and every audio
 /// file found under it that is not in `library_paths` is imported. Walks the file system.
 pub fn plan_folder_rescan(folder: &Path, library_paths: Vec<String>) -> RescanPlan {
-    let known: HashSet<&str> = library_paths.iter().map(String::as_str).collect();
-    let (import, walk_errors) = WalkDir::new(folder).follow_links(true).into_iter().fold(
-        (Vec::new(), Vec::new()),
-        |(mut import, mut errors), entry| {
+    let (import, walk_errors) = {
+        let known: HashSet<&str> = library_paths.iter().map(String::as_str).collect();
+        let mut import = Vec::new();
+        let mut walk_errors = Vec::new();
+        for entry in walk_audio_files(folder) {
             match entry {
-                Ok(e) if e.file_type().is_file() && is_audio_file(e.path()) => {
-                    let path = e.path().to_string_lossy().into_owned();
+                Ok(file) => {
+                    let path = file.to_string_lossy().into_owned();
                     if !known.contains(path.as_str()) {
                         import.push(path);
                     }
                 }
-                Ok(_) => {}
-                Err(error) => errors.push(match error.path() {
-                    Some(p) => format!("{}: {error}", p.display()),
-                    None => error.to_string(),
-                }),
+                Err(error) => walk_errors.push(describe_walk_error(&error)),
             }
-            (import, errors)
-        },
-    );
+        }
+        (import, walk_errors)
+    };
     let rescan = library_paths
-        .iter()
+        .into_iter()
         .filter(|p| Path::new(p).starts_with(folder))
-        .cloned()
         .collect();
     RescanPlan {
         rescan,

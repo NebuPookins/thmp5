@@ -272,20 +272,27 @@ async fn run_rescan_plan(
     state: &tauri::State<'_, AppState>,
     plan: RescanPlan,
 ) -> Result<(), CommandError> {
-    let total = plan.total();
-    let file_count = (plan.rescan.len() + plan.import.len()) as i64;
-    state.pending_jobs.fetch_add(file_count, Ordering::Relaxed);
+    let file_count = plan.file_count();
+    let total = file_count + plan.walk_errors.len();
+    state
+        .pending_jobs
+        .fetch_add(file_count as i64, Ordering::Relaxed);
     emit_job_update(app, state, "rescan");
 
     for error in &plan.walk_errors {
         tracing::error!("Rescan: directory walk error: {error}");
     }
     let mut failed_paths: Vec<String> = plan.walk_errors;
+    let mut finish_file = |failure: Option<String>| {
+        failed_paths.extend(failure);
+        state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+        emit_job_update(app, state, "rescan");
+    };
     for path in plan.rescan {
-        let source_path = std::path::Path::new(&path);
-        if !source_path.is_file() {
-            tracing::error!(path = %source_path.display(), "Rescan skipped: source file is missing");
-            failed_paths.push(source_path.display().to_string());
+        let source_path = Path::new(&path);
+        let failed = if !source_path.is_file() {
+            tracing::error!(path = %path, "Rescan skipped: source file is missing");
+            true
         } else if let Err(error) = do_rescan_source(
             &state.db,
             source_path,
@@ -295,28 +302,28 @@ async fn run_rescan_plan(
         )
         .await
         {
-            tracing::error!(path = %source_path.display(), "Rescan failed: {error:#}");
-            failed_paths.push(source_path.display().to_string());
-        }
-        state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
-        emit_job_update(app, state, "rescan");
+            tracing::error!(path = %path, "Rescan failed: {error:#}");
+            true
+        } else {
+            false
+        };
+        finish_file(failed.then_some(path));
     }
     for path in plan.import {
-        if let Err(error) = import_file(
+        let result = import_file(
             &state.db,
             Path::new(&path),
             state.acoustid_api_key.as_deref(),
             &state.write_serializer,
         )
-        .await
-        {
+        .await;
+        let failure = result.err().map(|error| {
             let detail = format!("{error:#}");
             tracing::error!(path = %path, "Import during rescan failed: {detail}");
             state.file_issues.push_import_error(path.clone(), detail);
-            failed_paths.push(path);
-        }
-        state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
-        emit_job_update(app, state, "rescan");
+            path
+        });
+        finish_file(failure);
     }
 
     reload_catalog(state, Announce::Frontend).await;
@@ -480,7 +487,7 @@ pub async fn rescan_folder(
     let plan = tokio::task::spawn_blocking(move || plan_folder_rescan(&folder, library_paths))
         .await
         .context("Folder walk task panicked")?;
-    if plan.total() == 0 {
+    if plan.file_count() == 0 && plan.walk_errors.is_empty() {
         return Err(CommandError::rejected(
             "No audio files found in this folder.",
         ));

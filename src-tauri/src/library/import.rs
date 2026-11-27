@@ -1,4 +1,7 @@
-use super::scanner::{build_raw_tags_json, is_audio_file, read_metadata, verify_audio};
+use super::scanner::{
+    build_raw_tags_json, describe_walk_error, is_audio_file, read_metadata, verify_audio,
+    walk_audio_files,
+};
 use crate::audio_probe::StreamIntegrity;
 use crate::db::DbPool;
 use crate::file_issues::{FileIssueKind, FileIssueLog};
@@ -12,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 /// Set the calling thread's I/O priority to idle class (Linux only).
 pub(super) fn set_io_priority_idle() {
@@ -62,11 +64,11 @@ pub async fn import_paths(
     for path_str in paths {
         let path = Path::new(&path_str);
         if path.is_dir() {
-            for entry in WalkDir::new(path).follow_links(true) {
+            for entry in walk_audio_files(path) {
                 match entry {
-                    Ok(e) if e.file_type().is_file() && is_audio_file(e.path()) => {
+                    Ok(file) => {
                         stats.scanned += 1;
-                        match import_file(db, e.path(), acoustid_key, serializer).await {
+                        match import_file(db, &file, acoustid_key, serializer).await {
                             Ok(true) => stats.imported += 1,
                             Ok(false) => stats.skipped += 1,
                             Err(e) => {
@@ -77,15 +79,11 @@ pub async fn import_paths(
                         }
                     }
                     Err(e) => {
-                        let msg = match e.path() {
-                            Some(p) => format!("{}: {}", p.display(), e),
-                            None => e.to_string(),
-                        };
+                        let msg = describe_walk_error(&e);
                         println!("[importer] import error: {msg}");
                         stats.errors += 1;
                         stats.error_messages.push(msg);
                     }
-                    _ => {}
                 }
             }
         } else if path.is_file() && is_audio_file(path) {

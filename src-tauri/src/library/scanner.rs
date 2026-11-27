@@ -727,6 +727,31 @@ pub fn is_audio_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Recursively walk `root` (following symlinks), yielding each audio file and each entry that
+/// could not be read. Every library walk goes through this so they agree on what they find.
+pub fn walk_audio_files(
+    root: &Path,
+) -> impl Iterator<Item = std::result::Result<std::path::PathBuf, walkdir::Error>> {
+    walkdir::WalkDir::new(root)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(e) if e.file_type().is_file() && is_audio_file(e.path()) => {
+                Some(Ok(e.into_path()))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+}
+
+/// Describe a walk error, naming the entry when known.
+pub fn describe_walk_error(error: &walkdir::Error) -> String {
+    match error.path() {
+        Some(p) => format!("{}: {error}", p.display()),
+        None => error.to_string(),
+    }
+}
+
 /// Read audio metadata from a file using Lofty.
 ///
 /// Returns `(metadata, duplicate_frame_overrides)` where
