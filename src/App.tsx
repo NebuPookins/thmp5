@@ -2,6 +2,7 @@ import { FormEvent, memo, useCallback, useEffect, useLayoutEffect, useMemo, useR
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import EntityDetailView, { type DetailNav } from "./EntityDetailView";
 import { pickNextTrack, pinPrimarySource, pinSource, type QueueItem, type RecordingRow } from "./autoDj";
@@ -2238,6 +2239,22 @@ function App() {
     }
   }
 
+  async function handleRescanFolder() {
+    setError(null);
+    try {
+      const folder = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: bootstrap?.config.music_root ?? undefined,
+        title: "Rescan folder",
+      });
+      if (folder === null) return;
+      await invoke("rescan_folder", { path: folder });
+    } catch (scanError) {
+      setError(scanError instanceof Error ? scanError.message : String(scanError));
+    }
+  }
+
   async function saveQueueSettings() {
     const parsed = Number.parseInt(queueHistoryLimitInput, 10);
     if (!Number.isFinite(parsed) || parsed < 1) {
@@ -3844,6 +3861,14 @@ function App() {
                   type="button"
                 >
                   Rescan all files
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={!bootstrap?.config.music_root}
+                  onClick={() => { void handleRescanFolder(); }}
+                  type="button"
+                >
+                  Rescan folder…
                 </button>
               </div>
             </div>

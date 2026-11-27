@@ -477,10 +477,9 @@ pub async fn rescan_folder(
     })?;
 
     let library_paths = list_local_source_paths(&state.db).await?;
-    let plan =
-        tokio::task::spawn_blocking(move || plan_folder_rescan(&folder, library_paths))
-            .await
-            .context("Folder walk task panicked")?;
+    let plan = tokio::task::spawn_blocking(move || plan_folder_rescan(&folder, library_paths))
+        .await
+        .context("Folder walk task panicked")?;
     if plan.total() == 0 {
         return Err(CommandError::rejected(
             "No audio files found in this folder.",
