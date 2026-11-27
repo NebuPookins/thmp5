@@ -226,6 +226,36 @@ export type RelinkSubject = {
   message: string;
 };
 
+export type RemoveMissingState =
+  | { phase: "closed" }
+  | { phase: "open"; subject: RelinkSubject; status: "ready" | "removing"; error: string | null };
+
+export type RemoveMissingAction =
+  | { type: "open"; subject: RelinkSubject }
+  | { type: "remove" }
+  | { type: "removeOk" }
+  | { type: "removeErr"; error: string }
+  | { type: "close" };
+
+export function removeMissingReducer(state: RemoveMissingState, action: RemoveMissingAction): RemoveMissingState {
+  switch (action.type) {
+    case "open":
+      return { phase: "open", subject: action.subject, status: "ready", error: null };
+    case "remove":
+      return state.phase === "open" && state.status === "ready"
+        ? { ...state, status: "removing", error: null }
+        : state;
+    case "removeOk":
+      return state.phase === "open" && state.status === "removing" ? { phase: "closed" } : state;
+    case "removeErr":
+      return state.phase === "open" && state.status === "removing"
+        ? { ...state, status: "ready", error: action.error }
+        : state;
+    case "close":
+      return state.phase === "open" && state.status === "ready" ? { phase: "closed" } : state;
+  }
+}
+
 /** A live library source the missing source's data can be moved onto. */
 export type RelinkCandidate = {
   source_id: string;

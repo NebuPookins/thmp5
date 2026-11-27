@@ -118,42 +118,31 @@ export function moveEntryByKey<T extends { key: string }>(
 }
 
 /**
- * Apply `fn` to each entry's recording, preserving its stable key. Returns the
- * original array reference when no recording changed, so callers can skip a
- * state update.
+ * Map each item through `fn`, dropping those it maps to null, in one pass.
+ * Returns the original array reference when every item maps to itself, so
+ * callers can skip a state update.
  */
-export function mapQueueEntryRecording(
-  entries: QueueEntry[],
-  fn: (recording: QueueItem) => QueueItem,
-): QueueEntry[] {
-  let changed = false;
-  const next = entries.map((entry) => {
-    const recording = fn(entry.recording);
-    if (recording !== entry.recording) {
-      changed = true;
-      return { ...entry, recording };
-    }
-    return entry;
+export function filterMapStable<T>(items: T[], fn: (item: T) => T | null): T[] {
+  const next = items.flatMap((item) => {
+    const mapped = fn(item);
+    return mapped === null ? [] : [mapped];
   });
-  return changed ? next : entries;
+  return next.length === items.length && next.every((item, index) => item === items[index]) ? items : next;
 }
 
 /**
- * Replace every queued entry playing `deadSourceId` with `replacement`, keeping each entry's
- * stable key, or drop those entries when `replacement` is null. Returns the original array
- * when no entry is affected.
+ * Apply `fn` to each entry's recording, preserving its stable key, and drop the
+ * entries it maps to null. Returns the original array reference when no
+ * recording changed, so callers can skip a state update.
  */
-export function replaceSourceInQueue(
+export function mapQueueEntryRecording(
   entries: QueueEntry[],
-  deadSourceId: string,
-  replacement: QueueItem | null,
+  fn: (recording: QueueItem) => QueueItem | null,
 ): QueueEntry[] {
-  if (!entries.some((entry) => entry.recording.source.id === deadSourceId)) {
-    return entries;
-  }
-  return entries.flatMap((entry) => {
-    if (entry.recording.source.id !== deadSourceId) return [entry];
-    return replacement === null ? [] : [{ ...entry, recording: replacement }];
+  return filterMapStable(entries, (entry) => {
+    const recording = fn(entry.recording);
+    if (recording === null) return null;
+    return recording === entry.recording ? entry : { ...entry, recording };
   });
 }
 

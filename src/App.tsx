@@ -15,9 +15,10 @@ import {
   makeQueueEntry,
   moveEntryByKey,
   mapQueueEntryRecording,
-  replaceSourceInQueue,
+  filterMapStable,
   lastAddedEntryKey,
 } from "./queue";
+import { refreshItem, repinItem, snapshotOf } from "./queueReconciliation";
 import {
   type CompoundArtistCheck,
   type MergeConflict,
@@ -25,6 +26,7 @@ import {
   mergeModalReducer,
   canSubmitRelink,
   relinkModalReducer,
+  removeMissingReducer,
   type FileDisposal,
   type ReplaceCorruptOutcome,
   type RelinkCandidate,
@@ -522,37 +524,8 @@ async function reportPoolTimeout(context: string, value: unknown) {
   }
 }
 
-function reconcileRecording(recording: RecordingRow, recordingsById: Map<string, RecordingRow>): RecordingRow {
+function reconcileRecording(recording: RecordingRow, recordingsById: ReadonlyMap<string, RecordingRow>): RecordingRow {
   return recordingsById.get(recording.id) ?? recording;
-}
-
-/** Refresh an item's recording data while keeping it pinned to the same source. */
-function reconcileItem(item: QueueItem, recordingsById: Map<string, RecordingRow>): QueueItem {
-  const fresh = recordingsById.get(item.id);
-  if (!fresh) {
-    return item;
-  }
-  const source = fresh.sources.find((s) => s.id === item.source.id) ?? item.source;
-  // Already derived from this exact recording: keep the reference so the
-  // reconcile effect (which depends on the lists it updates) settles.
-  return item.sources === fresh.sources && item.source === source ? item : { ...fresh, source };
-}
-
-function reconcileRecordingList<T extends RecordingRow>(
-  items: T[],
-  recordingsById: Map<string, RecordingRow>,
-  reconcile: (item: T, byId: Map<string, RecordingRow>) => T,
-): T[] {
-  let changed = false;
-  const nextItems = items.map((item) => {
-    const nextItem = reconcile(item, recordingsById);
-    if (nextItem !== item) {
-      changed = true;
-    }
-    return nextItem;
-  });
-
-  return changed ? nextItems : items;
 }
 
 function applyAggregateRatings<T extends { id: string; rating: number | null }>(
@@ -653,6 +626,9 @@ function App() {
   const [currentTrack, setCurrentTrack] = useState<QueueItem | null>(null);
   const currentTrackRef = useRef<QueueItem | null>(null);
   const playerSourceIdRef = useRef<string | null>(null);
+  // Dead source id -> the source Relink / Replace corrupt merged it onto, so a
+  // queued or played item follows its data even onto a different recording.
+  const sourceRedirectsRef = useRef<ReadonlyMap<string, string>>(new Map());
   // The source the backend actually started for a requested one (they differ
   // when a missing file fell back to another copy). Set when `play` resolves.
   const startedSourceRef = useRef<{ requested: string; actual: string } | null>(null);
@@ -760,9 +736,7 @@ function App() {
   // ── Missing-file issues: relink onto another source, or remove ──────────
   const [relinkModal, relinkDispatch] = useReducer(relinkModalReducer, { phase: "closed" });
   const nextRelinkRequestId = useRequestId();
-  const [removeMissing, setRemoveMissing] = useState<
-    { subject: RelinkSubject; removing: boolean; error: string | null } | null
-  >(null);
+  const [removeMissing, removeMissingDispatch] = useReducer(removeMissingReducer, { phase: "closed" });
   const relinkOpen = relinkModal.phase === "open" ? relinkModal : null;
 
   const subjectOfIssue = (issue: FileIssue): RelinkSubject | null => {
@@ -808,14 +782,11 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [relinkOpen?.query, relinkOpen?.subject.sourceId]);
 
-  /** After a source is merged away or removed: fix up the queue and drop its issues from the list. */
-  function afterSourceMergedAway(subject: RelinkSubject, replacement: QueueItem | null) {
-    setQueue((current) => replaceSourceInQueue(current, subject.sourceId, replacement));
-    setHistory((current) =>
-      current.flatMap((item) =>
-        item.source.id !== subject.sourceId ? [item] : replacement ? [replacement] : [],
-      ),
-    );
+  /**
+   * After a source is merged away or removed: drop its issues from the list, and stop it if it is
+   * the current track. The catalog reload re-pins the queue and history (see `repinToLiveSources`).
+   */
+  function afterSourceMergedAway(subject: RelinkSubject) {
     removeFileIssues((fi) => fi.source_id === subject.sourceId || fi.file_path === subject.filePath);
     // The source row is gone (e.g. the corrupt side was being auditioned in the compare step), so
     // stop it rather than later recording a play or rating against a deleted source id.
@@ -831,15 +802,26 @@ function App() {
     // A different track may have been started during the await; leave it alone.
     if (currentTrackRef.current?.source.id === sourceId) clearCurrentTrack("source merged away");
   }
+  /**
+   * Record the redirect before the merge command runs: the backend announces the catalog reload
+   * before the command returns, so the reload can land first. A redirect is only followed once its
+   * dead source is gone from the catalog, so a failed merge leaves it inert.
+   */
+  function rememberSourceRedirect(deadSourceId: string, targetSourceId: string) {
+    sourceRedirectsRef.current = new Map(sourceRedirectsRef.current).set(deadSourceId, targetSourceId);
+  }
+  /** Undo `rememberSourceRedirect` for a merge that did not happen, unless a later merge replaced it. */
+  function forgetSourceRedirect(deadSourceId: string, targetSourceId: string) {
+    if (sourceRedirectsRef.current.get(deadSourceId) !== targetSourceId) return;
+    sourceRedirectsRef.current = new Map([...sourceRedirectsRef.current].filter(([dead]) => dead !== deadSourceId));
+  }
   const applyRelink = (disposal: FileDisposal = "trash") => {
     if (relinkModal.phase !== "open" || relinkModal.selectedSourceId === null || !canSubmitRelink(relinkModal)) return;
     const { subject, requestId, selectedSourceId } = relinkModal;
     const { kind } = relinkModal;
     const { command } = RELINK_KINDS[kind];
-    const target = relinkModal.candidates.find((c) => c.source_id === selectedSourceId);
-    const targetRecording = target ? recordings.find((r) => r.id === target.recording_id) : undefined;
-    const replacement = targetRecording ? pinSource(targetRecording, selectedSourceId) : null;
     relinkDispatch({ type: "submit" });
+    rememberSourceRedirect(subject.sourceId, selectedSourceId);
     void (async () => {
       let trashFailedMessage: string | null = null;
       const ok = await runIssueMutation(
@@ -861,12 +843,16 @@ function App() {
                 message: result.message,
               });
               trashFailedMessage = result.message;
+              forgetSourceRedirect(subject.sourceId, selectedSourceId);
               return;
             }
           }
-          afterSourceMergedAway(subject, replacement);
+          afterSourceMergedAway(subject);
         },
-        (message) => relinkDispatch({ type: "submitErr", requestId, error: message }),
+        (message) => {
+          forgetSourceRedirect(subject.sourceId, selectedSourceId);
+          relinkDispatch({ type: "submitErr", requestId, error: message });
+        },
       );
       if (ok) {
         relinkDispatch(
@@ -879,23 +865,23 @@ function App() {
   };
   const openRemoveMissing = (issue: FileIssue) => {
     const subject = subjectOfIssue(issue);
-    if (subject) setRemoveMissing({ subject, removing: false, error: null });
+    if (subject) removeMissingDispatch({ type: "open", subject });
   };
-  const closeRemoveMissing = () => setRemoveMissing((current) => (current?.removing ? current : null));
+  const closeRemoveMissing = () => removeMissingDispatch({ type: "close" });
   const applyRemoveMissing = () => {
-    if (!removeMissing || removeMissing.removing) return;
+    if (removeMissing.phase !== "open" || removeMissing.status !== "ready") return;
     const { subject } = removeMissing;
-    setRemoveMissing({ subject, removing: true, error: null });
+    removeMissingDispatch({ type: "remove" });
     void (async () => {
       const ok = await runIssueMutation(
         `remove missing source ${subject.sourceId} (${subject.filePath})`,
         async () => {
           await invoke("remove_missing_source", { sourceId: subject.sourceId });
-          afterSourceMergedAway(subject, null);
+          afterSourceMergedAway(subject);
         },
-        (message) => setRemoveMissing({ subject, removing: false, error: message }),
+        (message) => removeMissingDispatch({ type: "removeErr", error: message }),
       );
-      if (ok) setRemoveMissing(null);
+      if (ok) removeMissingDispatch({ type: "removeOk" });
     })();
   };
   const missingFileIssue = (path: string): FileIssue | undefined =>
@@ -1184,6 +1170,28 @@ function App() {
   });
   const libraryReadyRef = useRef(false);
 
+  /**
+   * Re-pin queued and played items whose source has gone (Remove, Relink, Replace corrupt, a
+   * rescan...) to a live one, or drop them. Only call with the rows of a complete, consistent
+   * load. Skipped while a newer generation is still to be loaded, since the rows may then lack
+   * recordings the queue already holds; that load calls this again. The current track is left
+   * alone: changing its source would restart playback, and commands that delete a source stop it.
+   */
+  function repinToLiveSources(rows: readonly RecordingRow[], generation: number) {
+    const { wantedGeneration } = catalogSyncRef.current;
+    if (wantedGeneration > generation) {
+      frontendLog("debug", "Deferred re-pinning queue to live sources: a newer catalog generation is pending", {
+        wanted: wantedGeneration,
+        loaded: generation,
+      });
+      return;
+    }
+    const snapshot = snapshotOf(rows);
+    const redirects = sourceRedirectsRef.current;
+    setQueue((current) => mapQueueEntryRecording(current, (item) => repinItem(item, snapshot, redirects)));
+    setHistory((current) => filterMapStable(current, (item) => repinItem(item, snapshot, redirects)));
+  }
+
   /** Loads every recording and returns the catalog generation they were read from. */
   async function loadRecordings(): Promise<number> {
     // Pages are only consistent with each other when read from one catalog
@@ -1191,7 +1199,7 @@ function App() {
     // final attempt is not strict: it logs the change and keeps going rather
     // than leave the list empty.
     type PagedLoad =
-      | { readonly kind: "loaded"; readonly rows: RecordingRow[]; readonly generation: number }
+      | { readonly kind: "loaded"; readonly rows: RecordingRow[]; readonly generation: number; readonly consistent: boolean }
       | { readonly kind: "changed"; readonly from: number; readonly to: number };
 
     const loadPages = async (
@@ -1199,12 +1207,14 @@ function App() {
       generation: number | null = null,
       pages: readonly RecordingRow[][] = [],
       offset = 0,
+      consistent = true,
     ): Promise<PagedLoad> => {
       const page = await invoke<RecordingPage>("list_recordings", {
         limit: RECORDINGS_PAGE_SIZE,
         offset,
       });
-      if (generation !== null && page.generation !== generation) {
+      const torn = generation !== null && page.generation !== generation;
+      if (torn) {
         if (strict) {
           return { kind: "changed", from: generation, to: page.generation };
         }
@@ -1219,14 +1229,15 @@ function App() {
       const oldest = generation ?? page.generation;
       const loaded = [...pages, page.rows];
       return page.rows.length < RECORDINGS_PAGE_SIZE
-        ? { kind: "loaded", rows: loaded.flat(), generation: oldest }
-        : loadPages(strict, oldest, loaded, offset + page.rows.length);
+        ? { kind: "loaded", rows: loaded.flat(), generation: oldest, consistent: consistent && !torn }
+        : loadPages(strict, oldest, loaded, offset + page.rows.length, consistent && !torn);
     };
 
     for (let attempt = 1; ; attempt++) {
       const result = await loadPages(attempt < RECORDINGS_LOAD_MAX_ATTEMPTS);
       if (result.kind === "loaded") {
         setRecordings(result.rows);
+        if (result.consistent) repinToLiveSources(result.rows, result.generation);
         loadedGenerationRef.current = Math.max(loadedGenerationRef.current, result.generation);
         return result.generation;
       }
@@ -1779,20 +1790,21 @@ function App() {
     };
   }, [bootstrap?.needs_setup, bootstrap?.import_progress.is_running]);
 
+  const recordingsSnapshot = useMemo(() => snapshotOf(recordings), [recordings]);
   useEffect(() => {
     if (recordings.length === 0) {
       return;
     }
 
-    const recordingsById = new Map(recordings.map((recording) => [recording.id, recording] as const));
-    setHistory((current) => reconcileRecordingList(current, recordingsById, reconcileItem));
-    setQueue((current) => mapQueueEntryRecording(current, (item) => reconcileItem(item, recordingsById)));
-    setCurrentTrack((current) => (current ? reconcileItem(current, recordingsById) : current));
+    const { recordingsById } = recordingsSnapshot;
+    setHistory((current) => filterMapStable(current, (item) => refreshItem(item, recordingsSnapshot)));
+    setQueue((current) => mapQueueEntryRecording(current, (item) => refreshItem(item, recordingsSnapshot)));
+    setCurrentTrack((current) => (current ? refreshItem(current, recordingsSnapshot) : current));
     setSmartResult((current) => (
       current
         ? {
             ...current,
-            recordings: reconcileRecordingList(current.recordings, recordingsById, reconcileRecording),
+            recordings: filterMapStable(current.recordings, (recording) => reconcileRecording(recording, recordingsById)),
           }
         : current
     ));
@@ -1804,7 +1816,8 @@ function App() {
           }
         : current
     ));
-  }, [recordings, currentTrack, queue, history, smartResult]);
+  }, [recordingsSnapshot, currentTrack, queue, history, smartResult]);
+
 
   useEffect(() => {
     let isMounted = true;
@@ -4218,7 +4231,7 @@ function App() {
         />
       )}
 
-      {removeMissing !== null && (
+      {removeMissing.phase === "open" && (
         <div className="modal-overlay" onClick={closeRemoveMissing} role="dialog" aria-modal="true">
           <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 480 }}>
             <div className="modal-header">
@@ -4239,11 +4252,11 @@ function App() {
               <button className="comparison-cancel-btn" onClick={closeRemoveMissing} type="button">Cancel</button>
               <button
                 className="comparison-confirm-btn"
-                disabled={removeMissing.removing}
+                disabled={removeMissing.status === "removing"}
                 onClick={applyRemoveMissing}
                 type="button"
               >
-                {removeMissing.removing ? "Removing…" : "Remove"}
+                {removeMissing.status === "removing" ? "Removing…" : "Remove"}
               </button>
             </div>
           </div>

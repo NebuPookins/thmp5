@@ -5,6 +5,7 @@ import {
   canCompareRelink,
   canSubmitRelink,
   relinkModalReducer,
+  removeMissingReducer,
   splitModalReducer,
   type ArtistFixState,
   type CompoundArtistCheck,
@@ -175,6 +176,26 @@ describe("mergeModalReducer", () => {
 // ── relinkModalReducer ──────────────────────────────────────────────────────
 
 const subject: RelinkSubject = { sourceId: "dead", filePath: "/gone.mp3", message: "File not found" };
+
+describe("removeMissingReducer", () => {
+  it("keeps the modal open with an error when removal fails", () => {
+    const open = removeMissingReducer({ phase: "closed" }, { type: "open", subject });
+    const removing = removeMissingReducer(open, { type: "remove" });
+
+    expect(removeMissingReducer(removing, { type: "removeErr", error: "boom" })).toEqual({
+      phase: "open", subject, status: "ready", error: "boom",
+    });
+  });
+
+  it("does not close or accept a second removal while the write is in flight", () => {
+    const open = removeMissingReducer({ phase: "closed" }, { type: "open", subject });
+    const removing = removeMissingReducer(open, { type: "remove" });
+
+    expect(removeMissingReducer(removing, { type: "close" })).toBe(removing);
+    expect(removeMissingReducer(removing, { type: "remove" })).toBe(removing);
+    expect(removeMissingReducer(removing, { type: "removeOk" })).toEqual({ phase: "closed" });
+  });
+});
 
 function candidate(sourceId: string): RelinkCandidate {
   return {
