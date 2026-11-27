@@ -1,7 +1,10 @@
 use crate::audio::PlayRequest as EnginePlayRequest;
 use crate::command_error::CommandError;
 use crate::file_issues::{sorted_by_rating_desc, suppress_for_missing, FileIssue, FileIssueKind};
-use crate::library::import::{import_paths as do_import, rescan_source as do_rescan_source};
+use crate::library::folder_rescan::{plan_folder_rescan, resolve_folder_in_root, RescanPlan};
+use crate::library::import::{
+    import_file, import_paths as do_import, rescan_source as do_rescan_source,
+};
 use crate::library::source_merge::{
     delete_source, find_missing_sources, merge_source_into, source_file_state, user_data_of,
     SourceFileState,
@@ -252,19 +255,33 @@ pub async fn rescan_sources(
     rescan_path_list(&app, &state, trimmed).await
 }
 
-/// Shared loop: track per-file counter in AppState, emit `job-update` after each file.
+/// Re-read each of `paths` (library files) into the DB; see [`run_rescan_plan`].
 async fn rescan_path_list(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<(), CommandError> {
-    let count = paths.len() as i64;
-    state.pending_jobs.fetch_add(count, Ordering::Relaxed);
+    run_rescan_plan(app, state, RescanPlan::rescan_only(paths)).await
+}
+
+/// Shared loop: re-read `plan.rescan`, import `plan.import`, and count `plan.walk_errors` as
+/// failures. Tracks a per-file counter in AppState, emits `job-update` after each file, then
+/// reloads the catalog once.
+async fn run_rescan_plan(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    plan: RescanPlan,
+) -> Result<(), CommandError> {
+    let total = plan.total();
+    let file_count = (plan.rescan.len() + plan.import.len()) as i64;
+    state.pending_jobs.fetch_add(file_count, Ordering::Relaxed);
     emit_job_update(app, state, "rescan");
 
-    let total = paths.len();
-    let mut failed_paths: Vec<String> = Vec::new();
-    for path in paths {
+    for error in &plan.walk_errors {
+        tracing::error!("Rescan: directory walk error: {error}");
+    }
+    let mut failed_paths: Vec<String> = plan.walk_errors;
+    for path in plan.rescan {
         let source_path = std::path::Path::new(&path);
         if !source_path.is_file() {
             tracing::error!(path = %source_path.display(), "Rescan skipped: source file is missing");
@@ -280,6 +297,23 @@ async fn rescan_path_list(
         {
             tracing::error!(path = %source_path.display(), "Rescan failed: {error:#}");
             failed_paths.push(source_path.display().to_string());
+        }
+        state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+        emit_job_update(app, state, "rescan");
+    }
+    for path in plan.import {
+        if let Err(error) = import_file(
+            &state.db,
+            Path::new(&path),
+            state.acoustid_api_key.as_deref(),
+            &state.write_serializer,
+        )
+        .await
+        {
+            let detail = format!("{error:#}");
+            tracing::error!(path = %path, "Import during rescan failed: {detail}");
+            state.file_issues.push_import_error(path.clone(), detail);
+            failed_paths.push(path);
         }
         state.pending_jobs.fetch_sub(1, Ordering::Relaxed);
         emit_job_update(app, state, "rescan");
@@ -382,23 +416,7 @@ pub async fn rescan_all_sources(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let paths: Vec<String> = {
-        let mut conn = state
-            .db
-            .acquire("command.rescan_all_sources".to_string())
-            .await
-            .context("Failed to acquire connection")?;
-        sqlx::query_scalar!(
-            r#"SELECT DISTINCT s.file_path AS "file_path!"
-             FROM source s
-             WHERE s.source_type = 'local_file'
-               AND s.file_path IS NOT NULL
-             ORDER BY s.file_path"#
-        )
-        .fetch_all(&mut *conn)
-        .await
-        .context("Failed to list local sources")?
-    };
+    let paths = list_local_source_paths(&state.db).await?;
 
     if paths.is_empty() {
         return Err(CommandError::rejected(
@@ -407,6 +425,69 @@ pub async fn rescan_all_sources(
     }
 
     rescan_path_list(&app, &state, paths).await
+}
+
+/// File paths of every local-file source in the library, sorted.
+async fn list_local_source_paths(db: &crate::db::DbPool) -> anyhow::Result<Vec<String>> {
+    let mut conn = db
+        .acquire("command.list_local_source_paths".to_string())
+        .await
+        .context("Failed to acquire connection")?;
+    sqlx::query_scalar!(
+        r#"SELECT DISTINCT s.file_path AS "file_path!"
+         FROM source s
+         WHERE s.source_type = 'local_file'
+           AND s.file_path IS NOT NULL
+         ORDER BY s.file_path"#
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("Failed to list local sources")
+}
+
+/// Recursively rescan one folder inside the music root: re-read the tags of every library file
+/// under it (a missing one is reported as a failure, not removed) and import audio files found
+/// there that are not in the library yet.
+#[tauri::command]
+#[tracing::instrument(skip_all, fields(path = %path))]
+pub async fn rescan_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), CommandError> {
+    let folder = Path::new(path.trim());
+    if folder.as_os_str().is_empty() {
+        return Err(CommandError::rejected("Folder path cannot be empty."));
+    }
+    if !folder.is_dir() {
+        return Err(CommandError::rejected(format!(
+            "Not a directory: {}",
+            folder.display()
+        )));
+    }
+    let root = load_music_root(&state.db)
+        .await
+        .context("Failed to load music root")?
+        .ok_or_else(|| CommandError::rejected("Music root is not configured."))?;
+    let folder = resolve_folder_in_root(folder, Path::new(&root))?.ok_or_else(|| {
+        CommandError::rejected(format!(
+            "{} is not inside the music root ({root}).",
+            folder.display()
+        ))
+    })?;
+
+    let library_paths = list_local_source_paths(&state.db).await?;
+    let plan =
+        tokio::task::spawn_blocking(move || plan_folder_rescan(&folder, library_paths))
+            .await
+            .context("Folder walk task panicked")?;
+    if plan.total() == 0 {
+        return Err(CommandError::rejected(
+            "No audio files found in this folder.",
+        ));
+    }
+
+    run_rescan_plan(&app, &state, plan).await
 }
 
 #[tauri::command]

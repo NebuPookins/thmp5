@@ -268,6 +268,7 @@ pub fn run() {
             commands::rescan_sources_for_recording,
             commands::rescan_sources_for_release_group,
             commands::rescan_all_sources,
+            commands::rescan_folder,
             commands::set_music_root,
             commands::update_queue_settings,
             commands::save_external_commands,
